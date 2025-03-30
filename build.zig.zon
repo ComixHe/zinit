@@ -1,0 +1,18 @@
+.{
+    .name = .zinit,
+    .version = "0.0.1",
+    .fingerprint = 0x9270341b70f1e3c6,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.10.0.tar.gz",
+            .hash = "clap-0.10.0-oBajB434AQBDh-Ei3YtoKIRxZacVPF1iSwp3IX_ZB8f0",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
