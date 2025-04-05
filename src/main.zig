@@ -2,7 +2,6 @@ const std = @import("std");
 const config = @import("config");
 const builtin = @import("builtin");
 const clap = @import("clap");
-const utils = @import("utils.zig");
 
 const forwardMode = enum {
     Child,
