@@ -1,14 +1,22 @@
 const std = @import("std");
 const config = @import("config");
+const builtin = @import("builtin");
 const clap = @import("clap");
 const utils = @import("utils.zig");
 
+const forwardMode = enum {
+    Child,
+    ProcessGroup,
+    Broadcast,
+};
+
 const Args = struct {
     signal: ?u5,
+    mode: forwardMode,
     args: std.ArrayList(?[*:0]const u8),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, signal: ?u5, args: []const []const u8) !Args {
+    pub fn init(allocator: std.mem.Allocator, signal: ?u5, mode: forwardMode, args: []const []const u8) !Args {
         var list = try std.ArrayList(?[*:0]const u8).initCapacity(allocator, args.len + 1);
         for (args) |arg| {
             const new_arg = try allocator.allocSentinel(u8, arg.len, 0);
@@ -17,7 +25,7 @@ const Args = struct {
         }
 
         list.appendAssumeCapacity(null);
-        return .{ .signal = signal, .args = list, .allocator = allocator };
+        return .{ .signal = signal, .mode = mode, .args = list, .allocator = allocator };
     }
 
     pub fn deinit(self: Args) void {
@@ -31,6 +39,46 @@ const Err = error{
 };
 
 const std_sig = std.posix.SIG;
+
+const sig_map = std.StaticStringMap(u5).initComptime(.{
+    .{ "BLOCK", std_sig.BLOCK },
+    .{ "UNBLOCK", std_sig.UNBLOCK },
+    .{ "SETMASK", std_sig.SETMASK },
+    .{ "HUP", std_sig.HUP },
+    .{ "INT", std_sig.INT },
+    .{ "QUIT", std_sig.QUIT },
+    .{ "ILL", std_sig.ILL },
+    .{ "TRAP", std_sig.TRAP },
+    .{ "ABRT", std_sig.ABRT },
+    .{ "IOT", std_sig.IOT },
+    .{ "BUS", std_sig.BUS },
+    .{ "FPE", std_sig.FPE },
+    .{ "KILL", std_sig.KILL },
+    .{ "USR1", std_sig.USR1 },
+    .{ "SEGV", std_sig.SEGV },
+    .{ "USR2", std_sig.USR2 },
+    .{ "PIPE", std_sig.PIPE },
+    .{ "ALRM", std_sig.ALRM },
+    .{ "TERM", std_sig.TERM },
+    .{ "STKFLT", std_sig.STKFLT },
+    .{ "CHLD", std_sig.CHLD },
+    .{ "CONT", std_sig.CONT },
+    .{ "STOP", std_sig.STOP },
+    .{ "TSTP", std_sig.TSTP },
+    .{ "TTIN", std_sig.TTIN },
+    .{ "TTOU", std_sig.TTOU },
+    .{ "URG", std_sig.URG },
+    .{ "XCPU", std_sig.XCPU },
+    .{ "XFSZ", std_sig.XFSZ },
+    .{ "VTALRM", std_sig.VTALRM },
+    .{ "PROF", std_sig.PROF },
+    .{ "WINCH", std_sig.WINCH },
+    .{ "IO", std_sig.IO },
+    .{ "POLL", std_sig.POLL },
+    .{ "PWR", std_sig.PWR },
+    .{ "SYS", std_sig.SYS },
+    .{ "UNUSED", std_sig.UNUSED },
+});
 
 // support standard signal: 1~32
 fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?u5 {
@@ -55,46 +103,6 @@ fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?u5 {
         }
     }
 
-    const sig_map = std.StaticStringMap(u5).initComptime(.{
-        .{ "BLOCK", std_sig.BLOCK },
-        .{ "UNBLOCK", std_sig.UNBLOCK },
-        .{ "SETMASK", std_sig.SETMASK },
-        .{ "HUP", std_sig.HUP },
-        .{ "INT", std_sig.INT },
-        .{ "QUIT", std_sig.QUIT },
-        .{ "ILL", std_sig.ILL },
-        .{ "TRAP", std_sig.TRAP },
-        .{ "ABRT", std_sig.ABRT },
-        .{ "IOT", std_sig.IOT },
-        .{ "BUS", std_sig.BUS },
-        .{ "FPE", std_sig.FPE },
-        .{ "KILL", std_sig.KILL },
-        .{ "USR1", std_sig.USR1 },
-        .{ "SEGV", std_sig.SEGV },
-        .{ "USR2", std_sig.USR2 },
-        .{ "PIPE", std_sig.PIPE },
-        .{ "ALRM", std_sig.ALRM },
-        .{ "TERM", std_sig.TERM },
-        .{ "STKFLT", std_sig.STKFLT },
-        .{ "CHLD", std_sig.CHLD },
-        .{ "CONT", std_sig.CONT },
-        .{ "STOP", std_sig.STOP },
-        .{ "TSTP", std_sig.TSTP },
-        .{ "TTIN", std_sig.TTIN },
-        .{ "TTOU", std_sig.TTOU },
-        .{ "URG", std_sig.URG },
-        .{ "XCPU", std_sig.XCPU },
-        .{ "XFSZ", std_sig.XFSZ },
-        .{ "VTALRM", std_sig.VTALRM },
-        .{ "PROF", std_sig.PROF },
-        .{ "WINCH", std_sig.WINCH },
-        .{ "IO", std_sig.IO },
-        .{ "POLL", std_sig.POLL },
-        .{ "PWR", std_sig.PWR },
-        .{ "SYS", std_sig.SYS },
-        .{ "UNUSED", std_sig.UNUSED },
-    });
-
     return sig_map.get(sig_name);
 }
 
@@ -103,11 +111,13 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         \\-h, --help
         \\-v, --version
         \\-s, --signal <SIGNAL>     "The triggered signal when parent process dies"
+        \\--forward-mode <MODE>    "The mode to forward signal to child process"
         \\<ARG>...                 "Arguments to be passed to the child process"
     );
 
     const parsers = comptime .{
         .SIGNAL = clap.parsers.string,
+        .MODE = clap.parsers.enumeration(forwardMode),
         .ARG = clap.parsers.string,
     };
 
@@ -137,6 +147,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     }
 
     if (res.args.version != 0) {
+        // this function is wired, fmt and option will not be used
         config.version.format("", .{}, std.io.getStdOut().writer()) catch unreachable;
         std.process.exit(0);
     }
@@ -148,16 +159,17 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         };
     }
 
-    return try Args.init(allocator, pd_signal, res.positionals[0]);
+    return try Args.init(allocator, pd_signal, res.args.@"forward-mode" orelse .Child, res.positionals[0]);
 }
 
-const oldSigConf = struct {
-    sigset: std.posix.sigset_t,
+const SigConf = struct {
+    old_set: std.posix.sigset_t,
+    current_set: std.posix.sigset_t,
     ttin_action: std.posix.Sigaction,
-    tto_action: std.posix.Sigaction,
+    ttou_action: std.posix.Sigaction,
 };
 
-fn handleSignal(comptime sig_list: anytype) oldSigConf {
+fn handleSignal(comptime sig_list: anytype) SigConf {
     // not use sigfillset and sigdelset
     // these functions are not under std.posix
     var set: std.posix.sigset_t = [_]u32{1} ** 32;
@@ -168,12 +180,13 @@ fn handleSignal(comptime sig_list: anytype) oldSigConf {
     var old_set: std.posix.sigset_t = [_]u32{0} ** 32;
     std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &set, &old_set);
 
-    // we will make child process to be foreground process
-    // if we try to read/write message to terminal, we will be blocked
-    // and get SIGTTIN/SIGTTOU, which is not what we want
-    // so we ignore SIGTTIN and SIGTTOU
-    // related signal: https://man7.org/linux/man-pages/man7/signal.7.html
-    // flag TOSTOP: https://man7.org/linux/man-pages/man3/termios.3.html
+    // zinit will make child process to be foreground process
+    // if zinit try to read/write message from/to terminal, zinit will be suspended
+    // due to signal SIGTTIN/SIGTTOU. After resuming, read/write will failed with EINTER.
+    // so we ignore SIGTTIN and SIGTTOU.
+    // Related signal: https://man7.org/linux/man-pages/man7/signal.7.html
+    // Setting the TOSTOP flag on tty also has an effect:
+    // https://man7.org/linux/man-pages/man3/termios.3.html
     const ignored = std.posix.Sigaction{
         .handler = .{ .handler = std_sig.IGN },
         .mask = [_]u32{0} ** 32,
@@ -183,18 +196,19 @@ fn handleSignal(comptime sig_list: anytype) oldSigConf {
     var old_ttin_action: std.posix.Sigaction = undefined;
     std.posix.sigaction(std_sig.TTIN, &ignored, &old_ttin_action);
 
-    var old_tto_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std_sig.TTOU, &ignored, &old_tto_action);
+    var old_ttou_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std_sig.TTOU, &ignored, &old_ttou_action);
 
     return .{
-        .sigset = old_set,
+        .old_set = old_set,
+        .current_set = set,
         .ttin_action = old_ttin_action,
-        .tto_action = old_tto_action,
+        .ttou_action = old_ttou_action,
     };
 }
 
 fn debugDump(desc: []const u8, ptr: [*:null]const ?[*:0]const u8) !void {
-    if (comptime std.log.default_level != .debug) {
+    if (comptime builtin.mode != .Debug) {
         return;
     }
 
@@ -223,7 +237,7 @@ fn releasePointeList(allocator: std.mem.Allocator, ptr: *const std.ArrayList(?[*
     ptr.deinit();
 }
 
-fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig_conf: oldSigConf) std.posix.pid_t {
+fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig_conf: *const SigConf) std.posix.pid_t {
     const pid = std.posix.fork() catch |err| {
         std.log.err("unable to fork: {s}", .{@errorName(err)});
         return -1;
@@ -251,9 +265,9 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
         // fork will inherit signal settings from parent process
         // so we restore signal settings within child process
-        std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &sig_conf.sigset, null);
+        std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &sig_conf.old_set, null);
         std.posix.sigaction(std_sig.TTIN, &sig_conf.ttin_action, null);
-        std.posix.sigaction(std_sig.TTOU, &sig_conf.tto_action, null);
+        std.posix.sigaction(std_sig.TTOU, &sig_conf.ttou_action, null);
 
         var early_free = false;
         var envp = std.process.getEnvMap(allocator) catch |err| {
@@ -310,9 +324,48 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
     return pid;
 }
 
-fn waitAllChildren(son: std.posix.pid_t) u32 {
-    const ret = std.posix.waitpid(son, 0);
-    return ret.status;
+fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
+    while (true) {
+        const ret = std.posix.waitpid(-1, std.os.linux.W.NOHANG);
+        if (ret.pid == 0) {
+            std.log.debug("no process to handle", .{});
+            break;
+        }
+
+        std.log.debug("child process {d} exited", .{ret.pid});
+        if (ret.pid == pid) { // main child process exited
+            const writer = std.io.getStdOut().writer();
+            if (std.os.linux.W.IFSTOPPED(ret.status)) {
+                writer.print("main child process stopped with signal {d}.\n", .{std.os.linux.W.STOPSIG(ret.status)}) catch {};
+                return null;
+            }
+
+            // broadcasting SIGTERM to child process
+            // zinit unable to wait the rest of child process
+            std.posix.kill(-pid, std_sig.TERM) catch |err| {
+                std.log.err("unable to broadcast SIGTERM to child: {s}", .{@errorName(err)});
+            };
+
+            if (std.os.linux.W.IFEXITED(ret.status)) {
+                const code = std.os.linux.W.EXITSTATUS(ret.status);
+                writer.print("main child process exited with code {d} normally.\n", .{code}) catch {};
+                return code;
+            }
+
+            if (std.os.linux.W.IFSIGNALED(ret.status)) {
+                const signal = std.os.linux.W.TERMSIG(ret.status);
+                writer.print("main child process exited with signal {d}.\n", .{signal}) catch {};
+                return 128 + @as(u8, @intCast(std.os.linux.W.TERMSIG(signal)));
+            }
+
+            std.log.err("child process exited with unknown status", .{});
+            return 1;
+        }
+
+        // collecting orphaned child process continually
+    }
+
+    return null;
 }
 
 pub fn main() u8 {
@@ -327,10 +380,6 @@ pub fn main() u8 {
     };
     defer args.deinit();
 
-    if (std.os.linux.getpid() != 1) {
-        std.log.info("zinit is not running as PID 1.", .{});
-    }
-
     // we ignore all the signals that terminate with a core dump
     const ignored_sigs = [_]comptime_int{ std_sig.ABRT, std_sig.BUS, std_sig.FPE, std_sig.ILL, std_sig.SEGV, std_sig.SYS, std_sig.TRAP, std_sig.XCPU, std_sig.XFSZ, std_sig.TTIN, std_sig.TTOU };
     const sig_conf = handleSignal(ignored_sigs);
@@ -342,17 +391,71 @@ pub fn main() u8 {
         };
     }
 
-    const son = run(gpa.allocator(), @ptrCast(args.args.items.ptr), sig_conf);
+    // make us become child subreaper, so that we could handle orphaned process
+    // https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html
+    _ = std.posix.prctl(std.os.linux.PR.SET_CHILD_SUBREAPER, .{1}) catch |err| {
+        std.log.err("unable to set child subreaper: {s}", .{@errorName(err)});
+        return 1;
+    };
+
+    const son = run(gpa.allocator(), @ptrCast(args.args.items.ptr), &sig_conf);
     if (son == -1) {
         std.log.err("unable to run child process.", .{});
         return 1;
     }
 
+    const epfd = std.posix.epoll_create1(0) catch |err| {
+        std.log.err("unable to create epoll: {s}", .{@errorName(err)});
+        return 1;
+    };
+
+    const sigfd = std.posix.signalfd(-1, &sig_conf.current_set, 0) catch |err| {
+        std.log.err("unable to create signalfd: {s}", .{@errorName(err)});
+        return 1;
+    };
+
+    var ep_data = std.os.linux.epoll_event{ .events = std.os.linux.EPOLL.IN, .data = .{ .fd = sigfd } };
+    std.posix.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, sigfd, &ep_data) catch |err| {
+        std.log.err("unable to add sigfd to epoll: {s}", .{@errorName(err)});
+        return 1;
+    };
+
+    var event: [1]std.os.linux.epoll_event = undefined;
+    var buf: [@sizeOf(std.os.linux.signalfd_siginfo)]u8 = undefined;
     while (true) {
-        const status = waitAllChildren(son);
-        std.log.info("child process exited with status {d}.", .{status});
-        break;
+        std.log.debug("waiting for events", .{});
+        @memset(std.mem.asBytes(&event[0]), 0);
+        if (std.posix.epoll_wait(epfd, &event, 1000) == 0) {
+            std.log.debug("no event after timeout", .{});
+            continue;
+        }
+
+        @memset(std.mem.asBytes(&buf), 0);
+        _ = std.posix.read(sigfd, &buf) catch |err| {
+            std.log.err("unable to read from signalfd: {s}", .{@errorName(err)});
+            return 1;
+        };
+
+        const siginfo = std.mem.bytesAsValue(std.os.linux.signalfd_siginfo, &buf);
+        if (siginfo.signo != std_sig.CHLD) {
+            std.log.debug("forwarding signal {d}", .{siginfo.signo});
+            const destination = switch (args.mode) {
+                .Child => son,
+                .ProcessGroup => -son,
+                .Broadcast => -1,
+            };
+
+            std.posix.kill(destination, @intCast(siginfo.signo)) catch |err| {
+                std.log.err("unable to send signal to child: {s}", .{@errorName(err)});
+                return 1;
+            };
+        }
+
+        std.log.debug("process orphaned child process", .{});
+        if (handleExitedProcess(son)) |code| {
+            return code;
+        }
     }
 
-    return 0;
+    unreachable;
 }
