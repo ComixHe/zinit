@@ -170,14 +170,16 @@ const SigConf = struct {
 };
 
 fn handleSignal(comptime sig_list: anytype) SigConf {
-    // not use sigfillset and sigdelset
-    // these functions are not under std.posix
-    var set: std.posix.sigset_t = [_]u32{1} ** 32;
+    // we not use std.c.sigfillset here because it requires linking with libc
+    // sigfillset(glibc) will remove two additional internal signals 'SIGCANCEL(32)' and 'SIGSETXID(33)' for pthread private usage
+    // so we not unblock these two signals is ok
+    // https://sourceware.org/git?p=glibc.git;a=blob;f=signal/sigfillset.c;h=393df0ec8c7303c46464fe37f5e8db7d5f1dd9db;hb=refs/heads/master#l34
+    var set = std.os.linux.all_mask;
     inline for (sig_list) |sig| {
-        set[sig] = 0;
+        std.os.linux.sigdelset(&set, sig);
     }
 
-    var old_set: std.posix.sigset_t = [_]u32{0} ** 32;
+    var old_set: std.posix.sigset_t = undefined;
     std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &set, &old_set);
 
     // zinit will make child process to be foreground process
@@ -340,11 +342,9 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
                 return null;
             }
 
-            // broadcasting SIGTERM to child process
+            // try to broadcasting SIGTERM to child process and ignore the error
             // zinit unable to wait the rest of child process
-            std.posix.kill(-pid, std_sig.TERM) catch |err| {
-                std.log.err("unable to broadcast SIGTERM to child: {s}", .{@errorName(err)});
-            };
+            std.posix.kill(-pid, std_sig.TERM) catch {};
 
             if (std.os.linux.W.IFEXITED(ret.status)) {
                 const code = std.os.linux.W.EXITSTATUS(ret.status);
@@ -381,8 +381,8 @@ pub fn main() u8 {
     defer args.deinit();
 
     // we ignore all the signals that terminate with a core dump
-    const ignored_sigs = [_]comptime_int{ std_sig.ABRT, std_sig.BUS, std_sig.FPE, std_sig.ILL, std_sig.SEGV, std_sig.SYS, std_sig.TRAP, std_sig.XCPU, std_sig.XFSZ, std_sig.TTIN, std_sig.TTOU };
-    const sig_conf = handleSignal(ignored_sigs);
+    const unblocked_sigs = [_]comptime_int{ std_sig.ABRT, std_sig.BUS, std_sig.FPE, std_sig.ILL, std_sig.SEGV, std_sig.SYS, std_sig.TRAP, std_sig.XCPU, std_sig.XFSZ, std_sig.TTIN, std_sig.TTOU };
+    const sig_conf = handleSignal(unblocked_sigs);
 
     if (args.signal) |signal| {
         _ = std.posix.prctl(std.os.linux.PR.SET_PDEATHSIG, .{signal}) catch |err| {
