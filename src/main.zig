@@ -335,30 +335,25 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
 
         std.log.debug("child process {d} exited", .{ret.pid});
         if (ret.pid == pid) { // main child process exited
+            var ret_code: u8 = 0;
             const writer = std.io.getStdOut().writer();
-            if (std.os.linux.W.IFSTOPPED(ret.status)) {
-                writer.print("main child process stopped with signal {d}.\n", .{std.os.linux.W.STOPSIG(ret.status)}) catch {};
-                return null;
+            if (std.os.linux.W.IFEXITED(ret.status)) {
+                ret_code = std.os.linux.W.EXITSTATUS(ret.status);
+                writer.print("main child process exited with code {d} normally.\n", .{ret_code}) catch {};
+            } else if (std.os.linux.W.IFSIGNALED(ret.status)) {
+                const signal = std.os.linux.W.TERMSIG(ret.status);
+                writer.print("main child process exited with signal {d}.\n", .{signal}) catch {};
+                ret_code = 128 + @as(u8, @intCast(signal));
+            } else {
+                std.log.err("child process exited with unknown status", .{});
             }
 
             // try to broadcasting SIGTERM to child process and ignore the error
             // zinit unable to wait the rest of child process
+            //TODO: should we wait other process exit?
             std.posix.kill(-pid, std_sig.TERM) catch {};
 
-            if (std.os.linux.W.IFEXITED(ret.status)) {
-                const code = std.os.linux.W.EXITSTATUS(ret.status);
-                writer.print("main child process exited with code {d} normally.\n", .{code}) catch {};
-                return code;
-            }
-
-            if (std.os.linux.W.IFSIGNALED(ret.status)) {
-                const signal = std.os.linux.W.TERMSIG(ret.status);
-                writer.print("main child process exited with signal {d}.\n", .{signal}) catch {};
-                return 128 + @as(u8, @intCast(std.os.linux.W.TERMSIG(signal)));
-            }
-
-            std.log.err("child process exited with unknown status", .{});
-            return 1;
+            return ret_code;
         }
 
         // collecting orphaned child process continually
