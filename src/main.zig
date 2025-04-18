@@ -32,6 +32,30 @@ const Args = struct {
     }
 };
 
+test Args {
+    const allocator = std.testing.allocator;
+    const p_args: []const []const u8 = &[_][]const u8{ "foo", "--bar=x", "-v", "-c" };
+    const args = try Args.init(allocator, 15, .Child, p_args);
+    defer args.deinit();
+
+    try std.testing.expectEqual(15, args.signal);
+    try std.testing.expectEqual(forwardMode.Child, args.mode);
+
+    const expected: [5]?[*:0]const u8 = [_]?[*:0]const u8{ "foo", "--bar=x", "-v", "-c", null };
+    comptime {
+        std.debug.assert(expected.len == p_args.len + 1);
+    }
+
+    for (expected, 0..) |sentinel_arg, i| {
+        if (sentinel_arg) |arg| {
+            try std.testing.expectEqualSentinel(u8, 0, std.mem.span(arg), std.mem.span(args.args.items[i].?));
+            continue;
+        }
+
+        try std.testing.expectEqual(i, expected.len - 1);
+    }
+}
+
 const Err = error{
     InvalidSignal,
     InvalidParams,
@@ -40,9 +64,6 @@ const Err = error{
 const std_sig = std.posix.SIG;
 
 const sig_map = std.StaticStringMap(u5).initComptime(.{
-    .{ "BLOCK", std_sig.BLOCK },
-    .{ "UNBLOCK", std_sig.UNBLOCK },
-    .{ "SETMASK", std_sig.SETMASK },
     .{ "HUP", std_sig.HUP },
     .{ "INT", std_sig.INT },
     .{ "QUIT", std_sig.QUIT },
@@ -83,8 +104,12 @@ const sig_map = std.StaticStringMap(u5).initComptime(.{
 fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?u5 {
     // test if s could convert to integer
     const val = std.fmt.parseUnsigned(u5, s, 10) catch null;
-    if (val != null) {
-        return val;
+    if (val) |sig_num| {
+        if (sig_num <= 0 or sig_num > 32) {
+            return null;
+        }
+
+        return sig_num;
     }
 
     // test if s is a signal name
@@ -103,6 +128,16 @@ fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?u5 {
     }
 
     return sig_map.get(sig_name);
+}
+
+test parseSignal {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(15, parseSignal(allocator, "15"));
+    try std.testing.expectEqual(15, parseSignal(allocator, "SIGTERM"));
+    try std.testing.expectEqual(15, parseSignal(allocator, "TERM"));
+    try std.testing.expectEqual(null, parseSignal(allocator, "UNKNOWN"));
+    try std.testing.expectEqual(null, parseSignal(allocator, "32"));
+    try std.testing.expectEqual(null, parseSignal(allocator, "0"));
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -375,7 +410,7 @@ pub fn main() u8 {
     defer args.deinit();
 
     // we ignore all the signals that terminate with a core dump
-    const unblocked_sigs = [_]comptime_int{ std_sig.ABRT, std_sig.BUS, std_sig.FPE, std_sig.ILL, std_sig.SEGV, std_sig.SYS, std_sig.TRAP, std_sig.XCPU, std_sig.XFSZ, std_sig.TTIN, std_sig.TTOU };
+    const unblocked_sigs = .{ std_sig.ABRT, std_sig.BUS, std_sig.FPE, std_sig.ILL, std_sig.SEGV, std_sig.SYS, std_sig.TRAP, std_sig.XCPU, std_sig.XFSZ, std_sig.TTIN, std_sig.TTOU };
     const sig_conf = handleSignal(unblocked_sigs);
 
     if (args.signal) |signal| {
