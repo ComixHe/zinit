@@ -223,6 +223,7 @@ fn handleSignal(comptime sig_list: anytype) SigConf {
     // Related signal: https://man7.org/linux/man-pages/man7/signal.7.html
     // Setting the TOSTOP flag on tty also has an effect:
     // https://man7.org/linux/man-pages/man3/termios.3.html
+    //FIXME: workaround for https://github.com/ziglang/zig/issues/23169
     const ignored = std.posix.Sigaction{
         .handler = .{ .handler = std_sig.IGN },
         .mask = [_]u32{0} ** 32,
@@ -350,6 +351,28 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             std.log.err("unable to dump arguments: {s}", .{@errorName(err)});
             return -1;
         };
+
+        if (config.tracing_child) {
+            const dummy_handler = struct {
+                pub fn handler(_: i32) callconv(.C) void {
+                    std.io.getStdOut().writeAll("received USR1 signal, continuing\n") catch {};
+                }
+            }.handler;
+
+            const usr1_act: std.posix.Sigaction = .{
+                .handler = .{ .handler = dummy_handler },
+                .mask = [_]u32{0} ** 32,
+                .flags = 0,
+            };
+
+            var old_act: std.posix.Sigaction = undefined;
+            std.posix.sigaction(std_sig.USR1, &usr1_act, &old_act);
+
+            std.log.info("waiting for USR1 signal", .{});
+            _ = std.os.linux.pause();
+
+            std.posix.sigaction(std_sig.USR1, &old_act, null);
+        }
 
         // This function should never return
         const ret = std.posix.execvpeZ(args_ptr[0].?, args_ptr, envp_ptr);

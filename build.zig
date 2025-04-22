@@ -28,8 +28,11 @@ pub fn build(b: *std.Build) void {
     const clap = b.dependency("clap", .{});
     exe.root_module.addImport("clap", clap.module("clap"));
 
+    const tracing_child = b.option(bool, "tracing-child", "zinit will wait for SIGUSR1 to continue executing child process") orelse false;
+
     const config = b.addOptions();
     config.addOption(std.SemanticVersion, "version", exe.version orelse unreachable);
+    config.addOption(bool, "tracing_child", tracing_child);
     exe.root_module.addOptions("config", config);
 
     b.installArtifact(exe);
