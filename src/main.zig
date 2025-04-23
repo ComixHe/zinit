@@ -24,7 +24,7 @@ const Args = struct {
     }
 
     pub fn deinit(self: Args) void {
-        releasePointeList(self.allocator, &self.args);
+        releasePointerList(self.allocator, &self.args);
     }
 };
 
@@ -260,7 +260,7 @@ fn debugDump(desc: []const u8, ptr: [*:null]const ?[*:0]const u8) !void {
     try writer.print("]\n", .{});
 }
 
-fn releasePointeList(allocator: std.mem.Allocator, ptr: *const std.ArrayList(?[*:0]const u8)) void {
+fn releasePointerList(allocator: std.mem.Allocator, ptr: *const std.ArrayList(?[*:0]const u8)) void {
     for (ptr.items) |item| {
         if (item != null) {
             allocator.free(std.mem.span(item.?));
@@ -317,7 +317,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             std.log.err("unable to init environment variable list: {s}", .{@errorName(err)});
             return -1;
         };
-        defer releasePointeList(allocator, &envp_list);
+        defer releasePointerList(allocator, &envp_list);
 
         var iter = envp.iterator();
         while (iter.next()) |entry| {
