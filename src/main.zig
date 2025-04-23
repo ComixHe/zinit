@@ -3,11 +3,7 @@ const config = @import("config");
 const builtin = @import("builtin");
 const clap = @import("clap");
 
-const forwardMode = enum {
-    Child,
-    ProcessGroup,
-    Broadcast,
-};
+const forwardMode = enum { Child, ProcessGroup };
 
 const Args = struct {
     signal: ?u5,
@@ -494,7 +490,6 @@ pub fn main() u8 {
             const destination = switch (args.mode) {
                 .Child => son,
                 .ProcessGroup => -son,
-                .Broadcast => -1,
             };
 
             std.posix.kill(destination, @intCast(siginfo.signo)) catch |err| {
