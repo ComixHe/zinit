@@ -141,7 +141,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         \\-h, --help
         \\-v, --version
         \\-s, --signal <SIGNAL>     "The triggered signal when parent process dies"
-        \\--forward-mode <MODE>    "The mode to forward signal to child process"
+        \\--forward-mode <MODE>    "The mode of forwarding signals to child processes"
         \\<ARG>...                 "Arguments to be passed to the child process"
     );
 
@@ -333,8 +333,20 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
         }
         envp_list.appendAssumeCapacity(null);
 
-        // for convenience
-        const tracing_child_env = envp.get("ZINIT_TRACING_CHILD");
+        const tracing_child = blk: {
+            // for convenience
+            if (envp.get("ZINIT_TRACING_CHILD")) |val| {
+                if (std.mem.eql(u8, val, "ON")) {
+                    break :blk true;
+                }
+
+                if (std.mem.eql(u8, val, "OFF")) {
+                    break :blk false;
+                }
+            }
+
+            break :blk config.tracing_child;
+        };
 
         // we do not need envp anymore
         envp.deinit();
@@ -351,7 +363,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             return -1;
         };
 
-        if (config.tracing_child or tracing_child_env != null) {
+        if (tracing_child) {
             const dummy_handler = struct {
                 pub fn handler(_: i32) callconv(.C) void {
                     std.io.getStdOut().writeAll("received USR1 signal, continuing\n") catch {};
