@@ -333,6 +333,9 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
         }
         envp_list.appendAssumeCapacity(null);
 
+        // for convenience
+        const tracing_child_env = envp.get("ZINIT_TRACING_CHILD");
+
         // we do not need envp anymore
         envp.deinit();
         early_free = true;
@@ -348,7 +351,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             return -1;
         };
 
-        if (config.tracing_child) {
+        if (config.tracing_child or tracing_child_env != null) {
             const dummy_handler = struct {
                 pub fn handler(_: i32) callconv(.C) void {
                     std.io.getStdOut().writeAll("received USR1 signal, continuing\n") catch {};
@@ -498,7 +501,6 @@ pub fn main() u8 {
             };
         }
 
-        std.log.debug("process orphaned child process", .{});
         if (handleExitedProcess(son)) |code| {
             return code;
         }
