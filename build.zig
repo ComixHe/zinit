@@ -1,7 +1,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // only support linux for now
+    const target = b.standardTargetOptions(.{ .default_target = .{ .os_tag = .linux } });
     const optimize = b.standardOptimizeOption(.{});
     const is_release = optimize != .Debug;
 

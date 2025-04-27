@@ -59,6 +59,7 @@ const Err = error{
 
 const std_sig = std.posix.SIG;
 
+//NOTE: do we need to support realtime signals?
 const sig_map = std.StaticStringMap(u5).initComptime(.{
     .{ "HUP", std_sig.HUP },
     .{ "INT", std_sig.INT },
@@ -201,7 +202,7 @@ const SigConf = struct {
 
 fn handleSignal(comptime sig_list: anytype) SigConf {
     // we not use std.c.sigfillset here because it requires linking with libc
-    // sigfillset(glibc) will remove two additional internal signals 'SIGCANCEL(32)' and 'SIGSETXID(33)' for pthread private usage
+    // sigfillset(glibc) will remove two additional internal signals 'SIGCANCEL(32)' and 'SIGSETXID(33)' for pthread private usage (NPTL model)
     // so we not unblock these two signals is ok
     // https://sourceware.org/git?p=glibc.git;a=blob;f=signal/sigfillset.c;h=393df0ec8c7303c46464fe37f5e8db7d5f1dd9db;hb=refs/heads/master#l34
     var set = std.os.linux.all_mask;
@@ -210,7 +211,7 @@ fn handleSignal(comptime sig_list: anytype) SigConf {
     }
 
     var old_set: std.posix.sigset_t = undefined;
-    std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &set, &old_set);
+    std.posix.sigprocmask(std.posix.SIG.SETMASK, &set, &old_set);
 
     // zinit will make child process to be foreground process
     // if zinit try to read/write message from/to terminal, zinit will be suspended
@@ -298,7 +299,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
         // fork will inherit signal settings from parent process
         // so we restore signal settings within child process
-        std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &sig_conf.old_set, null);
+        std.posix.sigprocmask(std.posix.SIG.SETMASK, &sig_conf.old_set, null);
         std.posix.sigaction(std_sig.TTIN, &sig_conf.ttin_action, null);
         std.posix.sigaction(std_sig.TTOU, &sig_conf.ttou_action, null);
 
@@ -378,7 +379,6 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
             var old_act: std.posix.Sigaction = undefined;
             std.posix.sigaction(std_sig.USR1, &usr1_act, &old_act);
-
             std.log.info("waiting for USR1 signal", .{});
             _ = std.os.linux.pause();
 
@@ -396,7 +396,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
 fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
     while (true) {
-        const ret = std.posix.waitpid(-1, std.os.linux.W.NOHANG);
+        const ret = std.posix.waitpid(-1, std.posix.W.NOHANG);
         if (ret.pid == 0) {
             std.log.debug("no process to handle", .{});
             break;
@@ -406,11 +406,11 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
         if (ret.pid == pid) { // main child process exited
             var ret_code: u8 = 0;
             const writer = std.io.getStdOut().writer();
-            if (std.os.linux.W.IFEXITED(ret.status)) {
-                ret_code = std.os.linux.W.EXITSTATUS(ret.status);
+            if (std.posix.W.IFEXITED(ret.status)) {
+                ret_code = std.posix.W.EXITSTATUS(ret.status);
                 writer.print("main child process exited with code {d} normally.\n", .{ret_code}) catch {};
-            } else if (std.os.linux.W.IFSIGNALED(ret.status)) {
-                const signal = std.os.linux.W.TERMSIG(ret.status);
+            } else if (std.posix.W.IFSIGNALED(ret.status)) {
+                const signal = std.posix.W.TERMSIG(ret.status);
                 writer.print("main child process exited with signal {d}.\n", .{signal}) catch {};
                 ret_code = 128 + @as(u8, @intCast(signal));
             } else {
@@ -448,7 +448,7 @@ pub fn main() u8 {
     const sig_conf = handleSignal(unblocked_sigs);
 
     if (args.signal) |signal| {
-        _ = std.posix.prctl(std.os.linux.PR.SET_PDEATHSIG, .{signal}) catch |err| {
+        _ = std.posix.prctl(std.posix.PR.SET_PDEATHSIG, .{signal}) catch |err| {
             std.log.err("failed to set parent death signal to {d}: {s}", .{ signal, @errorName(err) });
             return 1;
         };
@@ -456,7 +456,7 @@ pub fn main() u8 {
 
     // make us become child subreaper, so that we could handle orphaned process
     // https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html
-    _ = std.posix.prctl(std.os.linux.PR.SET_CHILD_SUBREAPER, .{1}) catch |err| {
+    _ = std.posix.prctl(std.posix.PR.SET_CHILD_SUBREAPER, .{1}) catch |err| {
         std.log.err("unable to set child subreaper: {s}", .{@errorName(err)});
         return 1;
     };
@@ -467,32 +467,15 @@ pub fn main() u8 {
         return 1;
     }
 
-    const epfd = std.posix.epoll_create1(0) catch |err| {
-        std.log.err("unable to create epoll: {s}", .{@errorName(err)});
-        return 1;
-    };
-
     const sigfd = std.posix.signalfd(-1, &sig_conf.current_set, 0) catch |err| {
         std.log.err("unable to create signalfd: {s}", .{@errorName(err)});
         return 1;
     };
+    defer std.posix.close(sigfd);
 
-    var ep_data = std.os.linux.epoll_event{ .events = std.os.linux.EPOLL.IN, .data = .{ .fd = sigfd } };
-    std.posix.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, sigfd, &ep_data) catch |err| {
-        std.log.err("unable to add sigfd to epoll: {s}", .{@errorName(err)});
-        return 1;
-    };
-
-    var event: [1]std.os.linux.epoll_event = undefined;
     var buf: [@sizeOf(std.os.linux.signalfd_siginfo)]u8 = undefined;
     while (true) {
         std.log.debug("waiting for events", .{});
-        @memset(std.mem.asBytes(&event[0]), 0);
-        if (std.posix.epoll_wait(epfd, &event, 1000) == 0) {
-            std.log.debug("no event after timeout", .{});
-            continue;
-        }
-
         @memset(std.mem.asBytes(&buf), 0);
         _ = std.posix.read(sigfd, &buf) catch |err| {
             std.log.err("unable to read from signalfd: {s}", .{@errorName(err)});
