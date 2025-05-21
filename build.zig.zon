@@ -2,7 +2,7 @@
     .name = .zinit,
     .version = "0.0.1",
     .fingerprint = 0x9270341b70f1e3c6,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.15.0-dev.621+a63f7875f",
     .dependencies = .{
         .clap = .{
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.10.0.tar.gz",
