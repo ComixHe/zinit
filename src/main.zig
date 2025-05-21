@@ -201,11 +201,7 @@ const SigConf = struct {
 };
 
 fn handleSignal(comptime sig_list: anytype) SigConf {
-    // we not use std.c.sigfillset here because it requires linking with libc
-    // sigfillset(glibc) will remove two additional internal signals 'SIGCANCEL(32)' and 'SIGSETXID(33)' for pthread private usage (NPTL model)
-    // so we not unblock these two signals is ok
-    // https://sourceware.org/git?p=glibc.git;a=blob;f=signal/sigfillset.c;h=393df0ec8c7303c46464fe37f5e8db7d5f1dd9db;hb=refs/heads/master#l34
-    var set = std.os.linux.all_mask;
+    var set = std.posix.sigfillset();
     inline for (sig_list) |sig| {
         std.os.linux.sigdelset(&set, sig);
     }
@@ -220,10 +216,9 @@ fn handleSignal(comptime sig_list: anytype) SigConf {
     // Related signal: https://man7.org/linux/man-pages/man7/signal.7.html
     // Setting the TOSTOP flag on tty also has an effect:
     // https://man7.org/linux/man-pages/man3/termios.3.html
-    //FIXME: workaround for https://github.com/ziglang/zig/issues/23169
     const ignored = std.posix.Sigaction{
         .handler = .{ .handler = std_sig.IGN },
-        .mask = [_]u32{0} ** 32,
+        .mask = .{0},
         .flags = 0,
     };
 
@@ -373,7 +368,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
             const usr1_act: std.posix.Sigaction = .{
                 .handler = .{ .handler = dummy_handler },
-                .mask = [_]u32{0} ** 32,
+                .mask = .{0},
                 .flags = 0,
             };
 
