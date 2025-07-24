@@ -157,18 +157,14 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .diagnostic = &diag,
         .allocator = allocator,
     }) catch |err| {
-        diag.report(std.io.getStdErr().writer(), err) catch |e| {
-            std.log.err("unable to write error: {s}", .{@errorName(e)});
-        };
-
+        try diag.reportToFile(.stderr(), err);
         return Err.InvalidParams;
     };
     defer res.deinit();
 
     if (res.args.help != 0) {
-        const writer = std.io.getStdOut().writer();
-        try writer.writeAll("zinit - A tiny init for linux container.\n\n");
-        try clap.help(writer, clap.Help, &params, .{
+        try std.fs.File.stdout().writeAll("zinit - A tiny init for linux container.\n\n");
+        try clap.helpToFile(.stdout(), clap.Help, &params, .{
             .indent = 2,
             .description_indent = 4,
             .description_on_new_line = false,
@@ -179,7 +175,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
     if (res.args.version != 0) {
         // this function is wired, fmt and option will not be used
-        config.version.format("", .{}, std.io.getStdOut().writer()) catch unreachable;
+        var buffer: [16]u8 = undefined;
+        var writer = std.fs.File.stdout().writer(&buffer);
+        config.version.format(&writer.interface) catch unreachable;
+        try writer.interface.flush();
         std.process.exit(0);
     }
 
@@ -361,8 +360,8 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
         if (tracing_child) {
             const dummy_handler = struct {
-                pub fn handler(_: i32) callconv(.C) void {
-                    std.io.getStdOut().writeAll("received USR1 signal, continuing\n") catch {};
+                pub fn handler(_: i32) callconv(.c) void {
+                    std.fs.File.stdout().writeAll("received USR1 signal, continuing\n") catch {};
                 }
             }.handler;
 
@@ -400,13 +399,12 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
         std.log.debug("child process {d} exited", .{ret.pid});
         if (ret.pid == pid) { // main child process exited
             var ret_code: u8 = 0;
-            const writer = std.io.getStdOut().writer();
             if (std.posix.W.IFEXITED(ret.status)) {
                 ret_code = std.posix.W.EXITSTATUS(ret.status);
-                writer.print("main child process exited with code {d} normally.\n", .{ret_code}) catch {};
+                std.log.info("main child process exited with code {d}.", .{ret_code});
             } else if (std.posix.W.IFSIGNALED(ret.status)) {
                 const signal = std.posix.W.TERMSIG(ret.status);
-                writer.print("main child process exited with signal {d}.\n", .{signal}) catch {};
+                std.log.info("main child process exited with signal {d}.", .{signal});
                 ret_code = 128 + @as(u8, @intCast(signal));
             } else {
                 std.log.err("child process exited with unknown status", .{});
