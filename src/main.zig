@@ -175,10 +175,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
     if (res.args.version != 0) {
         // this function is wired, fmt and option will not be used
-        var buffer: [16]u8 = undefined;
-        var writer = std.fs.File.stdout().writer(&buffer);
-        config.version.format(&writer.interface) catch unreachable;
-        try writer.interface.flush();
+        var buffer: [32]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&buffer);
+        const stdout = &stdout_writer.interface;
+        config.version.format(stdout) catch unreachable;
+        try stdout.flush();
         std.process.exit(0);
     }
 
@@ -240,19 +241,24 @@ fn debugDump(desc: []const u8, ptr: [*:null]const ?[*:0]const u8) !void {
         return;
     }
 
-    const writer = std.io.getStdOut().writer();
-    try writer.print("{s}:[\n", .{desc});
+    var buf: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&buf);
+    const stdout = &stdout_writer.interface;
+
+    try stdout.print("{s}:[\n", .{desc});
     var i: usize = 0;
     while (ptr[i] != null) : (i += 1) {
         const val = ptr[i].?;
         var j: usize = 0;
-        try writer.writeByte('\t');
+        try stdout.writeByte('\t');
         while (val[j] != 0) : (j += 1) {
-            try writer.writeByte(val[j]);
+            try stdout.writeByte(val[j]);
         }
-        try writer.writeAll(",\n");
+        try stdout.writeAll(",\n");
+        try stdout.flush();
     }
-    try writer.print("]\n", .{});
+    try stdout.print("]\n", .{});
+    try stdout.flush();
 }
 
 fn releasePointerList(allocator: std.mem.Allocator, ptr: *const std.ArrayList(?[*:0]const u8)) void {
@@ -361,7 +367,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
         if (tracing_child) {
             const dummy_handler = struct {
                 pub fn handler(_: i32) callconv(.c) void {
-                    std.fs.File.stdout().writeAll("received USR1 signal, continuing\n") catch {};
+                    _ = std.fs.File.stdout().write("received USR1 signal, continuing\n") catch {};
                 }
             }.handler;
 
