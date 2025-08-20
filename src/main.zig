@@ -23,8 +23,9 @@ const Args = struct {
         return .{ .signal = signal, .mode = mode, .args = list, .allocator = allocator };
     }
 
-    pub fn deinit(self: Args) void {
+    pub fn deinit(self: *Args) void {
         releasePointerList(self.allocator, &self.args);
+        self.args.deinit(self.allocator);
     }
 };
 
@@ -267,8 +268,6 @@ fn releasePointerList(allocator: std.mem.Allocator, ptr: *const std.ArrayList(?[
             allocator.free(std.mem.span(item.?));
         }
     }
-
-    ptr.deinit();
 }
 
 fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig_conf: *const SigConf) std.posix.pid_t {
@@ -318,7 +317,11 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             std.log.err("unable to init environment variable list: {s}", .{@errorName(err)});
             return -1;
         };
-        defer releasePointerList(allocator, &envp_list);
+
+        defer {
+            releasePointerList(allocator, &envp_list);
+            envp_list.deinit(allocator);
+        }
 
         var iter = envp.iterator();
         while (iter.next()) |entry| {
