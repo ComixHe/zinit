@@ -6,12 +6,12 @@ const clap = @import("clap");
 const forwardMode = enum { Child, ProcessGroup };
 
 const Args = struct {
-    signal: ?u5,
+    signal: ?sig_t,
     mode: forwardMode,
     args: std.ArrayList(?[*:0]const u8),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, signal: ?u5, mode: forwardMode, args: []const []const u8) !Args {
+    pub fn init(allocator: std.mem.Allocator, signal: ?sig_t, mode: forwardMode, args: []const []const u8) !Args {
         var list = try std.ArrayList(?[*:0]const u8).initCapacity(allocator, args.len + 1);
         for (args) |arg| {
             const new_arg = try allocator.allocSentinel(u8, arg.len, 0);
@@ -32,10 +32,10 @@ const Args = struct {
 test Args {
     const allocator = std.testing.allocator;
     const p_args: []const []const u8 = &[_][]const u8{ "foo", "--bar=x", "-v", "-c" };
-    const args = try Args.init(allocator, 15, .Child, p_args);
+    var args = try Args.init(allocator, sig_t.TERM, .Child, p_args);
     defer args.deinit();
 
-    try std.testing.expectEqual(15, args.signal);
+    try std.testing.expectEqual(sig_t.TERM, args.signal);
     try std.testing.expectEqual(forwardMode.Child, args.mode);
 
     const expected: [5]?[*:0]const u8 = [_]?[*:0]const u8{ "foo", "--bar=x", "-v", "-c", null };
@@ -58,56 +58,58 @@ const Err = error{
     InvalidParams,
 };
 
-const std_sig = std.posix.SIG;
+const sig_t = std.posix.SIG;
 
 //NOTE: do we need to support realtime signals?
-const sig_map = std.StaticStringMap(u5).initComptime(.{
-    .{ "HUP", std_sig.HUP },
-    .{ "INT", std_sig.INT },
-    .{ "QUIT", std_sig.QUIT },
-    .{ "ILL", std_sig.ILL },
-    .{ "TRAP", std_sig.TRAP },
-    .{ "ABRT", std_sig.ABRT },
-    .{ "IOT", std_sig.IOT },
-    .{ "BUS", std_sig.BUS },
-    .{ "FPE", std_sig.FPE },
-    .{ "KILL", std_sig.KILL },
-    .{ "USR1", std_sig.USR1 },
-    .{ "SEGV", std_sig.SEGV },
-    .{ "USR2", std_sig.USR2 },
-    .{ "PIPE", std_sig.PIPE },
-    .{ "ALRM", std_sig.ALRM },
-    .{ "TERM", std_sig.TERM },
-    .{ "STKFLT", std_sig.STKFLT },
-    .{ "CHLD", std_sig.CHLD },
-    .{ "CONT", std_sig.CONT },
-    .{ "STOP", std_sig.STOP },
-    .{ "TSTP", std_sig.TSTP },
-    .{ "TTIN", std_sig.TTIN },
-    .{ "TTOU", std_sig.TTOU },
-    .{ "URG", std_sig.URG },
-    .{ "XCPU", std_sig.XCPU },
-    .{ "XFSZ", std_sig.XFSZ },
-    .{ "VTALRM", std_sig.VTALRM },
-    .{ "PROF", std_sig.PROF },
-    .{ "WINCH", std_sig.WINCH },
-    .{ "IO", std_sig.IO },
-    .{ "POLL", std_sig.POLL },
-    .{ "PWR", std_sig.PWR },
-    .{ "SYS", std_sig.SYS },
-    .{ "UNUSED", std_sig.UNUSED },
+const sig_map = std.StaticStringMap(sig_t).initComptime(.{
+    .{ "HUP", sig_t.HUP },
+    .{ "INT", sig_t.INT },
+    .{ "QUIT", sig_t.QUIT },
+    .{ "ILL", sig_t.ILL },
+    .{ "TRAP", sig_t.TRAP },
+    .{ "ABRT", sig_t.ABRT },
+    .{ "IOT", sig_t.IOT },
+    .{ "BUS", sig_t.BUS },
+    .{ "FPE", sig_t.FPE },
+    .{ "KILL", sig_t.KILL },
+    .{ "USR1", sig_t.USR1 },
+    .{ "SEGV", sig_t.SEGV },
+    .{ "USR2", sig_t.USR2 },
+    .{ "PIPE", sig_t.PIPE },
+    .{ "ALRM", sig_t.ALRM },
+    .{ "TERM", sig_t.TERM },
+    .{ "STKFLT", sig_t.STKFLT },
+    .{ "CHLD", sig_t.CHLD },
+    .{ "CONT", sig_t.CONT },
+    .{ "STOP", sig_t.STOP },
+    .{ "TSTP", sig_t.TSTP },
+    .{ "TTIN", sig_t.TTIN },
+    .{ "TTOU", sig_t.TTOU },
+    .{ "URG", sig_t.URG },
+    .{ "XCPU", sig_t.XCPU },
+    .{ "XFSZ", sig_t.XFSZ },
+    .{ "VTALRM", sig_t.VTALRM },
+    .{ "PROF", sig_t.PROF },
+    .{ "WINCH", sig_t.WINCH },
+    .{ "IO", sig_t.IO },
+    .{ "POLL", sig_t.POLL },
+    .{ "PWR", sig_t.PWR },
+    .{ "SYS", sig_t.SYS },
 });
 
-// support standard signal: 1~32
-fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?u5 {
+fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?sig_t {
     // test if s could convert to integer
-    const val = std.fmt.parseUnsigned(u5, s, 10) catch null;
+    const val = std.fmt.parseUnsigned(u32, s, 10) catch null;
     if (val) |sig_num| {
-        if (sig_num <= 0 or sig_num > 32) {
-            return null;
+        const sig_vals = sig_map.values();
+
+        for (sig_vals) |sig| {
+            if (sig_num == @intFromEnum(sig)) {
+                return sig;
+            }
         }
 
-        return sig_num;
+        return null;
     }
 
     // test if s is a signal name
@@ -130,9 +132,9 @@ fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?u5 {
 
 test parseSignal {
     const allocator = std.testing.allocator;
-    try std.testing.expectEqual(15, parseSignal(allocator, "15"));
-    try std.testing.expectEqual(15, parseSignal(allocator, "SIGTERM"));
-    try std.testing.expectEqual(15, parseSignal(allocator, "TERM"));
+    try std.testing.expectEqual(sig_t.TERM, parseSignal(allocator, "15"));
+    try std.testing.expectEqual(sig_t.TERM, parseSignal(allocator, "SIGTERM"));
+    try std.testing.expectEqual(sig_t.TERM, parseSignal(allocator, "TERM"));
     try std.testing.expectEqual(null, parseSignal(allocator, "UNKNOWN"));
     try std.testing.expectEqual(null, parseSignal(allocator, "32"));
     try std.testing.expectEqual(null, parseSignal(allocator, "0"));
@@ -184,7 +186,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         std.process.exit(0);
     }
 
-    var pd_signal: ?u5 = null;
+    var pd_signal: ?sig_t = null;
     if (res.args.signal) |signal| {
         pd_signal = parseSignal(allocator, signal) orelse {
             return Err.InvalidSignal;
@@ -218,16 +220,16 @@ fn handleSignal(comptime sig_list: anytype) SigConf {
     // Setting the TOSTOP flag on tty also has an effect:
     // https://man7.org/linux/man-pages/man3/termios.3.html
     const ignored = std.posix.Sigaction{
-        .handler = .{ .handler = std_sig.IGN },
+        .handler = .{ .handler = sig_t.IGN },
         .mask = .{0},
         .flags = 0,
     };
 
     var old_ttin_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std_sig.TTIN, &ignored, &old_ttin_action);
+    std.posix.sigaction(sig_t.TTIN, &ignored, &old_ttin_action);
 
     var old_ttou_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std_sig.TTOU, &ignored, &old_ttou_action);
+    std.posix.sigaction(sig_t.TTOU, &ignored, &old_ttou_action);
 
     return .{
         .old_set = old_set,
@@ -299,8 +301,8 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
         // fork will inherit signal settings from parent process
         // so we restore signal settings within child process
         std.posix.sigprocmask(std.posix.SIG.SETMASK, &sig_conf.old_set, null);
-        std.posix.sigaction(std_sig.TTIN, &sig_conf.ttin_action, null);
-        std.posix.sigaction(std_sig.TTOU, &sig_conf.ttou_action, null);
+        std.posix.sigaction(sig_t.TTIN, &sig_conf.ttin_action, null);
+        std.posix.sigaction(sig_t.TTOU, &sig_conf.ttou_action, null);
 
         var early_free = false;
         var envp = std.process.getEnvMap(allocator) catch |err| {
@@ -369,7 +371,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
         if (tracing_child) {
             const dummy_handler = struct {
-                pub fn handler(_: i32) callconv(.c) void {
+                pub fn handler(_: sig_t) callconv(.c) void {
                     _ = std.fs.File.stdout().write("received USR1 signal, continuing\n") catch {};
                 }
             }.handler;
@@ -381,11 +383,11 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             };
 
             var old_act: std.posix.Sigaction = undefined;
-            std.posix.sigaction(std_sig.USR1, &usr1_act, &old_act);
+            std.posix.sigaction(sig_t.USR1, &usr1_act, &old_act);
             std.log.info("waiting for USR1 signal", .{});
             _ = std.os.linux.pause();
 
-            std.posix.sigaction(std_sig.USR1, &old_act, null);
+            std.posix.sigaction(sig_t.USR1, &old_act, null);
         }
 
         // This function should never return
@@ -422,7 +424,7 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
             // try to broadcasting SIGTERM to child process and ignore the error
             // zinit unable to wait the rest of child process
             //TODO: should we wait other process exit?
-            std.posix.kill(-pid, std_sig.TERM) catch {};
+            std.posix.kill(-pid, sig_t.TERM) catch {};
 
             return ret_code;
         }
@@ -446,11 +448,11 @@ pub fn main() u8 {
     defer args.deinit();
 
     // we ignore all the signals that terminate with a core dump
-    const unblocked_sigs = .{ std_sig.ABRT, std_sig.BUS, std_sig.FPE, std_sig.ILL, std_sig.SEGV, std_sig.SYS, std_sig.TRAP, std_sig.XCPU, std_sig.XFSZ, std_sig.TTIN, std_sig.TTOU };
+    const unblocked_sigs = .{ sig_t.ABRT, sig_t.BUS, sig_t.FPE, sig_t.ILL, sig_t.SEGV, sig_t.SYS, sig_t.TRAP, sig_t.XCPU, sig_t.XFSZ, sig_t.TTIN, sig_t.TTOU };
     const sig_conf = handleSignal(unblocked_sigs);
 
     if (args.signal) |signal| {
-        _ = std.posix.prctl(std.posix.PR.SET_PDEATHSIG, .{signal}) catch |err| {
+        _ = std.posix.prctl(std.posix.PR.SET_PDEATHSIG, .{@intFromEnum(signal)}) catch |err| {
             std.log.err("failed to set parent death signal to {d}: {s}", .{ signal, @errorName(err) });
             return 1;
         };
@@ -485,14 +487,14 @@ pub fn main() u8 {
         };
 
         const siginfo = std.mem.bytesAsValue(std.os.linux.signalfd_siginfo, &buf);
-        if (siginfo.signo != std_sig.CHLD) {
+        if (siginfo.signo != @intFromEnum(sig_t.CHLD)) {
             std.log.debug("forwarding signal {d}", .{siginfo.signo});
             const destination = switch (args.mode) {
                 .Child => son,
                 .ProcessGroup => -son,
             };
 
-            std.posix.kill(destination, @intCast(siginfo.signo)) catch |err| {
+            std.posix.kill(destination, @enumFromInt(siginfo.signo)) catch |err| {
                 std.log.err("unable to send signal to child: {s}", .{@errorName(err)});
                 return 1;
             };

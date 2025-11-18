@@ -1,14 +1,14 @@
 .{
     .name = .zinit,
-    .version = "0.0.1",
+    .version = "0.0.2",
     .dependencies = .{
         .clap = .{
-            .url = "git+https://github.com/Hejsil/zig-clap#9cfa61596cd44ef7be35f8d2e108d2025e09868e",
-            .hash = "clap-0.10.0-oBajB_TnAQB0l5UdW9WYhhJDEswbedvwFOzzZwGknYeR",
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
+            .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
         },
     },
     .fingerprint = 0x9270341b70f1e3c6,
-    .minimum_zig_version = "0.15.0-dev.621+a63f7875f",
+    .minimum_zig_version = "0.16.0-dev.1344+bc589c271",
 
     .paths = .{
         "build.zig",
