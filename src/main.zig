@@ -4,28 +4,30 @@ const builtin = @import("builtin");
 const clap = @import("clap");
 
 const forwardMode = enum { Child, ProcessGroup };
+const FAILURE_EXIT_CODE: i32 = 1;
 
 const Args = struct {
     signal: ?sig_t,
     mode: forwardMode,
     args: std.ArrayList(?[*:0]const u8),
-    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
 
     pub fn init(allocator: std.mem.Allocator, signal: ?sig_t, mode: forwardMode, args: []const []const u8) !Args {
-        var list = try std.ArrayList(?[*:0]const u8).initCapacity(allocator, args.len + 1);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        const arena_allocator = arena.allocator();
+
+        var list = try std.ArrayList(?[*:0]const u8).initCapacity(arena_allocator, args.len + 1);
         for (args) |arg| {
-            const new_arg = try allocator.allocSentinel(u8, arg.len, 0);
-            @memcpy(new_arg[0..arg.len], arg);
+            const new_arg = try arena_allocator.dupeZ(u8, arg);
             list.appendAssumeCapacity(new_arg);
         }
-
         list.appendAssumeCapacity(null);
-        return .{ .signal = signal, .mode = mode, .args = list, .allocator = allocator };
+
+        return .{ .arena = arena, .signal = signal, .mode = mode, .args = list };
     }
 
     pub fn deinit(self: *Args) void {
-        releasePointerList(self.allocator, &self.args);
-        self.args.deinit(self.allocator);
+        self.arena.deinit();
     }
 };
 
@@ -97,13 +99,22 @@ const sig_map = std.StaticStringMap(sig_t).initComptime(.{
     .{ "SYS", sig_t.SYS },
 });
 
-fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?sig_t {
+fn parseSignal(s: []const u8) ?sig_t {
     // test if s could convert to integer
-    const val = std.fmt.parseUnsigned(u32, s, 10) catch null;
-    if (val) |sig_num| {
-        const sig_vals = sig_map.values();
+    const val = eval_num: {
+        break :eval_num std.fmt.parseUnsigned(u32, s, 10) catch |err| switch (err) {
+            error.Overflow => {
+                std.log.err("parse signal number overflow: {s}", .{s});
+                return null;
+            },
+            error.InvalidCharacter => {
+                break :eval_num null;
+            },
+        };
+    };
 
-        for (sig_vals) |sig| {
+    if (val) |sig_num| {
+        for (sig_map.values()) |sig| {
             if (sig_num == @intFromEnum(sig)) {
                 return sig;
             }
@@ -113,34 +124,35 @@ fn parseSignal(allocator: std.mem.Allocator, s: []const u8) ?sig_t {
     }
 
     // test if s is a signal name
-    var sig_name = s;
-    if (std.ascii.startsWithIgnoreCase(s, "SIG")) {
-        sig_name = std.ascii.allocUpperString(allocator, s[3..]) catch |err| {
-            std.log.err("unable to allocate memory: {s}", .{@errorName(err)});
-            return null;
-        };
-    }
-
-    defer {
-        if (sig_name.ptr != s.ptr) {
-            allocator.free(sig_name);
+    const name_to_check = eval_name: {
+        if (std.ascii.startsWithIgnoreCase(s, "SIG")) {
+            break :eval_name s[3..];
+        } else {
+            break :eval_name s;
         }
+    };
+
+    for (sig_map.keys(), sig_map.values()) |k, v| {
+        if (!std.ascii.eqlIgnoreCase(k, name_to_check)) {
+            continue;
+        }
+
+        return v;
     }
 
-    return sig_map.get(sig_name);
+    return null;
 }
 
 test parseSignal {
-    const allocator = std.testing.allocator;
-    try std.testing.expectEqual(sig_t.TERM, parseSignal(allocator, "15"));
-    try std.testing.expectEqual(sig_t.TERM, parseSignal(allocator, "SIGTERM"));
-    try std.testing.expectEqual(sig_t.TERM, parseSignal(allocator, "TERM"));
-    try std.testing.expectEqual(null, parseSignal(allocator, "UNKNOWN"));
-    try std.testing.expectEqual(null, parseSignal(allocator, "32"));
-    try std.testing.expectEqual(null, parseSignal(allocator, "0"));
+    try std.testing.expectEqual(sig_t.TERM, parseSignal("15"));
+    try std.testing.expectEqual(sig_t.TERM, parseSignal("SIGTERM"));
+    try std.testing.expectEqual(sig_t.TERM, parseSignal("TERM"));
+    try std.testing.expectEqual(null, parseSignal("UNKNOWN"));
+    try std.testing.expectEqual(null, parseSignal("32"));
+    try std.testing.expectEqual(null, parseSignal("0"));
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Args {
+fn parseArgs(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args) !?Args {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help
         \\-v, --version
@@ -156,39 +168,40 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     };
 
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, parsers, .{
+    var res = clap.parse(clap.Help, &params, parsers, args, .{
         .diagnostic = &diag,
         .allocator = allocator,
     }) catch |err| {
-        try diag.reportToFile(.stderr(), err);
+        try diag.reportToFile(io, .stderr(), err);
         return Err.InvalidParams;
     };
     defer res.deinit();
 
     if (res.args.help != 0) {
-        try std.fs.File.stdout().writeAll("zinit - A tiny init for linux container.\n\n");
-        try clap.helpToFile(.stdout(), clap.Help, &params, .{
+        try std.Io.File.stdout().writeStreamingAll(io, "zinit - A tiny init for linux container.\n\n");
+        try clap.helpToFile(io, .stdout(), clap.Help, &params, .{
             .indent = 2,
             .description_indent = 4,
             .description_on_new_line = false,
         });
 
-        std.process.exit(0);
+        return null;
     }
 
     if (res.args.version != 0) {
         // this function is wired, fmt and option will not be used
         var buffer: [32]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&buffer);
+        var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
         const stdout = &stdout_writer.interface;
         config.version.format(stdout) catch unreachable;
         try stdout.flush();
-        std.process.exit(0);
+
+        return null;
     }
 
     var pd_signal: ?sig_t = null;
     if (res.args.signal) |signal| {
-        pd_signal = parseSignal(allocator, signal) orelse {
+        pd_signal = parseSignal(signal) orelse {
             return Err.InvalidSignal;
         };
     }
@@ -239,13 +252,13 @@ fn handleSignal(comptime sig_list: anytype) SigConf {
     };
 }
 
-fn debugDump(desc: []const u8, ptr: [*:null]const ?[*:0]const u8) !void {
+fn debugDump(io: std.Io, desc: []const u8, ptr: [*:null]const ?[*:0]const u8) !void {
     if (comptime builtin.mode != .Debug) {
         return;
     }
 
     var buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &buf);
     const stdout = &stdout_writer.interface;
 
     try stdout.print("{s}:[\n", .{desc});
@@ -264,27 +277,49 @@ fn debugDump(desc: []const u8, ptr: [*:null]const ?[*:0]const u8) !void {
     try stdout.flush();
 }
 
-fn releasePointerList(allocator: std.mem.Allocator, ptr: *const std.ArrayList(?[*:0]const u8)) void {
-    for (ptr.items) |item| {
-        if (item != null) {
-            allocator.free(std.mem.span(item.?));
-        }
-    }
+fn reportChildError(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, err: anytype) noreturn {
+    const msg = std.fmt.allocPrint(allocator, fmt, .{err}) catch unreachable;
+    std.Io.File.stderr().writeStreamingAll(io, msg) catch unreachable;
+    std.os.linux.exit(FAILURE_EXIT_CODE);
 }
 
-fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig_conf: *const SigConf) std.posix.pid_t {
-    const pid = std.posix.fork() catch |err| {
-        std.log.err("unable to fork: {s}", .{@errorName(err)});
-        return -1;
-    };
+fn run(args: *Args, environ: std.process.Environ, sig_conf: *const SigConf) usize {
+    defer args.deinit();
+    const pid = std.os.linux.fork();
 
     if (pid == 0) {
+        const raw_allocator = std.heap.page_allocator;
+        var child_arena_allocator = std.heap.ArenaAllocator.init(raw_allocator);
+        defer child_arena_allocator.deinit(); // actually this is not necessary
+
+        const child_allocator = child_arena_allocator.allocator();
+        var threaded: std.Io.Threaded = .init(child_allocator, .{ .environ = environ, .argv0 = .empty });
+        const io = threaded.ioBasic();
+
+        const env_map = environ.createMap(child_allocator) catch |err| {
+            reportChildError(child_allocator, io, "unable to create environment map: {s}", @errorName(err));
+        };
+
+        var env_list = std.ArrayList(?[*:0]const u8).initCapacity(child_allocator, env_map.count() + 1) catch |err| {
+            reportChildError(child_allocator, io, "unable to init environment variable list: {s}", @errorName(err));
+        };
+
+        var iter = env_map.iterator();
+        while (iter.next()) |entry| {
+            var env = child_allocator.allocSentinel(u8, entry.key_ptr.len + entry.value_ptr.len + 1, 0) catch |err| {
+                reportChildError(child_allocator, io, "unable to allocate memory: {s}", @errorName(err));
+            };
+
+            @memcpy(env, entry.key_ptr.ptr);
+            env[entry.key_ptr.len] = '=';
+            @memcpy(env[entry.key_ptr.len + 1 ..], entry.value_ptr.ptr);
+            env_list.appendAssumeCapacity(env);
+        }
+        env_list.appendAssumeCapacity(null);
+
         // move to new process group
         // we could forward signal easily
-        std.posix.setpgid(0, 0) catch |err| {
-            std.log.err("unable to move child process into a new process group: {s}", .{@errorName(err)});
-            return -1;
-        };
+        _ = std.os.linux.setpgid(0, 0);
 
         // let child process to be foreground process
         // so that child process could take control of controlling terminal
@@ -293,8 +328,7 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
                 // not running in terminal
             },
             else => {
-                std.log.err("unable to set process group: {s}", .{@errorName(err)});
-                return -1;
+                reportChildError(child_allocator, io, "unable to set terminal process group: {s}", @errorName(err));
             },
         };
 
@@ -304,49 +338,14 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
         std.posix.sigaction(sig_t.TTIN, &sig_conf.ttin_action, null);
         std.posix.sigaction(sig_t.TTOU, &sig_conf.ttou_action, null);
 
-        var early_free = false;
-        var envp = std.process.getEnvMap(allocator) catch |err| {
-            std.log.err("unable to get environment variables: {s}", .{@errorName(err)});
-            return -1;
-        };
-        defer {
-            if (!early_free) {
-                envp.deinit();
-            }
-        }
-
-        var envp_list = std.ArrayList(?[*:0]const u8).initCapacity(allocator, envp.count() + 1) catch |err| {
-            std.log.err("unable to init environment variable list: {s}", .{@errorName(err)});
-            return -1;
-        };
-
-        defer {
-            releasePointerList(allocator, &envp_list);
-            envp_list.deinit(allocator);
-        }
-
-        var iter = envp.iterator();
-        while (iter.next()) |entry| {
-            var env = allocator.allocSentinel(u8, entry.key_ptr.len + entry.value_ptr.len + 1, 0) catch |err| {
-                std.log.err("unable to allocate memory: {s}", .{@errorName(err)});
-                return -1;
-            };
-
-            @memcpy(env, entry.key_ptr.ptr);
-            env[entry.key_ptr.len] = '=';
-            @memcpy(env[entry.key_ptr.len + 1 ..], entry.value_ptr.ptr);
-            envp_list.appendAssumeCapacity(env);
-        }
-        envp_list.appendAssumeCapacity(null);
-
         const tracing_child = blk: {
             // for convenience
-            if (envp.get("ZINIT_TRACING_CHILD")) |val| {
-                if (std.mem.eql(u8, val, "ON")) {
+            if (env_map.get("ZINIT_TRACING_CHILD")) |val| {
+                if (std.ascii.eqlIgnoreCase(val, "ON")) {
                     break :blk true;
                 }
 
-                if (std.mem.eql(u8, val, "OFF")) {
+                if (std.ascii.eqlIgnoreCase(val, "OFF")) {
                     break :blk false;
                 }
             }
@@ -354,26 +353,19 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
             break :blk config.tracing_child;
         };
 
-        // we do not need envp anymore
-        envp.deinit();
-        early_free = true;
-
-        const envp_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(envp_list.items.ptr);
-        debugDump("environment variables", envp_ptr) catch |err| {
-            std.log.err("unable to dump environment variables: {s}", .{@errorName(err)});
-            return -1;
+        const env_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(env_list.items.ptr);
+        debugDump(io, "environment variables", env_ptr) catch |err| {
+            reportChildError(child_allocator, io, "unable to dump environment variables: {s}", @errorName(err));
         };
 
-        debugDump("arguments", args_ptr) catch |err| {
-            std.log.err("unable to dump arguments: {s}", .{@errorName(err)});
-            return -1;
+        const args_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(args.args.items.ptr);
+        debugDump(io, "arguments", args_ptr) catch |err| {
+            reportChildError(child_allocator, io, "unable to dump arguments: {s}", @errorName(err));
         };
 
         if (tracing_child) {
             const dummy_handler = struct {
-                pub fn handler(_: sig_t) callconv(.c) void {
-                    _ = std.fs.File.stdout().write("received USR1 signal, continuing\n") catch {};
-                }
+                pub fn handler(_: sig_t) callconv(.c) void {}
             }.handler;
 
             const usr1_act: std.posix.Sigaction = .{
@@ -384,39 +376,38 @@ fn run(allocator: std.mem.Allocator, args_ptr: [*:null]const ?[*:0]const u8, sig
 
             var old_act: std.posix.Sigaction = undefined;
             std.posix.sigaction(sig_t.USR1, &usr1_act, &old_act);
-            std.log.info("waiting for USR1 signal", .{});
             _ = std.os.linux.pause();
 
             std.posix.sigaction(sig_t.USR1, &old_act, null);
         }
 
         // This function should never return
-        const ret = std.posix.execvpeZ(args_ptr[0].?, args_ptr, envp_ptr);
-        std.log.err("unable to execvpe: {s}", .{@errorName(ret)});
-        return -1;
+        const ret = std.os.linux.execve(args_ptr[0].?, args_ptr, env_ptr);
+        reportChildError(child_allocator, io, "unable to execve: {s}", @tagName(std.os.linux.errno(ret)));
     }
 
-    return pid;
+    return @intCast(pid);
 }
 
-fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
+fn handleExitedProcess(pid: usize) ?u8 {
+    var status: u32 = 0;
     while (true) {
-        const ret = std.posix.waitpid(-1, std.posix.W.NOHANG);
-        if (ret.pid == 0) {
+        const ret = std.os.linux.waitpid(-1, &status, std.posix.W.NOHANG);
+        if (ret == 0) {
             std.log.debug("no process to handle", .{});
             break;
         }
 
-        std.log.debug("child process {d} exited", .{ret.pid});
-        if (ret.pid == pid) { // main child process exited
+        std.log.debug("child process {d} exited", .{ret});
+        if (ret == pid) { // main child process exited
             var ret_code: u8 = 0;
-            if (std.posix.W.IFEXITED(ret.status)) {
-                ret_code = std.posix.W.EXITSTATUS(ret.status);
+            if (std.posix.W.IFEXITED(status)) {
+                ret_code = std.posix.W.EXITSTATUS(status);
                 std.log.info("main child process exited with code {d}.", .{ret_code});
-            } else if (std.posix.W.IFSIGNALED(ret.status)) {
-                const signal = std.posix.W.TERMSIG(ret.status);
+            } else if (std.posix.W.IFSIGNALED(status)) {
+                const signal = std.posix.W.TERMSIG(status);
                 std.log.info("main child process exited with signal {d}.", .{signal});
-                ret_code = 128 + @as(u8, @intCast(signal));
+                ret_code = @intCast(128 + @as(u32, @intFromEnum(signal)));
             } else {
                 std.log.err("child process exited with unknown status", .{});
             }
@@ -424,7 +415,7 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
             // try to broadcasting SIGTERM to child process and ignore the error
             // zinit unable to wait the rest of child process
             //TODO: should we wait other process exit?
-            std.posix.kill(-pid, sig_t.TERM) catch {};
+            std.posix.kill(-@as(std.posix.pid_t, @intCast(pid)), sig_t.TERM) catch {};
 
             return ret_code;
         }
@@ -435,17 +426,35 @@ fn handleExitedProcess(pid: std.posix.pid_t) ?u8 {
     return null;
 }
 
-pub fn main() u8 {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer if (gpa.deinit() == .leak) {
-        std.log.err("memory leak has been detected.", .{});
+var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+
+pub fn main(init: std.process.Init.Minimal) u8 {
+    const allocator, const is_debug = gpa: {
+        break :gpa switch (builtin.mode) {
+            .Debug => .{ debug_allocator.allocator(), true },
+            .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .{ std.heap.page_allocator, false },
+        };
     };
 
-    var args = parseArgs(gpa.allocator()) catch |err| {
+    defer if (is_debug) {
+        _ = debug_allocator.deinit();
+    };
+
+    var threaded: std.Io.Threaded = .init(allocator, .{
+        .environ = init.environ,
+        .argv0 = .init(init.args),
+    });
+    defer threaded.deinit();
+    const io = threaded.ioBasic();
+
+    const ret = parseArgs(io, allocator, init.args) catch |err| {
         std.log.err("unable to parse arguments: {s}", .{@errorName(err)});
         return 1;
     };
-    defer args.deinit();
+
+    var args = ret orelse {
+        return 0;
+    };
 
     // we ignore all the signals that terminate with a core dump
     const unblocked_sigs = .{ sig_t.ABRT, sig_t.BUS, sig_t.FPE, sig_t.ILL, sig_t.SEGV, sig_t.SYS, sig_t.TRAP, sig_t.XCPU, sig_t.XFSZ, sig_t.TTIN, sig_t.TTOU };
@@ -465,12 +474,8 @@ pub fn main() u8 {
         return 1;
     };
 
-    const son = run(gpa.allocator(), @ptrCast(args.args.items.ptr), &sig_conf);
-    if (son == -1) {
-        std.log.err("unable to run child process.", .{});
-        return 1;
-    }
-
+    //NOTE: args ownership transfer to run function
+    const child = run(&args, init.environ, &sig_conf);
     const sigfd = std.posix.signalfd(-1, &sig_conf.current_set, 0) catch |err| {
         std.log.err("unable to create signalfd: {s}", .{@errorName(err)});
         return 1;
@@ -479,7 +484,6 @@ pub fn main() u8 {
 
     var buf: [@sizeOf(std.os.linux.signalfd_siginfo)]u8 = undefined;
     while (true) {
-        std.log.debug("waiting for events", .{});
         @memset(std.mem.asBytes(&buf), 0);
         _ = std.posix.read(sigfd, &buf) catch |err| {
             std.log.err("unable to read from signalfd: {s}", .{@errorName(err)});
@@ -489,10 +493,12 @@ pub fn main() u8 {
         const siginfo = std.mem.bytesAsValue(std.os.linux.signalfd_siginfo, &buf);
         if (siginfo.signo != @intFromEnum(sig_t.CHLD)) {
             std.log.debug("forwarding signal {d}", .{siginfo.signo});
-            const destination = switch (args.mode) {
-                .Child => son,
-                .ProcessGroup => -son,
-            };
+            var destination = @as(std.posix.pid_t, @intCast(child));
+
+            if (args.mode == .ProcessGroup) {
+                // send signal to process group
+                destination = -destination;
+            }
 
             std.posix.kill(destination, @enumFromInt(siginfo.signo)) catch |err| {
                 std.log.err("unable to send signal to child: {s}", .{@errorName(err)});
@@ -500,7 +506,7 @@ pub fn main() u8 {
             };
         }
 
-        if (handleExitedProcess(son)) |code| {
+        if (handleExitedProcess(child)) |code| {
             return code;
         }
     }
