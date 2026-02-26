@@ -480,7 +480,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.log.err("unable to create signalfd: {s}", .{@errorName(err)});
         return 1;
     };
-    defer std.posix.close(sigfd);
+    defer {
+        const rc = std.os.linux.close(sigfd);
+        if (rc != 0) {
+            std.log.err("unable to close signalfd: {s}", .{@tagName(std.os.linux.errno(rc))});
+        }
+    }
 
     var buf: [@sizeOf(std.os.linux.signalfd_siginfo)]u8 = undefined;
     while (true) {
