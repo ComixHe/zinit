@@ -294,7 +294,7 @@ fn run(args: *Args, environ: std.process.Environ, sig_conf: *const SigConf) usiz
 
         const child_allocator = child_arena_allocator.allocator();
         var threaded: std.Io.Threaded = .init(child_allocator, .{ .environ = environ, .argv0 = .empty });
-        const io = threaded.ioBasic();
+        const io = threaded.io();
 
         const env_map = environ.createMap(child_allocator) catch |err| {
             reportChildError(child_allocator, io, "unable to create environment map: {s}", @errorName(err));
@@ -445,7 +445,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .argv0 = .init(init.args),
     });
     defer threaded.deinit();
-    const io = threaded.ioBasic();
+    const io = threaded.io();
 
     const ret = parseArgs(io, allocator, init.args) catch |err| {
         std.log.err("unable to parse arguments: {s}", .{@errorName(err)});

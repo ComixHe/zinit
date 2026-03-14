@@ -3,12 +3,12 @@
     .version = "0.0.3",
     .dependencies = .{
         .clap = .{
-            .url = "git+https://github.com/Hejsil/zig-clap#27621cb7207643f914bae7b01902b22a8b5916e7",
-            .hash = "clap-0.11.0-oBajBxDoAQChQCl4LRM4tyf-VChKLbhYilS806xxzxrQ",
+            .url = "git+https://github.com/Hejsil/zig-clap#23fa3eb4b056eeacc8349aa330e9e7102daf8c71",
+            .hash = "clap-0.11.0-oBajBxToAQBCuP2IJxUwO2-coRk96cBGDrJezaNZjsQN",
         },
     },
     .fingerprint = 0x9270341b70f1e3c6,
-    .minimum_zig_version = "0.16.0-dev.2653+784e89fd4",
+    .minimum_zig_version = "0.16.0-dev.2860+9c5460316",
 
     .paths = .{
         "build.zig",
