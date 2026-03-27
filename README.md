@@ -1,21 +1,35 @@
 # zinit
 
-A tiny init written in Zig for linux container, which for forwarding signal and recycling dead processes.
+A tiny init process written in Zig for Linux containers, designed for signal forwarding and orphan process collection.
+
+## Features
+
+- **Signal Forwarding**: Forward signals from parent process to child processes
+- **Orphan Process Collection**: Acts as a child subreaper to collect orphaned processes
+- **Parent Death Signal**: Configurable signal when parent process dies
+- **Terminal Control**: Properly handles terminal process groups for interactive applications
+- **Debug Support**: Optional tracing mode for debugging child processes
 
 ## Requirements
 
-- Zig compiler (>= 0.14.0)
+- Zig compiler (>= 0.16.0-dev.2860)
 - Linux >= 3.4 (for PR_SET_CHILD_SUBREAPER)
-- Linux kernel supports signalfd
+- Linux kernel with signalfd support
 
-## Installation & Build
+## Installation
+
+### From Source
 
 ```bash
-git clone <repo_url> && cd <project_dir>
-zig build --release=safe
+git clone <repo_url> && cd zinit
+zig build -Doptimize=ReleaseSafe
 ```
 
-## Command‑Line Options
+### Build Options
+
+- `-Dtracing-child=true`: Enable tracing mode (child waits for SIGUSR1 before exec)
+
+## Usage
 
 ```Text
 Usage: zinit [OPTIONS] -- <command> [args...]
@@ -25,27 +39,87 @@ Options:
   -v, --version               Show version and exit
   -s, --signal <SIGNAL>       The triggered signal when parent process dies
   --forward-mode <MODE>       The mode of forwarding signals to child processes
-```
 
-- `<command>`: The binary to execute.
-- `[args...]`: Arguments passed to the child process.
+Forward Modes:
+  Child         Forward signals to the main child process (default)
+  ProcessGroup  Forward signals to the entire process group
+```
 
 ## Examples
 
+### Basic Usage
+
 ```bash
-#!/path/to/zinit /bin/bash
+# Run a simple command
+zinit -- /bin/bash -c "echo hello"
+
+# With signal forwarding
+zinit -s TERM -- /bin/sh -c "sleep 100"
+```
+
+### As a Container Init Process
+
+```bash
+#!/path/to/zinit -- /bin/bash
 export YOUR_ENV=SOME_VALUE
 # do some preparing
 exec my-binary
 ```
 
-## Configuration & Environment Variables
+### Signal Forwarding to Process Group
 
-you can build from source with '-Dtracing-child=true' or set **ZINIT_TRACING_CHILD=ON** at runtime to make child process waiting before execvpe.
+```bash
+# Forward signals to all processes in the group
+zinit --forward-mode ProcessGroup -- /bin/sh -c "stress-ng --cpu 4"
+```
 
-The priority of **ZINIT_TRACING_CHILD** is higher than build config, you can set this to **ON** or **OFF** to override config value.
+## Configuration
 
-One usage is using strace to tracing child process.
+### Environment Variables
+
+- `ZINIT_TRACING_CHILD=ON|OFF`: Override build-time tracing configuration
+  - When `ON`, child process waits for SIGUSR1 before executing
+  - Useful for debugging with `strace` or similar tools
+
+### Build Configuration
+
+```bash
+# Build with tracing enabled
+zig build -Dtracing-child=true -Doptimize=ReleaseSafe
+```
+
+## How It Works
+
+1. **Initialization**: Sets up signal handling and becomes a child subreaper
+2. **Fork**: Creates a child process in a new process group
+3. **Signal Loop**: Waits for signals using signalfd
+4. **Signal Forwarding**: Forwards received signals to child processes
+5. **Process Collection**: Collects exited child processes and handles orphaned processes
+
+## Development
+
+### Building for Development
+
+```bash
+# Debug build
+zig build
+
+# Run tests
+zig build test
+
+# Run with arguments
+zig build run -- /bin/bash
+```
+
+### Project Structure
+
+```
+├── src/
+│   └── main.zig      # Main application logic
+├── build.zig         # Build configuration
+├── build.zig.zon     # Package metadata
+└── LICENSE           # MIT License
+```
 
 ## License
 
