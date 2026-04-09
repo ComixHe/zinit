@@ -1,5 +1,7 @@
 # zinit
 
+[![Coverage Status](https://img.shields.io/codecov/c/github/ComixHe/zinit?style=flat-square&logo=codecov)](https://codecov.io/gh/ComixHe/zinit)
+
 A tiny init process written in Zig for Linux containers, designed for signal forwarding, orphan process collection, and safer PID 1 shutdown behavior.
 
 ## Features
