@@ -245,20 +245,16 @@ fn parseRewrite(map: *RewriteMap, value: []const u8) !void {
     const new = kv.next() orelse return ZinitError.InvalidRewrite;
     const new_sig = parseSignal(new) orelse return ZinitError.InvalidSignal;
 
-    if (old_sig == new_sig) {
-        return ZinitError.DuplicateSignal;
+    if (kv.peek() != null) {
+        return ZinitError.InvalidRewrite;
     }
 
-    if (map.contains(old_sig)) {
+    if (old_sig == new_sig) {
         return ZinitError.DuplicateSignal;
     }
 
     if (hasCycle(map, new_sig)) {
         return ZinitError.CycleRewrite;
-    }
-
-    if (kv.peek() != null) {
-        return ZinitError.InvalidRewrite;
     }
 
     const result = map.getOrPutAssumeCapacity(old_sig);
@@ -835,9 +831,22 @@ fn tryClose(fd: std.os.linux.fd_t) void {
         switch (std.os.linux.errno(close_rc)) {
             .SUCCESS => return,
             .INTR => continue,
-            else => |err| Logger.err("unable to close fd {d}: {s}", .{ fd, @tagName(err) }),
+            else => |err| {
+                Logger.err("unable to close fd {d}: {s}", .{ fd, @tagName(err) });
+                break;
+            },
         }
     }
+}
+
+test tryClose {
+    tryClose(-1);
+
+    const fd = std.os.linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0o600);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(fd));
+    tryClose(@intCast(fd));
+
+    tryClose(5);
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
