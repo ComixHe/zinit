@@ -12,18 +12,7 @@ pub fn build(b: *std.Build) void {
     const size_analysis = b.option(bool, "size-analysis", "Keep symbols in release builds for bloaty analysis") orelse false;
     const coverage = b.option(bool, "test-coverage", "Generate coverage reports") orelse false;
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = is_release and !size_analysis,
-        .omit_frame_pointer = is_release,
-        .single_threaded = true,
-        .unwind_tables = if (is_release) .none else .sync,
-        .link_libc = false,
-        .link_libcpp = false,
-        .error_tracing = !is_release,
-    });
+    const exe_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .strip = is_release and !size_analysis, .omit_frame_pointer = is_release, .single_threaded = true, .unwind_tables = if (is_release) .none else .sync, .pic = true });
 
     const exe = b.addExecutable(.{
         .name = "zinit",

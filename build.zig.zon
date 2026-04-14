@@ -1,6 +1,6 @@
 .{
     .name = .zinit,
-    .version = "0.0.3",
+    .version = "0.1.0",
     .dependencies = .{
         .clap = .{
             .url = "git+https://github.com/Hejsil/zig-clap#fc1e5cc3f6d9d3001112385ee6256d694e959d2f",
@@ -8,7 +8,7 @@
         },
     },
     .fingerprint = 0x9270341b70f1e3c6,
-    .minimum_zig_version = "0.16.0-dev.2860+9c5460316",
+    .minimum_zig_version = "0.16.0-dev.3153+d6f43caad",
 
     .paths = .{
         "build.zig",

@@ -216,7 +216,7 @@ fn parseSignal(s: []const u8) ?u32 {
     return sig_map.get(upper_name);
 }
 
-const RewriteMap = std.AutoArrayHashMap(u32, u32);
+const RewriteMap = std.AutoArrayHashMapUnmanaged(u32, u32);
 
 fn hasCycle(map: *const RewriteMap, start_node: u32) bool {
     var visited = std.StaticBitSet(std.posix.NSIG).initEmpty();
@@ -261,13 +261,20 @@ fn parseRewrite(map: *RewriteMap, value: []const u8) !void {
         return ZinitError.InvalidRewrite;
     }
 
-    try map.put(old_sig, new_sig);
+    const result = map.getOrPutAssumeCapacity(old_sig);
+    if (result.found_existing) {
+        return ZinitError.DuplicateSignal;
+    }
+
+    result.value_ptr.* = new_sig;
 }
 
 fn buildRewriteMap(allocator: std.mem.Allocator, rewrites: []const []const u8) !?RewriteMap {
     if (rewrites.len == 0) return null;
 
-    var map = RewriteMap.init(allocator);
+    var map = RewriteMap.empty;
+    try map.ensureTotalCapacity(allocator, rewrites.len);
+    errdefer map.deinit(allocator);
 
     for (rewrites) |value| {
         parseRewrite(&map, value) catch {
@@ -276,7 +283,7 @@ fn buildRewriteMap(allocator: std.mem.Allocator, rewrites: []const []const u8) !
         };
     }
 
-    map.shrinkAndFree(map.count());
+    map.shrinkAndFree(allocator, map.count());
     return map;
 }
 
@@ -964,8 +971,9 @@ test "parseSignal edge cases" {
 
 test parseRewrite {
     const allocator = std.testing.allocator;
-    var map = RewriteMap.init(allocator);
-    defer map.deinit();
+    var map = RewriteMap.empty;
+    try map.ensureTotalCapacity(allocator, 1);
+    defer map.deinit(allocator);
 
     try parseRewrite(&map, "TERM:INT");
     const new_sig = map.get(15);
@@ -975,8 +983,10 @@ test parseRewrite {
 
 test "parseRewrite error cases" {
     const allocator = std.testing.allocator;
-    var map = RewriteMap.init(allocator);
-    defer map.deinit();
+    var map = RewriteMap.empty;
+    defer map.deinit(allocator);
+
+    try map.ensureTotalCapacity(allocator, 3);
 
     try std.testing.expectError(ZinitError.InvalidRewrite, parseRewrite(&map, "TERM"));
 
@@ -987,58 +997,62 @@ test "parseRewrite error cases" {
     try parseRewrite(&map, "TERM:INT");
     try std.testing.expectError(ZinitError.DuplicateSignal, parseRewrite(&map, "TERM:HUP"));
 
-    map.clearAndFree();
+    map.clearRetainingCapacity();
     try std.testing.expectError(ZinitError.InvalidRewrite, parseRewrite(&map, "TERM:INT:EXTRA"));
 
-    try map.put(1, 2);
-    try map.put(2, 9);
-    try map.put(9, 1);
+    map.putAssumeCapacity(1, 2);
+    map.putAssumeCapacity(2, 9);
+    map.putAssumeCapacity(9, 1);
     try std.testing.expectError(ZinitError.CycleRewrite, parseRewrite(&map, "TERM:1"));
 }
 
 test hasCycle {
     const allocator = std.testing.allocator;
-    var map = RewriteMap.init(allocator);
-    defer map.deinit();
+    var map = RewriteMap.empty;
+    defer map.deinit(allocator);
 
-    try map.put(15, 2);
+    try map.ensureTotalCapacity(allocator, 3);
+
+    map.putAssumeCapacity(15, 2);
     try std.testing.expect(!hasCycle(&map, 15));
 
-    try map.put(2, 9);
+    map.putAssumeCapacity(2, 9);
     try std.testing.expect(!hasCycle(&map, 15));
 
-    try map.put(9, 15);
+    map.putAssumeCapacity(9, 15);
     try std.testing.expect(hasCycle(&map, 15));
     try std.testing.expect(hasCycle(&map, 2));
     try std.testing.expect(hasCycle(&map, 9));
 
-    map.clearAndFree();
+    map.clearRetainingCapacity();
 
     const rtmin = std.os.linux.sigrtmin();
     const rtmax = std.os.linux.sigrtmax();
 
-    try map.put(rtmin, @intCast(rtmin + 1));
+    map.putAssumeCapacity(rtmin, @intCast(rtmin + 1));
     try std.testing.expect(!hasCycle(&map, rtmin));
 
-    try map.put(@intCast(rtmin + 1), @intCast(rtmin + 2));
+    map.putAssumeCapacity(@intCast(rtmin + 1), @intCast(rtmin + 2));
     try std.testing.expect(!hasCycle(&map, rtmin));
 
-    try map.put(@intCast(rtmin + 2), rtmin);
+    map.putAssumeCapacity(@intCast(rtmin + 2), rtmin);
     try std.testing.expect(hasCycle(&map, rtmin));
 
     if (rtmax > 60) {
-        map.clearAndFree();
-        try map.put(@intCast(rtmax), @intCast(rtmax - 1));
+        map.clearRetainingCapacity();
+        map.putAssumeCapacity(@intCast(rtmax), @intCast(rtmax - 1));
         try std.testing.expect(!hasCycle(&map, rtmax));
     }
 }
 
 test mapSignal {
     const allocator = std.testing.allocator;
-    var map = RewriteMap.init(allocator);
-    defer map.deinit();
+    var map = RewriteMap.empty;
+    defer map.deinit(allocator);
 
-    try map.put(15, 2);
+    try map.ensureTotalCapacity(allocator, 1);
+
+    map.putAssumeCapacity(15, 2);
 
     try std.testing.expectEqual(2, mapSignal(map, 15));
     try std.testing.expectEqual(9, mapSignal(map, 9));
@@ -1051,7 +1065,7 @@ test buildRewriteMap {
     var map = try buildRewriteMap(allocator, &[_][]const u8{"TERM:INT"});
     try std.testing.expect(map != null);
     if (map) |*m| {
-        defer m.deinit();
+        defer m.deinit(allocator);
         try std.testing.expectEqual(@as(?u32, 2), m.get(15));
     }
 
