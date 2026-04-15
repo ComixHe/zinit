@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
     } });
     const optimize = b.standardOptimizeOption(.{});
 
+    const opts = .{
+        .optimize = optimize,
+        .target = target,
+    };
+
     const is_release = optimize != .Debug;
     const size_analysis = b.option(bool, "size-analysis", "Keep symbols in release builds for bloaty analysis") orelse false;
     const coverage = b.option(bool, "test-coverage", "Generate coverage reports") orelse false;
@@ -24,7 +29,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const clap = b.dependency("clap", .{});
+    const clap = b.dependency("clap", opts);
     exe.root_module.addImport("clap", clap.module("clap"));
 
     const config = b.addOptions();

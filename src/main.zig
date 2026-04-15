@@ -4,9 +4,7 @@ const builtin = @import("builtin");
 const clap = @import("clap");
 
 pub const std_options: std.Options = .{
-    .enable_segfault_handler = false,
     .signal_stack_size = null,
-    .allow_stack_tracing = false,
     .networking = false,
 };
 
@@ -25,8 +23,6 @@ fn minimalPanic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noretur
 
     std.os.linux.exit(1);
 }
-
-var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 
 const LogLevel = enum(u8) {
     err = 0,
@@ -188,14 +184,14 @@ fn parseRealtimeSignal(s: []const u8) ?u32 {
     return null;
 }
 
-fn parseSignal(s: []const u8) ?u32 {
+fn parseSignal(s: []const u8) !u32 {
     if (s.len == 0) {
-        return null;
+        return ZinitError.InvalidParams;
     }
 
     if (std.fmt.parseUnsigned(u32, s, 10)) |sig_num| {
         if (isValidU32(sig_num)) return @intCast(sig_num);
-        return null;
+        return ZinitError.InvalidSignal;
     } else |_| {}
 
     if (parseRealtimeSignal(s)) |sig_num| {
@@ -208,42 +204,57 @@ fn parseSignal(s: []const u8) ?u32 {
         s;
 
     if (name_to_check.len == 0 or name_to_check.len > 15) {
-        return null;
+        return ZinitError.InvalidSignal;
     }
 
     var buf: [16]u8 = undefined;
     const upper_name = std.ascii.upperString(&buf, name_to_check);
-    return sig_map.get(upper_name);
+    return sig_map.get(upper_name) orelse ZinitError.InvalidSignal;
 }
 
-const RewriteMap = std.AutoArrayHashMapUnmanaged(u32, u32);
+const RewriteMap = struct {
+    entries: [std.os.linux.NSIG]u32 = [_]u32{0} ** std.os.linux.NSIG,
+
+    pub fn get(self: *const RewriteMap, sig: u32) u32 {
+        return self.entries[sig];
+    }
+
+    pub fn has(self: *const RewriteMap, sig: u32) bool {
+        return self.entries[sig] != 0;
+    }
+
+    pub fn set(self: *RewriteMap, old_sig: u32, new_sig: u32) void {
+        self.entries[old_sig] = new_sig;
+    }
+};
 
 fn hasCycle(map: *const RewriteMap, start_node: u32) bool {
-    var visited = std.StaticBitSet(std.posix.NSIG).initEmpty();
-    std.debug.assert(start_node > 0 and start_node < std.posix.NSIG);
+    std.debug.assert(start_node > 0 and start_node < std.os.linux.NSIG);
 
-    visited.set(start_node);
     var current = start_node;
-    while (map.get(current)) |next_node| {
-        if (visited.isSet(next_node)) {
-            return true;
+    var count: usize = 0;
+    while (true) {
+        const next_node = map.get(current);
+        if (next_node == 0) {
+            return false;
         }
 
-        visited.set(next_node);
+        count += 1;
+        if (count >= std.os.linux.NSIG) return true;
         current = next_node;
     }
 
-    return false;
+    unreachable;
 }
 
 fn parseRewrite(map: *RewriteMap, value: []const u8) !void {
     var kv = std.mem.splitScalar(u8, value, ':');
 
     const old = kv.next() orelse return ZinitError.InvalidRewrite;
-    const old_sig = parseSignal(old) orelse return ZinitError.InvalidSignal;
+    const old_sig = try parseSignal(old);
 
     const new = kv.next() orelse return ZinitError.InvalidRewrite;
-    const new_sig = parseSignal(new) orelse return ZinitError.InvalidSignal;
+    const new_sig = try parseSignal(new);
 
     if (kv.peek() != null) {
         return ZinitError.InvalidRewrite;
@@ -257,104 +268,85 @@ fn parseRewrite(map: *RewriteMap, value: []const u8) !void {
         return ZinitError.CycleRewrite;
     }
 
-    const result = map.getOrPutAssumeCapacity(old_sig);
-    if (result.found_existing) {
+    if (map.has(old_sig)) {
         return ZinitError.DuplicateSignal;
     }
 
-    result.value_ptr.* = new_sig;
-}
-
-fn buildRewriteMap(allocator: std.mem.Allocator, rewrites: []const []const u8) !?RewriteMap {
-    if (rewrites.len == 0) return null;
-
-    var map = RewriteMap.empty;
-    try map.ensureTotalCapacity(allocator, rewrites.len);
-    errdefer map.deinit(allocator);
-
-    for (rewrites) |value| {
-        parseRewrite(&map, value) catch {
-            Logger.err("unable to parse rewrite: {s}", .{value});
-            return ZinitError.InvalidRewrite;
-        };
-    }
-
-    map.shrinkAndFree(allocator, map.count());
-    return map;
+    map.set(old_sig, new_sig);
 }
 
 fn mapSignal(rewrite: ?RewriteMap, signo: u32) u32 {
-    return if (rewrite) |m| m.get(signo) orelse signo else signo;
+    if (rewrite) |m| {
+        const mapped = m.get(signo);
+        if (mapped != 0) return mapped;
+    }
+
+    return signo;
 }
 
 const forwardMode = enum { Child, ProcessGroup };
 
 const Args = struct {
+    allocator: std.mem.Allocator,
     log_level: LogLevel,
     pdeath_signal: ?u32,
     mode: forwardMode,
-    rewrite: ?RewriteMap,
+    rewrites: ?RewriteMap,
     expected_exit: ?u8,
     subreaper: bool,
     tracing_child: bool,
     argv: [:null]const ?[*:0]const u8,
-    envp: [:null]const ?[*:0]const u8,
-    arena: std.heap.ArenaAllocator,
+    envs: [:null]const ?[*:0]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        environ: std.process.Environ,
+        envs: [:null]const ?[*:0]const u8,
         log_level: LogLevel,
         pdeath_signal: ?u32,
         mode: forwardMode,
-        rewrites: []const []const u8,
+        rewrites: ?RewriteMap,
         expected_exit: ?u8,
         subreaper: bool,
         tracing_child: bool,
         args: []const []const u8,
     ) !Args {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const arena_allocator = arena.allocator();
+        const argv = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
 
-        const argv = try arena_allocator.allocSentinel(?[*:0]const u8, args.len, null);
         for (args, 0..) |arg, i| {
-            argv[i] = try arena_allocator.dupeSentinel(u8, arg, 0);
+            argv[i] = @as([*:0]const u8, @ptrCast(arg.ptr));
         }
-
-        const env_view = environ.block.view();
-        const envp = try arena_allocator.allocSentinel(?[*:0]const u8, env_view.slice.len, null);
-        for (env_view.slice, 0..) |raw_ptr, i| {
-            envp[i] = raw_ptr;
-        }
-
-        const rewrite_map = try buildRewriteMap(arena_allocator, rewrites);
 
         return .{
-            .arena = arena,
+            .allocator = allocator,
             .log_level = log_level,
             .pdeath_signal = pdeath_signal,
             .mode = mode,
-            .rewrite = rewrite_map,
+            .rewrites = rewrites,
             .expected_exit = expected_exit,
             .subreaper = subreaper,
             .tracing_child = tracing_child,
             .argv = argv,
-            .envp = envp,
+            .envs = envs,
         };
     }
 
     pub fn deinit(self: *Args) void {
-        self.arena.deinit();
+        self.allocator.free(self.argv);
     }
 };
 
-fn parseLogLevel(value: []const u8) ?LogLevel {
+fn parseForwardMode(value: []const u8) !forwardMode {
+    if (std.ascii.eqlIgnoreCase(value, "child")) return .Child;
+    if (std.ascii.eqlIgnoreCase(value, "processGroup")) return .ProcessGroup;
+    return ZinitError.InvalidParams;
+}
+
+fn parseLogLevel(value: []const u8) !LogLevel {
     if (std.ascii.eqlIgnoreCase(value, "error")) return .err;
     if (std.ascii.eqlIgnoreCase(value, "warning")) return .warn;
     if (std.ascii.eqlIgnoreCase(value, "info")) return .info;
     if (std.ascii.eqlIgnoreCase(value, "debug")) return .debug;
-    return null;
+    return ZinitError.InvalidParams;
 }
 
 fn parseExpectedExit(value: []const u8) !u8 {
@@ -366,106 +358,126 @@ fn parseTracingChild(env_val: ?[]const u8, default: bool) bool {
     return if (std.ascii.eqlIgnoreCase(val, "OFF")) false else if (std.ascii.eqlIgnoreCase(val, "ON")) true else default;
 }
 
-fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args, environ: std.process.Environ) !?Args {
-    const params = comptime clap.parseParamsComptime(
-        \\-h, --help
-        \\-v, --version
-        \\--log-level <LEVEL>            "Set log level: error, warning, info, or debug"
-        \\-p, --signal <SIGNAL>          "The triggered signal when parent process dies"
-        \\-s, --subreaper                "Enable child subreaper mode explicitly"
-        \\-r, --rewrite <OLD:NEW>...     "Rewrite a forwarded signal before sending to the child"
-        \\-e, --expect-exit <CODE>       "Map a child exit code to 0"
-        \\--forward-mode <MODE>          "The mode of forwarding signals to child processes"
-        \\<ARG>...                       "Arguments to be passed to the child process"
+fn printHelp(io: std.Io) !void {
+    const out = std.Io.File.stdout();
+    try out.writeStreamingAll(io,
+        \\zinit - A tiny init for linux containers.
+        \\
+        \\Usage: zinit [options] <ARG>...
+        \\
+        \\Options:
+        \\  -h, --help                     Display this help and exit
+        \\  -v, --version                  Output version information and exit
+        \\      --log-level <LEVEL>        Set log level: error, warn(default), info, or debug
+        \\  -p, --signal <SIGNAL>          The triggered signal when parent process dies
+        \\  -s, --subreaper                Enable child subreaper mode explicitly
+        \\  -r, --rewrite <OLD:NEW>...     Rewrite a forwarded signal before sending to the child
+        \\  -e, --expect-exit <CODE>       Map a child exit code to 0
+        \\      --forward-mode <MODE>      The mode of forwarding signals to child processes: child (default) or processGroup
+        \\
     );
+}
 
-    const parsers = comptime .{
-        .LEVEL = clap.parsers.string,
-        .SIGNAL = clap.parsers.string,
-        .MODE = clap.parsers.enumeration(forwardMode),
-        .@"OLD:NEW" = clap.parsers.string,
-        .CODE = clap.parsers.string,
-        .ARG = clap.parsers.string,
+fn printVersion(io: std.Io) !void {
+    var buffer: [16]u8 = undefined;
+    var out = std.Io.File.stdout().writer(io, buffer[0..]).interface;
+    try config.version.format(&out);
+}
+
+fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, environ: std.process.Environ) !?Args {
+    const params = [_]clap.Param(u8){
+        .{ .id = 'h', .names = .{ .short = 'h', .long = "help" } },
+        .{ .id = 'v', .names = .{ .short = 'v', .long = "version" } },
+        .{ .id = 'L', .names = .{ .long = "log-level" }, .takes_value = .one },
+        .{ .id = 'p', .names = .{ .short = 'p', .long = "signal" }, .takes_value = .one },
+        .{ .id = 's', .names = .{ .short = 's', .long = "subreaper" } },
+        .{ .id = 'r', .names = .{ .short = 'r', .long = "rewrite" }, .takes_value = .one },
+        .{ .id = 'e', .names = .{ .short = 'e', .long = "expect-exit" }, .takes_value = .one },
+        .{ .id = 'M', .names = .{ .long = "forward-mode" }, .takes_value = .one },
+        .{ .id = 'A', .takes_value = .one },
     };
 
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, parsers, args, .{
+    var parser = clap.streaming.Clap(u8, std.process.Args.Iterator){
+        .params = &params,
+        .iter = args_iter,
         .diagnostic = &diag,
-        .allocator = allocator,
-    }) catch |err| {
-        try diag.reportToFile(io, .stderr(), err);
-        return ZinitError.InvalidParams;
     };
-    defer res.deinit();
 
-    if (res.args.help != 0) {
-        const out = std.Io.File.stdout();
-        try out.writeStreamingAll(io, "zinit - A tiny init for linux containers.\n\n");
-        try clap.helpToFile(io, out, clap.Help, &params, .{
-            .indent = 2,
-            .description_indent = 4,
-            .description_on_new_line = false,
-        });
+    var rewrite_map: ?RewriteMap = null;
+    var child_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer child_args.deinit(allocator);
 
-        return null;
+    var log_level: LogLevel = .warn;
+    var pdeath_signal: ?u32 = null;
+    var forward_mode: forwardMode = .Child;
+    var subreaper_flag = false;
+    var expected_exit: ?u8 = null;
+
+    while (parser.next() catch |err| {
+        try diag.reportToFile(io, .stderr(), err);
+        return err;
+    }) |arg| {
+        switch (arg.param.id) {
+            'h' => {
+                try printHelp(io);
+                return null;
+            },
+            'v' => {
+                try printVersion(io);
+                return null;
+            },
+            'L' => log_level = try parseLogLevel(arg.value.?),
+            'p' => pdeath_signal = try parseSignal(arg.value.?),
+            's' => subreaper_flag = true,
+            'r' => {
+                if (rewrite_map == null) rewrite_map = .{};
+                try parseRewrite(&rewrite_map.?, arg.value.?);
+            },
+            'e' => expected_exit = try parseExpectedExit(arg.value.?),
+            'M' => forward_mode = try parseForwardMode(arg.value.?),
+            'A' => {
+                try child_args.append(allocator, arg.value.?);
+
+                while (args_iter.next()) |remainder| {
+                    try child_args.append(allocator, remainder);
+                }
+
+                break;
+            },
+            else => unreachable,
+        }
     }
 
-    if (res.args.version != 0) {
-        var buffer: [32]u8 = undefined;
-        var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
-        const stdout = &stdout_writer.interface;
-        try config.version.format(stdout);
-        try stdout.flush();
-        return null;
-    }
-
-    const log_level = if (res.args.@"log-level") |value|
-        parseLogLevel(value) orelse {
-            Logger.err("invalid log level: '{s}'", .{value});
-            return ZinitError.InvalidParams;
-        }
-    else
-        .warn;
-
-    const pdeath_signal = if (res.args.signal) |sig|
-        parseSignal(sig) orelse {
-            Logger.err("invalid signal name or number: '{s}'", .{sig});
-            return ZinitError.InvalidSignal;
-        }
-    else
-        null;
-
-    const expected_exit = if (res.args.@"expect-exit") |value|
-        parseExpectedExit(value) catch {
-            Logger.err("invalid expected exit code: '{s}'", .{value});
-            return ZinitError.InvalidExitCode;
-        }
-    else
-        null;
-
+    if (child_args.items.len == 0) return error.InvalidParams;
     const tracing_child = parseTracingChild(environ.getPosix("ZINIT_TRACING_CHILD"), config.tracing_child);
 
     return try Args.init(
         allocator,
-        environ,
+        environ.block.slice,
         log_level,
         pdeath_signal,
-        res.args.@"forward-mode" orelse .Child,
-        res.args.rewrite,
+        forward_mode,
+        rewrite_map,
         expected_exit,
-        res.args.subreaper != 0,
+        subreaper_flag,
         tracing_child,
-        res.positionals[0],
+        child_args.items,
     );
 }
 
-fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args, environ: std.process.Environ) !?Args {
+fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init.Minimal) !?Args {
+    var args_iter = init.args.iterate();
+    defer args_iter.deinit();
+    _ = args_iter.skip(); // skip argv0
+
     var threaded: std.Io.Threaded = .init(allocator, .{
-        .environ = environ,
-        .argv0 = .init(args),
+        .environ = init.environ,
+        .argv0 = .init(init.args),
     });
     defer threaded.deinit();
-    return parseArgsWithIo(threaded.io(), allocator, args, environ);
+
+    return parseArgsWithIo(threaded.io(), allocator, &args_iter, init.environ);
 }
 
 const SHUTDOWN_GRACE_PERIOD_NS: u64 = 5 * std.time.ns_per_s;
@@ -584,9 +596,7 @@ fn run(args: *Args, sig_conf: *const SigConf) !usize {
         std.posix.sigaction(sig_t.USR1, &old_act, null);
     }
 
-    const env_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(args.envp.ptr);
-    const args_ptr: [*:null]const ?[*:0]const u8 = @ptrCast(args.argv.ptr);
-    const ret = std.os.linux.execve(args_ptr[0].?, args_ptr, env_ptr);
+    const ret = std.os.linux.execve(args.argv[0].?, args.argv, args.envs);
     reportChildError("unable to execve: {s}", .{@tagName(std.os.linux.errno(ret))});
 }
 
@@ -647,7 +657,7 @@ fn logExitedProcess(pid: usize, status: u32) void {
 const ProcessState = struct {
     child: usize,
     expected_exit: ?u8,
-    rewrite: ?RewriteMap,
+    rewrites: ?RewriteMap,
     mode: forwardMode,
     sigfd: std.posix.fd_t,
     shutdown: ?ShutdownState = null,
@@ -702,7 +712,7 @@ fn getSignalDestination(mode: forwardMode, child_pid: usize) std.posix.pid_t {
 }
 
 fn forwardSignal(state: *ProcessState, signo: u32) void {
-    const signal_to_send = mapSignal(state.rewrite, signo);
+    const signal_to_send = mapSignal(state.rewrites, signo);
     Logger.debug("forwarding signal {d} as {d}", .{ signo, signal_to_send });
 
     const destination = getSignalDestination(state.mode, state.child);
@@ -849,6 +859,7 @@ test tryClose {
     tryClose(5);
 }
 
+var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 pub fn main(init: std.process.Init.Minimal) u8 {
     const allocator, const is_debug = gpa: {
         break :gpa switch (builtin.mode) {
@@ -861,7 +872,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = debug_allocator.deinit();
     };
 
-    var args = parseArgs(allocator, init.args, init.environ) catch |err| {
+    var args = parseArgs(allocator, init) catch |err| {
         Logger.err("unable to parse arguments: {s}", .{@errorName(err)});
         return 1;
     } orelse return 0;
@@ -904,7 +915,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var process_state = ProcessState{
         .child = child,
         .expected_exit = args.expected_exit,
-        .rewrite = args.rewrite,
+        .rewrites = args.rewrites,
         .mode = args.mode,
         .sigfd = sigfd,
     };
@@ -959,30 +970,27 @@ test "Logger functions" {
 }
 
 test parseSignal {
-    try std.testing.expectEqual(@as(?u32, 15), parseSignal("15"));
-    try std.testing.expectEqual(@as(?u32, 15), parseSignal("SIGTERM"));
-    try std.testing.expectEqual(@as(?u32, 15), parseSignal("TERM"));
-    try std.testing.expectEqual(@as(?u32, std.os.linux.sigrtmin()), parseSignal("SIGRTMIN"));
-    try std.testing.expectEqual(@as(?u32, std.os.linux.sigrtmin() + 2), parseSignal("SIGRTMIN+2"));
-    try std.testing.expectEqual(@as(?u32, std.os.linux.sigrtmax() - 1), parseSignal("RTMAX-1"));
-    try std.testing.expectEqual(null, parseSignal("UNKNOWN"));
-    try std.testing.expectEqual(null, parseSignal("999"));
-    try std.testing.expectEqual(null, parseSignal("0"));
-    try std.testing.expectEqual(null, parseSignal(""));
+    try std.testing.expectEqual(15, parseSignal("15") catch unreachable);
+    try std.testing.expectEqual(15, parseSignal("SIGTERM") catch unreachable);
+    try std.testing.expectEqual(15, parseSignal("TERM") catch unreachable);
+    try std.testing.expectEqual(std.os.linux.sigrtmin(), parseSignal("SIGRTMIN") catch unreachable);
+    try std.testing.expectEqual(std.os.linux.sigrtmin() + 2, parseSignal("SIGRTMIN+2") catch unreachable);
+    try std.testing.expectEqual(std.os.linux.sigrtmax() - 1, parseSignal("RTMAX-1") catch unreachable);
+    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("UNKNOWN"));
+    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("999"));
+    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("0"));
+    try std.testing.expectError(ZinitError.InvalidParams, parseSignal(""));
 }
 
 test "parseSignal edge cases" {
-    try std.testing.expectEqual(null, parseSignal("SIG"));
-    try std.testing.expectEqual(null, parseSignal("A"));
+    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("SIG"));
+    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("A"));
     const long_name = "SIG" ++ "A" ** 20;
-    try std.testing.expectEqual(null, parseSignal(long_name));
+    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal(long_name));
 }
 
 test parseRewrite {
-    const allocator = std.testing.allocator;
-    var map = RewriteMap.empty;
-    try map.ensureTotalCapacity(allocator, 1);
-    defer map.deinit(allocator);
+    var map: RewriteMap = .{};
 
     try parseRewrite(&map, "TERM:INT");
     const new_sig = map.get(15);
@@ -991,11 +999,7 @@ test parseRewrite {
 }
 
 test "parseRewrite error cases" {
-    const allocator = std.testing.allocator;
-    var map = RewriteMap.empty;
-    defer map.deinit(allocator);
-
-    try map.ensureTotalCapacity(allocator, 3);
+    var map: RewriteMap = .{};
 
     try std.testing.expectError(ZinitError.InvalidRewrite, parseRewrite(&map, "TERM"));
 
@@ -1006,83 +1010,58 @@ test "parseRewrite error cases" {
     try parseRewrite(&map, "TERM:INT");
     try std.testing.expectError(ZinitError.DuplicateSignal, parseRewrite(&map, "TERM:HUP"));
 
-    map.clearRetainingCapacity();
+    map = .{};
     try std.testing.expectError(ZinitError.InvalidRewrite, parseRewrite(&map, "TERM:INT:EXTRA"));
 
-    map.putAssumeCapacity(1, 2);
-    map.putAssumeCapacity(2, 9);
-    map.putAssumeCapacity(9, 1);
+    map.set(1, 2);
+    map.set(2, 9);
+    map.set(9, 1);
     try std.testing.expectError(ZinitError.CycleRewrite, parseRewrite(&map, "TERM:1"));
 }
 
 test hasCycle {
-    const allocator = std.testing.allocator;
-    var map = RewriteMap.empty;
-    defer map.deinit(allocator);
+    var map: RewriteMap = .{};
 
-    try map.ensureTotalCapacity(allocator, 3);
-
-    map.putAssumeCapacity(15, 2);
+    map.set(15, 2);
     try std.testing.expect(!hasCycle(&map, 15));
 
-    map.putAssumeCapacity(2, 9);
+    map.set(2, 9);
     try std.testing.expect(!hasCycle(&map, 15));
 
-    map.putAssumeCapacity(9, 15);
+    map.set(9, 15);
     try std.testing.expect(hasCycle(&map, 15));
     try std.testing.expect(hasCycle(&map, 2));
     try std.testing.expect(hasCycle(&map, 9));
 
-    map.clearRetainingCapacity();
+    map = .{};
 
     const rtmin = std.os.linux.sigrtmin();
     const rtmax = std.os.linux.sigrtmax();
 
-    map.putAssumeCapacity(rtmin, @intCast(rtmin + 1));
+    map.set(rtmin, @intCast(rtmin + 1));
     try std.testing.expect(!hasCycle(&map, rtmin));
 
-    map.putAssumeCapacity(@intCast(rtmin + 1), @intCast(rtmin + 2));
+    map.set(@intCast(rtmin + 1), @intCast(rtmin + 2));
     try std.testing.expect(!hasCycle(&map, rtmin));
 
-    map.putAssumeCapacity(@intCast(rtmin + 2), rtmin);
+    map.set(@intCast(rtmin + 2), rtmin);
     try std.testing.expect(hasCycle(&map, rtmin));
 
     if (rtmax > 60) {
-        map.clearRetainingCapacity();
-        map.putAssumeCapacity(@intCast(rtmax), @intCast(rtmax - 1));
+        map = .{};
+        map.set(@intCast(rtmax), @intCast(rtmax - 1));
         try std.testing.expect(!hasCycle(&map, rtmax));
     }
 }
 
 test mapSignal {
-    const allocator = std.testing.allocator;
-    var map = RewriteMap.empty;
-    defer map.deinit(allocator);
+    var map: RewriteMap = .{};
 
-    try map.ensureTotalCapacity(allocator, 1);
-
-    map.putAssumeCapacity(15, 2);
+    map.set(15, 2);
 
     try std.testing.expectEqual(2, mapSignal(map, 15));
     try std.testing.expectEqual(9, mapSignal(map, 9));
     try std.testing.expectEqual(15, mapSignal(null, 15));
-}
-
-test buildRewriteMap {
-    const allocator = std.testing.allocator;
-
-    var map = try buildRewriteMap(allocator, &[_][]const u8{"TERM:INT"});
-    try std.testing.expect(map != null);
-    if (map) |*m| {
-        defer m.deinit(allocator);
-        try std.testing.expectEqual(@as(?u32, 2), m.get(15));
-    }
-
-    const empty_map = try buildRewriteMap(allocator, &[_][]const u8{});
-    try std.testing.expect(empty_map == null);
-
-    const invalid_result = buildRewriteMap(allocator, &[_][]const u8{"INVALID"});
-    try std.testing.expectError(ZinitError.InvalidRewrite, invalid_result);
 }
 
 test Args {
@@ -1096,7 +1075,10 @@ test Args {
 
     const p_args: []const []const u8 = &[_][]const u8{ "foo", "--bar=x", "-v", "-c" };
 
-    var args = try Args.init(allocator, environ, .debug, 15, .Child, &[_][]const u8{"15:2"}, 143, true, true, p_args);
+    var map: RewriteMap = .{};
+    map.set(15, 2);
+
+    var args = try Args.init(allocator, environ.block.slice, .debug, 15, .Child, map, 143, true, true, p_args);
     defer args.deinit();
 
     try std.testing.expectEqual(LogLevel.debug, args.log_level);
@@ -1110,7 +1092,7 @@ test Args {
     try std.testing.expectEqual(@as(?[*:0]const u8, null), args.argv[p_args.len]);
 
     var found_env = false;
-    for (args.envp) |entry| {
+    for (args.envs) |entry| {
         const raw = entry orelse continue;
         if (std.mem.eql(u8, std.mem.span(raw), "ZINIT_TEST_KEY=1")) {
             found_env = true;
@@ -1122,11 +1104,11 @@ test Args {
 }
 
 test parseLogLevel {
-    try std.testing.expectEqual(LogLevel.err, parseLogLevel("error").?);
-    try std.testing.expectEqual(LogLevel.warn, parseLogLevel("WARNING").?);
-    try std.testing.expectEqual(LogLevel.info, parseLogLevel("Info").?);
-    try std.testing.expectEqual(LogLevel.debug, parseLogLevel("debug").?);
-    try std.testing.expectEqual(null, parseLogLevel("trace"));
+    try std.testing.expectEqual(LogLevel.err, parseLogLevel("error") catch unreachable);
+    try std.testing.expectEqual(LogLevel.warn, parseLogLevel("WARNING") catch unreachable);
+    try std.testing.expectEqual(LogLevel.info, parseLogLevel("Info") catch unreachable);
+    try std.testing.expectEqual(LogLevel.debug, parseLogLevel("debug") catch unreachable);
+    try std.testing.expectError(ZinitError.InvalidParams, parseLogLevel("trace"));
 }
 
 test "parseExpectedExit" {
@@ -1155,24 +1137,11 @@ test "Args.init without rewrite" {
     defer environ.block.deinit(allocator);
 
     const p_args: []const []const u8 = &[_][]const u8{"test"};
-    var args = try Args.init(allocator, environ, .warn, null, .Child, &[_][]const u8{}, null, false, false, p_args);
+    var args = try Args.init(allocator, environ.block.slice, .warn, null, .Child, null, null, false, false, p_args);
     defer args.deinit();
 
-    try std.testing.expect(args.rewrite == null);
-    try std.testing.expect(args.envp[0] == null);
-}
-
-test "Args.init with invalid rewrite triggers error log" {
-    const allocator = std.testing.allocator;
-    var env_map: std.process.Environ.Map = .init(allocator);
-    defer env_map.deinit();
-
-    const environ: std.process.Environ = .{ .block = try env_map.createPosixBlock(allocator, .{}) };
-    defer environ.block.deinit(allocator);
-
-    const p_args: []const []const u8 = &[_][]const u8{"test"};
-    const result = Args.init(allocator, environ, .warn, null, .Child, &[_][]const u8{"INVALID"}, null, false, false, p_args);
-    try std.testing.expectError(ZinitError.InvalidRewrite, result);
+    try std.testing.expect(args.rewrites == null);
+    try std.testing.expect(args.envs[0] == null);
 }
 
 test "Args.init with empty env" {
@@ -1185,11 +1154,11 @@ test "Args.init with empty env" {
     defer environ.block.deinit(allocator);
 
     const p_args: []const []const u8 = &[_][]const u8{"test"};
-    var args = try Args.init(allocator, environ, .warn, null, .Child, &[_][]const u8{}, null, false, false, p_args);
+    var args = try Args.init(allocator, environ.block.slice, .warn, null, .Child, null, null, false, false, p_args);
     defer args.deinit();
 
     var found = false;
-    for (args.envp) |entry| {
+    for (args.envs) |entry| {
         if (entry) |raw| {
             if (std.mem.startsWith(u8, std.mem.span(raw), "TEST_KEY=")) {
                 found = true;
