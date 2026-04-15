@@ -16,7 +16,7 @@ A tiny init process written in Zig for Linux containers, designed for signal for
 
 ## Requirements
 
-- Zig compiler (>= 0.16.0-dev.2860)
+- Zig compiler (>= 0.16.0-dev.3153)
 - Linux >= 3.4 (for PR_SET_CHILD_SUBREAPER)
 - Linux kernel with signalfd support
 
@@ -40,9 +40,9 @@ Options:
   --log-level <LEVEL>         Set log level: error, warning, info, or debug
   -p, --signal <SIGNAL>       Signal to send when parent process dies
   -s, --subreaper             Enable child subreaper mode explicitly
+  -n, --new-session           Enable new session mode for process groups
   -r, --rewrite <OLD:NEW>     Rewrite a signal before forwarding (can be repeated)
   -e, --expect-exit <CODE>    Treat child exit code as success (0)
-  --forward-mode <MODE>       Signal forwarding mode: Child (default) or ProcessGroup
 
 Signal formats:
   - Number: 15, 9, 2
@@ -70,13 +70,15 @@ When running `zinit` outside of PID 1 (e.g., as a supervisor process), explicitl
 zinit --subreaper -- /usr/bin/my-daemon
 ```
 
-### Forward Signals to Process Groups
+### Use New Session for Process Groups
 
-For applications that spawn worker processes, use `ProcessGroup` mode to ensure all processes receive signals:
+For applications that spawn worker processes, use `--new-session` to create a new session and forward signals to the entire process group:
 
 ```bash
-zinit --forward-mode ProcessGroup -- /bin/sh -c "stress-ng --cpu 4"
+zinit --new-session -- /bin/sh -c "stress-ng --cpu 4"
 ```
+
+This option also automatically rewrites job control signals (TSTP, TTOU, TTIN) to STOP to avoid issues when running in background process groups.
 
 ### Handle Application-Specific Exit Codes
 
@@ -117,7 +119,7 @@ exec /usr/bin/my-application
 ### Multi-Process Container
 
 ```bash
-zinit --forward-mode ProcessGroup -- /bin/sh -c '
+zinit --new-session -- /bin/sh -c '
   nginx &
   php-fpm &
   wait

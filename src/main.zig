@@ -15,7 +15,7 @@ else
 
 fn minimalPanic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
     const prefix = "zinit panic: ";
-    const stderr_fd = std.os.linux.STDERR_FILENO;
+    const stderr_fd = std.posix.STDERR_FILENO;
 
     _ = std.os.linux.write(stderr_fd, prefix, prefix.len);
     _ = std.os.linux.write(stderr_fd, msg.ptr, msg.len);
@@ -33,9 +33,9 @@ const LogLevel = enum(u8) {
 
 const Logger = struct {
     var runtime_log_level: LogLevel = .warn;
-    var target_fd: std.os.linux.fd_t = std.os.linux.STDERR_FILENO;
+    var target_fd: std.posix.fd_t = std.posix.STDERR_FILENO;
 
-    pub fn setTargetFd(fd: std.os.linux.fd_t) void {
+    pub fn setTargetFd(fd: std.posix.fd_t) void {
         target_fd = fd;
     }
 
@@ -67,7 +67,7 @@ const Logger = struct {
         writeFormattedLog(.debug, format, args);
     }
 
-    fn rawTryWriteAll(fd: std.os.linux.fd_t, bytes: []const u8) void {
+    fn rawTryWriteAll(fd: std.posix.fd_t, bytes: []const u8) void {
         if (comptime builtin.is_test) {
             return;
         }
@@ -146,21 +146,21 @@ const sig_map = std.StaticStringMap(u32).initComptime(.{
 });
 
 fn isValidU32(sig_num: u32) bool {
-    return sig_num > 0 and sig_num < std.os.linux.NSIG;
+    return sig_num > 0 and sig_num < std.posix.NSIG;
 }
 
 fn parseRealtimeSignal(s: []const u8) ?u32 {
     const rtmin_prefixes = [_][]const u8{ "RTMIN", "SIGRTMIN" };
     inline for (rtmin_prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(s, prefix)) {
-            const base = std.os.linux.sigrtmin();
+            const base = std.posix.sigrtmin();
             const suffix = s[prefix.len..];
             if (suffix.len == 0) return base;
             if (suffix[0] != '+') return null;
 
             const offset = std.fmt.parseUnsigned(u8, suffix[1..], 10) catch return null;
             const value = @as(u32, base) + offset;
-            if (!isValidU32(value) or value > std.os.linux.sigrtmax()) return null;
+            if (!isValidU32(value) or value > std.posix.sigrtmax()) return null;
             return @intCast(value);
         }
     }
@@ -168,7 +168,7 @@ fn parseRealtimeSignal(s: []const u8) ?u32 {
     const rtmax_prefixes = [_][]const u8{ "RTMAX", "SIGRTMAX" };
     inline for (rtmax_prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(s, prefix)) {
-            const base = std.os.linux.sigrtmax();
+            const base = std.posix.sigrtmax();
             const suffix = s[prefix.len..];
             if (suffix.len == 0) return base;
             if (suffix[0] != '-') return null;
@@ -213,7 +213,7 @@ fn parseSignal(s: []const u8) !u32 {
 }
 
 const RewriteMap = struct {
-    entries: [std.os.linux.NSIG]u32 = [_]u32{0} ** std.os.linux.NSIG,
+    entries: [std.posix.NSIG]u32 = [_]u32{0} ** std.posix.NSIG,
 
     pub fn get(self: *const RewriteMap, sig: u32) u32 {
         return self.entries[sig];
@@ -229,7 +229,7 @@ const RewriteMap = struct {
 };
 
 fn hasCycle(map: *const RewriteMap, start_node: u32) bool {
-    std.debug.assert(start_node > 0 and start_node < std.os.linux.NSIG);
+    std.debug.assert(start_node > 0 and start_node < std.posix.NSIG);
 
     var current = start_node;
     var count: usize = 0;
@@ -240,7 +240,7 @@ fn hasCycle(map: *const RewriteMap, start_node: u32) bool {
         }
 
         count += 1;
-        if (count >= std.os.linux.NSIG) return true;
+        if (count >= std.posix.NSIG) return true;
         current = next_node;
     }
 
@@ -284,16 +284,15 @@ fn mapSignal(rewrite: ?RewriteMap, signo: u32) u32 {
     return signo;
 }
 
-const forwardMode = enum { Child, ProcessGroup };
-
 const Args = struct {
     allocator: std.mem.Allocator,
     log_level: LogLevel,
     pdeath_signal: ?u32,
-    mode: forwardMode,
     rewrites: ?RewriteMap,
     expected_exit: ?u8,
     subreaper: bool,
+    new_session: bool,
+    is_terminal: bool,
     tracing_child: bool,
     argv: [:null]const ?[*:0]const u8,
     envs: [:null]const ?[*:0]const u8,
@@ -303,10 +302,11 @@ const Args = struct {
         envs: [:null]const ?[*:0]const u8,
         log_level: LogLevel,
         pdeath_signal: ?u32,
-        mode: forwardMode,
         rewrites: ?RewriteMap,
         expected_exit: ?u8,
         subreaper: bool,
+        new_session: bool,
+        is_terminal: bool,
         tracing_child: bool,
         args: []const []const u8,
     ) !Args {
@@ -320,13 +320,14 @@ const Args = struct {
             .allocator = allocator,
             .log_level = log_level,
             .pdeath_signal = pdeath_signal,
-            .mode = mode,
             .rewrites = rewrites,
             .expected_exit = expected_exit,
             .subreaper = subreaper,
             .tracing_child = tracing_child,
             .argv = argv,
             .envs = envs,
+            .new_session = new_session,
+            .is_terminal = is_terminal,
         };
     }
 
@@ -334,12 +335,6 @@ const Args = struct {
         self.allocator.free(self.argv);
     }
 };
-
-fn parseForwardMode(value: []const u8) !forwardMode {
-    if (std.ascii.eqlIgnoreCase(value, "child")) return .Child;
-    if (std.ascii.eqlIgnoreCase(value, "processGroup")) return .ProcessGroup;
-    return ZinitError.InvalidParams;
-}
 
 fn parseLogLevel(value: []const u8) !LogLevel {
     if (std.ascii.eqlIgnoreCase(value, "error")) return .err;
@@ -371,17 +366,18 @@ fn printHelp(io: std.Io) !void {
         \\      --log-level <LEVEL>        Set log level: error, warn(default), info, or debug
         \\  -p, --signal <SIGNAL>          The triggered signal when parent process dies
         \\  -s, --subreaper                Enable child subreaper mode explicitly
+        \\  -n, --new-session              Enable new session mode explicitly
         \\  -r, --rewrite <OLD:NEW>...     Rewrite a forwarded signal before sending to the child
         \\  -e, --expect-exit <CODE>       Map a child exit code to 0
-        \\      --forward-mode <MODE>      The mode of forwarding signals to child processes: child (default) or processGroup
         \\
     );
 }
 
 fn printVersion(io: std.Io) !void {
     var buffer: [16]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, buffer[0..]).interface;
-    try config.version.format(&out);
+    var writer = std.Io.File.stdout().writer(io, buffer[0..]);
+    try config.version.format(&writer.interface);
+    try writer.flush();
 }
 
 fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, environ: std.process.Environ) !?Args {
@@ -393,7 +389,7 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
         .{ .id = 's', .names = .{ .short = 's', .long = "subreaper" } },
         .{ .id = 'r', .names = .{ .short = 'r', .long = "rewrite" }, .takes_value = .one },
         .{ .id = 'e', .names = .{ .short = 'e', .long = "expect-exit" }, .takes_value = .one },
-        .{ .id = 'M', .names = .{ .long = "forward-mode" }, .takes_value = .one },
+        .{ .id = 'n', .names = .{ .short = 'n', .long = "new-session" } },
         .{ .id = 'A', .takes_value = .one },
     };
 
@@ -410,9 +406,9 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
 
     var log_level: LogLevel = .warn;
     var pdeath_signal: ?u32 = null;
-    var forward_mode: forwardMode = .Child;
     var subreaper_flag = false;
     var expected_exit: ?u8 = null;
+    var new_session = false;
 
     while (parser.next() catch |err| {
         try diag.reportToFile(io, .stderr(), err);
@@ -427,6 +423,7 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
                 try printVersion(io);
                 return null;
             },
+            'n' => new_session = true,
             'L' => log_level = try parseLogLevel(arg.value.?),
             'p' => pdeath_signal = try parseSignal(arg.value.?),
             's' => subreaper_flag = true,
@@ -435,7 +432,6 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
                 try parseRewrite(&rewrite_map.?, arg.value.?);
             },
             'e' => expected_exit = try parseExpectedExit(arg.value.?),
-            'M' => forward_mode = try parseForwardMode(arg.value.?),
             'A' => {
                 try child_args.append(allocator, arg.value.?);
 
@@ -452,15 +448,39 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
     if (child_args.items.len == 0) return error.InvalidParams;
     const tracing_child = parseTracingChild(environ.getPosix("ZINIT_TRACING_CHILD"), config.tracing_child);
 
+    if (new_session) {
+        if (rewrite_map == null) {
+            rewrite_map = .{};
+        }
+
+        const stop = @intFromEnum(sig_t.STOP);
+        const tstp = @intFromEnum(sig_t.TSTP);
+        const ttou = @intFromEnum(sig_t.TTOU);
+        const ttin = @intFromEnum(sig_t.TTIN);
+
+        if (!rewrite_map.?.has(tstp)) {
+            rewrite_map.?.set(tstp, stop);
+        }
+
+        if (!rewrite_map.?.has(ttou)) {
+            rewrite_map.?.set(ttou, stop);
+        }
+
+        if (!rewrite_map.?.has(ttin)) {
+            rewrite_map.?.set(ttin, stop);
+        }
+    }
+
     return try Args.init(
         allocator,
         environ.block.slice,
         log_level,
         pdeath_signal,
-        forward_mode,
         rewrite_map,
         expected_exit,
         subreaper_flag,
+        new_session,
+        try std.Io.File.stdout().isTty(io),
         tracing_child,
         child_args.items,
     );
@@ -487,11 +507,12 @@ const SigConf = struct {
     current_set: std.posix.sigset_t,
     ttin_action: std.posix.Sigaction,
     ttou_action: std.posix.Sigaction,
+    ignore_detached_sig: bool = false,
 };
 
-fn handleSignal(comptime sig_list: anytype) SigConf {
+fn handleSignal(comptime sig_list: []const sig_t) SigConf {
     var set = std.posix.sigfillset();
-    inline for (sig_list) |sig| {
+    for (sig_list) |sig| {
         std.posix.sigdelset(&set, sig);
     }
 
@@ -535,28 +556,46 @@ fn restoreChildSignals(sig_conf: *const SigConf) void {
     std.posix.sigaction(sig_t.TTOU, &sig_conf.ttou_action, null);
 }
 
-fn setupChildTerminal() void {
-    const sid = std.os.linux.setsid();
-    var err = std.os.linux.errno(sid);
-    if (err != .SUCCESS and err != .PERM) {
-        reportChildError("unable to create session: {s}", .{@tagName(err)});
-    }
-
-    const rc = std.os.linux.ioctl(std.posix.STDIN_FILENO, std.posix.T.IOCSCTTY, 1);
-    err = std.os.linux.errno(rc);
-    if (err != .SUCCESS and err != .NOTTY and err != .INVAL and err != .PERM) {
-        reportChildError("unable to acquire controlling tty: {s}", .{@tagName(err)});
-    }
-
-    const child_pid = std.os.linux.getpid();
-    std.posix.tcsetpgrp(std.posix.STDIN_FILENO, child_pid) catch |e| {
-        if (e != std.posix.TermioSetPgrpError.NotATerminal and e != std.posix.TermioSetPgrpError.NotAPgrpMember) {
-            reportChildError("tcsetpgrp failed: {s}", .{@errorName(e)});
+fn setupChildTerminal(args: Args) void {
+    if (args.new_session) {
+        const sid = std.os.linux.setsid();
+        const err = std.os.linux.errno(sid);
+        if (err != .SUCCESS) {
+            reportChildError("unable to create session: {s}", .{@tagName(err)});
         }
-    };
+    }
+
+    if (!args.is_terminal) {
+        return;
+    }
+
+    const rc = std.os.linux.ioctl(std.posix.STDIN_FILENO, std.posix.T.IOCSCTTY, 0);
+    const err = std.os.linux.errno(rc);
+    if (err != .SUCCESS) {
+        Logger.debug("unable to acquire controlling tty: {s}", .{@tagName(err)});
+    }
 }
 
-fn run(args: *Args, sig_conf: *const SigConf) !usize {
+fn run(args: *Args, sig_conf: *SigConf) !usize {
+    // detach zinit from control terminal, let child handle it
+    if (args.new_session and args.is_terminal) {
+        const rc = std.os.linux.ioctl(std.posix.STDIN_FILENO, std.posix.T.IOCNOTTY, 0);
+        const err = std.os.linux.errno(rc);
+        if (err != .SUCCESS) { // maybe the in/out has been redirected
+            Logger.debug("unable to detach from terminal: {s}", .{@tagName(err)});
+        } else {
+            if (std.os.linux.getsid(0) == std.os.linux.getpid()) {
+                // if session leader detachs from the control terminal
+                // kernel will send SIGHUP and SIGCONT to the process group
+                // so we should ignore the first SIGHUP/SIGCONT while forwarding signals
+                sig_conf.ignore_detached_sig = true;
+                Logger.debug("detaching from controlling terminal, ignoring first SIGHUP/SIGCONT", .{});
+            } else {
+                Logger.debug("detached from controlling terminal, but was not session leader", .{});
+            }
+        }
+    }
+
     const pid = std.os.linux.fork();
     const err = std.os.linux.errno(pid);
     if (err != .SUCCESS) {
@@ -571,7 +610,7 @@ fn run(args: *Args, sig_conf: *const SigConf) !usize {
     defer args.deinit();
 
     restoreChildSignals(sig_conf);
-    setupChildTerminal();
+    setupChildTerminal(args.*);
 
     if (args.pdeath_signal) |sig| {
         _ = std.posix.prctl(std.posix.PR.SET_PDEATHSIG, .{sig}) catch |e| {
@@ -634,7 +673,10 @@ fn reapOne(flags: u32, status: *u32) !ReapResult {
             .INTR => continue,
             .SUCCESS => return .{ .pid = @intCast(ret) },
             .CHILD => return .no_children,
-            else => return std.posix.unexpectedErrno(err),
+            else => {
+                Logger.debug("unable to waitpid: {s}", .{@tagName(err)});
+                return ZinitError.SysCallError;
+            },
         }
     }
 }
@@ -658,9 +700,11 @@ const ProcessState = struct {
     child: usize,
     expected_exit: ?u8,
     rewrites: ?RewriteMap,
-    mode: forwardMode,
     sigfd: std.posix.fd_t,
     shutdown: ?ShutdownState = null,
+    new_session: bool,
+    ignore_hup: bool = false,
+    ignore_cont: bool = false,
 };
 
 const ShutdownState = struct {
@@ -704,18 +748,28 @@ fn handleSignalEvent(state: *ProcessState) ?u8 {
     }
 }
 
-fn getSignalDestination(mode: forwardMode, child_pid: usize) std.posix.pid_t {
-    return if (mode == .ProcessGroup)
+fn getSignalDestination(new_session: bool, child_pid: usize) std.posix.pid_t {
+    return if (new_session)
         -@as(std.posix.pid_t, @intCast(child_pid))
     else
         @intCast(child_pid);
 }
 
 fn forwardSignal(state: *ProcessState, signo: u32) void {
+    if (state.ignore_hup and signo == @intFromEnum(sig_t.HUP)) {
+        state.ignore_hup = false;
+        return;
+    }
+
+    if (state.ignore_cont and signo == @intFromEnum(sig_t.CONT)) {
+        state.ignore_cont = false;
+        return;
+    }
+
     const signal_to_send = mapSignal(state.rewrites, signo);
     Logger.debug("forwarding signal {d} as {d}", .{ signo, signal_to_send });
 
-    const destination = getSignalDestination(state.mode, state.child);
+    const destination = getSignalDestination(state.new_session, state.child);
 
     std.posix.kill(destination, @enumFromInt(signal_to_send)) catch |err| {
         Logger.err("unable to send signal to child: {s}", .{@errorName(err)});
@@ -831,7 +885,7 @@ fn reapShutdownChildren() !bool {
     }
 }
 
-fn tryClose(fd: std.os.linux.fd_t) void {
+fn tryClose(fd: std.posix.fd_t) void {
     if (fd < 0) {
         return;
     }
@@ -851,11 +905,9 @@ fn tryClose(fd: std.os.linux.fd_t) void {
 
 test tryClose {
     tryClose(-1);
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0o600);
 
-    const fd = std.os.linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0o600);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(fd));
-    tryClose(@intCast(fd));
-
+    tryClose(fd);
     tryClose(5);
 }
 
@@ -879,8 +931,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer args.deinit();
     Logger.setLevel(args.log_level);
 
-    const unblocked_sigs = [_]std.posix.SIG{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP, .XCPU, .XFSZ, .TTIN, .TTOU };
-    const sig_conf = handleSignal(unblocked_sigs);
+    const unblocked_sigs = [_]sig_t{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP, .TTIN, .TTOU };
+    var sig_conf = handleSignal(&unblocked_sigs);
 
     const should_enable_subreaper = args.subreaper or std.os.linux.getpid() != 1;
     if (should_enable_subreaper) {
@@ -916,17 +968,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .child = child,
         .expected_exit = args.expected_exit,
         .rewrites = args.rewrites,
-        .mode = args.mode,
         .sigfd = sigfd,
+        .new_session = args.new_session,
+        .ignore_cont = sig_conf.ignore_detached_sig,
+        .ignore_hup = sig_conf.ignore_detached_sig,
     };
 
     while (true) {
+        Logger.debug("polling", .{});
         const count = std.posix.poll(poll_fds[0..poll_fds_len], -1) catch |err| {
             Logger.err("poll failed: {s}", .{@errorName(err)});
             return 1;
         };
 
-        if (count == 0) continue;
+        if (count == 0) {
+            Logger.err("poll returned 0, continue", .{});
+            continue;
+        }
 
         for (poll_fds[0..poll_fds_len]) |*pfd| {
             if (pfd.revents == 0) continue;
@@ -973,9 +1031,9 @@ test parseSignal {
     try std.testing.expectEqual(15, parseSignal("15") catch unreachable);
     try std.testing.expectEqual(15, parseSignal("SIGTERM") catch unreachable);
     try std.testing.expectEqual(15, parseSignal("TERM") catch unreachable);
-    try std.testing.expectEqual(std.os.linux.sigrtmin(), parseSignal("SIGRTMIN") catch unreachable);
-    try std.testing.expectEqual(std.os.linux.sigrtmin() + 2, parseSignal("SIGRTMIN+2") catch unreachable);
-    try std.testing.expectEqual(std.os.linux.sigrtmax() - 1, parseSignal("RTMAX-1") catch unreachable);
+    try std.testing.expectEqual(std.posix.sigrtmin(), parseSignal("SIGRTMIN") catch unreachable);
+    try std.testing.expectEqual(std.posix.sigrtmin() + 2, parseSignal("SIGRTMIN+2") catch unreachable);
+    try std.testing.expectEqual(std.posix.sigrtmax() - 1, parseSignal("RTMAX-1") catch unreachable);
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("UNKNOWN"));
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("999"));
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("0"));
@@ -1035,8 +1093,8 @@ test hasCycle {
 
     map = .{};
 
-    const rtmin = std.os.linux.sigrtmin();
-    const rtmax = std.os.linux.sigrtmax();
+    const rtmin = std.posix.sigrtmin();
+    const rtmax = std.posix.sigrtmax();
 
     map.set(rtmin, @intCast(rtmin + 1));
     try std.testing.expect(!hasCycle(&map, rtmin));
@@ -1078,15 +1136,16 @@ test Args {
     var map: RewriteMap = .{};
     map.set(15, 2);
 
-    var args = try Args.init(allocator, environ.block.slice, .debug, 15, .Child, map, 143, true, true, p_args);
+    var args = try Args.init(allocator, environ.block.slice, .debug, 15, map, 143, true, true, true, true, p_args);
     defer args.deinit();
 
     try std.testing.expectEqual(LogLevel.debug, args.log_level);
     try std.testing.expectEqual(@as(?u32, 15), args.pdeath_signal);
-    try std.testing.expectEqual(forwardMode.Child, args.mode);
     try std.testing.expectEqual(@as(?u8, 143), args.expected_exit);
     try std.testing.expect(args.subreaper);
     try std.testing.expect(args.tracing_child);
+    try std.testing.expect(args.new_session);
+    try std.testing.expect(args.is_terminal);
     try std.testing.expectEqualStrings("foo", std.mem.span(args.argv[0].?));
     try std.testing.expectEqualStrings("--bar=x", std.mem.span(args.argv[1].?));
     try std.testing.expectEqual(@as(?[*:0]const u8, null), args.argv[p_args.len]);
@@ -1137,7 +1196,7 @@ test "Args.init without rewrite" {
     defer environ.block.deinit(allocator);
 
     const p_args: []const []const u8 = &[_][]const u8{"test"};
-    var args = try Args.init(allocator, environ.block.slice, .warn, null, .Child, null, null, false, false, p_args);
+    var args = try Args.init(allocator, environ.block.slice, .warn, null, null, null, false, false, false, false, p_args);
     defer args.deinit();
 
     try std.testing.expect(args.rewrites == null);
@@ -1154,7 +1213,7 @@ test "Args.init with empty env" {
     defer environ.block.deinit(allocator);
 
     const p_args: []const []const u8 = &[_][]const u8{"test"};
-    var args = try Args.init(allocator, environ.block.slice, .warn, null, .Child, null, null, false, false, p_args);
+    var args = try Args.init(allocator, environ.block.slice, .warn, null, null, null, false, false, false, false, p_args);
     defer args.deinit();
 
     var found = false;
@@ -1190,8 +1249,8 @@ test isValidU32 {
     try std.testing.expect(!isValidU32(0));
     try std.testing.expect(isValidU32(1));
     try std.testing.expect(isValidU32(15));
-    try std.testing.expect(isValidU32(@as(u32, std.os.linux.NSIG) - 1));
-    try std.testing.expect(!isValidU32(@as(u32, std.os.linux.NSIG)));
+    try std.testing.expect(isValidU32(@as(u32, std.posix.NSIG) - 1));
+    try std.testing.expect(!isValidU32(@as(u32, std.posix.NSIG)));
 }
 
 test classifyExitStatus {
@@ -1206,8 +1265,8 @@ test classifyExitStatus {
 }
 
 test getSignalDestination {
-    try std.testing.expectEqual(@as(std.posix.pid_t, 100), getSignalDestination(.Child, 100));
-    try std.testing.expectEqual(@as(std.posix.pid_t, -100), getSignalDestination(.ProcessGroup, 100));
+    try std.testing.expectEqual(@as(std.posix.pid_t, 100), getSignalDestination(false, 100));
+    try std.testing.expectEqual(@as(std.posix.pid_t, -100), getSignalDestination(true, 100));
 }
 
 test "tryClose with invalid fd" {
