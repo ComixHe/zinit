@@ -15,7 +15,7 @@ else
 
 fn minimalPanic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
     const prefix = "zinit panic: ";
-    const stderr_fd = std.posix.STDERR_FILENO;
+    const stderr_fd = std.os.linux.STDERR_FILENO;
 
     _ = std.os.linux.write(stderr_fd, prefix, prefix.len);
     _ = std.os.linux.write(stderr_fd, msg.ptr, msg.len);
@@ -33,9 +33,9 @@ const LogLevel = enum(u8) {
 
 const Logger = struct {
     var runtime_log_level: LogLevel = .warn;
-    var target_fd: std.posix.fd_t = std.posix.STDERR_FILENO;
+    var target_fd: std.os.linux.fd_t = std.os.linux.STDERR_FILENO;
 
-    pub fn setTargetFd(fd: std.posix.fd_t) void {
+    pub fn setTargetFd(fd: std.os.linux.fd_t) void {
         target_fd = fd;
     }
 
@@ -67,7 +67,7 @@ const Logger = struct {
         writeFormattedLog(.debug, format, args);
     }
 
-    fn rawTryWriteAll(fd: std.posix.fd_t, bytes: []const u8) void {
+    fn rawTryWriteAll(fd: std.os.linux.fd_t, bytes: []const u8) void {
         if (comptime builtin.is_test) {
             return;
         }
@@ -97,7 +97,7 @@ const Logger = struct {
     }
 };
 
-const sig_t = std.posix.SIG;
+const sig_t = std.os.linux.SIG;
 
 const ZinitError = error{
     InvalidSignal,
@@ -146,21 +146,21 @@ const sig_map = std.StaticStringMap(u32).initComptime(.{
 });
 
 fn isValidU32(sig_num: u32) bool {
-    return sig_num > 0 and sig_num < std.posix.NSIG;
+    return sig_num > 0 and sig_num < std.os.linux.NSIG;
 }
 
 fn parseRealtimeSignal(s: []const u8) ?u32 {
     const rtmin_prefixes = [_][]const u8{ "RTMIN", "SIGRTMIN" };
     inline for (rtmin_prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(s, prefix)) {
-            const base = std.posix.sigrtmin();
+            const base = std.os.linux.sigrtmin();
             const suffix = s[prefix.len..];
             if (suffix.len == 0) return base;
             if (suffix[0] != '+') return null;
 
             const offset = std.fmt.parseUnsigned(u8, suffix[1..], 10) catch return null;
             const value = @as(u32, base) + offset;
-            if (!isValidU32(value) or value > std.posix.sigrtmax()) return null;
+            if (!isValidU32(value) or value > std.os.linux.sigrtmax()) return null;
             return @intCast(value);
         }
     }
@@ -168,7 +168,7 @@ fn parseRealtimeSignal(s: []const u8) ?u32 {
     const rtmax_prefixes = [_][]const u8{ "RTMAX", "SIGRTMAX" };
     inline for (rtmax_prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(s, prefix)) {
-            const base = std.posix.sigrtmax();
+            const base = std.os.linux.sigrtmax();
             const suffix = s[prefix.len..];
             if (suffix.len == 0) return base;
             if (suffix[0] != '-') return null;
@@ -213,7 +213,7 @@ fn parseSignal(s: []const u8) !u32 {
 }
 
 const RewriteMap = struct {
-    entries: [std.posix.NSIG]u32 = [_]u32{0} ** std.posix.NSIG,
+    entries: [std.os.linux.NSIG]u32 = [_]u32{0} ** std.os.linux.NSIG,
 
     pub fn get(self: *const RewriteMap, sig: u32) u32 {
         return self.entries[sig];
@@ -229,7 +229,7 @@ const RewriteMap = struct {
 };
 
 fn hasCycle(map: *const RewriteMap, start_node: u32) bool {
-    std.debug.assert(start_node > 0 and start_node < std.posix.NSIG);
+    std.debug.assert(start_node > 0 and start_node < std.os.linux.NSIG);
 
     var current = start_node;
     var count: usize = 0;
@@ -240,7 +240,7 @@ fn hasCycle(map: *const RewriteMap, start_node: u32) bool {
         }
 
         count += 1;
-        if (count >= std.posix.NSIG) return true;
+        if (count >= std.os.linux.NSIG) return true;
         current = next_node;
     }
 
@@ -503,33 +503,54 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init.Minimal) !?Arg
 const SHUTDOWN_GRACE_PERIOD_NS: u64 = 5 * std.time.ns_per_s;
 
 const SigConf = struct {
-    old_set: std.posix.sigset_t,
-    current_set: std.posix.sigset_t,
-    ttin_action: std.posix.Sigaction,
-    ttou_action: std.posix.Sigaction,
+    old_set: std.os.linux.sigset_t,
+    current_set: std.os.linux.sigset_t,
+    ttin_action: std.os.linux.Sigaction,
+    ttou_action: std.os.linux.Sigaction,
     ignore_detached_sig: bool = false,
 };
 
-fn handleSignal(comptime sig_list: []const sig_t) SigConf {
-    var set = std.posix.sigfillset();
+fn handleSignal(comptime sig_list: []const sig_t) !SigConf {
+    var set = std.os.linux.sigfillset();
     for (sig_list) |sig| {
-        std.posix.sigdelset(&set, sig);
+        std.os.linux.sigdelset(&set, sig);
     }
 
-    var old_set: std.posix.sigset_t = undefined;
-    std.posix.sigprocmask(sig_t.SETMASK, &set, &old_set);
+    var old_set: std.os.linux.sigset_t = undefined;
+    var ret = std.os.linux.sigprocmask(sig_t.SETMASK, &set, &old_set);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => {
+            Logger.err("unable to set signal mask: {s}", .{@tagName(std.os.linux.errno(ret))});
+            return ZinitError.SysCallError;
+        },
+    }
 
-    const ignored = std.posix.Sigaction{
+    const ignored = std.os.linux.Sigaction{
         .handler = .{ .handler = sig_t.IGN },
-        .mask = std.posix.sigemptyset(),
+        .mask = std.os.linux.sigemptyset(),
         .flags = 0,
     };
 
-    var old_ttin_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(sig_t.TTIN, &ignored, &old_ttin_action);
+    var old_ttin_action: std.os.linux.Sigaction = undefined;
+    ret = std.os.linux.sigaction(sig_t.TTIN, &ignored, &old_ttin_action);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => {
+            Logger.err("unable to set signal action for TTIN: {s}", .{@tagName(std.os.linux.errno(ret))});
+            return ZinitError.SysCallError;
+        },
+    }
 
-    var old_ttou_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(sig_t.TTOU, &ignored, &old_ttou_action);
+    var old_ttou_action: std.os.linux.Sigaction = undefined;
+    ret = std.os.linux.sigaction(sig_t.TTOU, &ignored, &old_ttou_action);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => {
+            Logger.err("unable to set signal action for TTOU: {s}", .{@tagName(std.os.linux.errno(ret))});
+            return ZinitError.SysCallError;
+        },
+    }
 
     return .{
         .old_set = old_set,
@@ -542,18 +563,43 @@ fn handleSignal(comptime sig_list: []const sig_t) SigConf {
 fn reportChildError(comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "zinit child error: " ++ fmt ++ "\n", args) catch "zinit child error: (message too long to format)\n";
-    _ = std.os.linux.write(std.posix.STDERR_FILENO, msg.ptr, msg.len);
+    _ = std.os.linux.write(std.os.linux.STDERR_FILENO, msg.ptr, msg.len);
     std.os.linux.exit(1);
 }
 
 fn restoreChildSignals(sig_conf: *const SigConf) void {
-    std.posix.sigprocmask(sig_t.SETMASK, &sig_conf.old_set, null);
+    var ret = std.os.linux.sigprocmask(sig_t.SETMASK, &sig_conf.old_set, null);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => |e| {
+            reportChildError("unable to restore signal mask: {s}", .{@tagName(e)});
+        },
+    }
 
-    var unblock_all = std.posix.sigfillset();
-    std.posix.sigprocmask(sig_t.UNBLOCK, &unblock_all, null);
+    var unblock_all = std.os.linux.sigfillset();
+    ret = std.os.linux.sigprocmask(sig_t.UNBLOCK, &unblock_all, null);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => |e| {
+            reportChildError("unable to unblock signals: {s}", .{@tagName(e)});
+        },
+    }
 
-    std.posix.sigaction(sig_t.TTIN, &sig_conf.ttin_action, null);
-    std.posix.sigaction(sig_t.TTOU, &sig_conf.ttou_action, null);
+    ret = std.os.linux.sigaction(sig_t.TTIN, &sig_conf.ttin_action, null);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => |e| {
+            reportChildError("unable to restore signal action for TTIN: {s}", .{@tagName(e)});
+        },
+    }
+
+    ret = std.os.linux.sigaction(sig_t.TTOU, &sig_conf.ttou_action, null);
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        else => |e| {
+            reportChildError("unable to restore signal action for TTOU: {s}", .{@tagName(e)});
+        },
+    }
 }
 
 fn setupChildTerminal(args: Args) void {
@@ -569,7 +615,7 @@ fn setupChildTerminal(args: Args) void {
         return;
     }
 
-    const rc = std.os.linux.ioctl(std.posix.STDIN_FILENO, std.posix.T.IOCSCTTY, 0);
+    const rc = std.os.linux.ioctl(std.os.linux.STDIN_FILENO, std.os.linux.T.IOCSCTTY, 0);
     const err = std.os.linux.errno(rc);
     if (err != .SUCCESS) {
         Logger.debug("unable to acquire controlling tty: {s}", .{@tagName(err)});
@@ -579,7 +625,7 @@ fn setupChildTerminal(args: Args) void {
 fn run(args: *Args, sig_conf: *SigConf) !usize {
     // detach zinit from control terminal, let child handle it
     if (args.new_session and args.is_terminal) {
-        const rc = std.os.linux.ioctl(std.posix.STDIN_FILENO, std.posix.T.IOCNOTTY, 0);
+        const rc = std.os.linux.ioctl(std.os.linux.STDIN_FILENO, std.os.linux.T.IOCNOTTY, 0);
         const err = std.os.linux.errno(rc);
         if (err != .SUCCESS) { // maybe the in/out has been redirected
             Logger.debug("unable to detach from terminal: {s}", .{@tagName(err)});
@@ -613,26 +659,42 @@ fn run(args: *Args, sig_conf: *SigConf) !usize {
     setupChildTerminal(args.*);
 
     if (args.pdeath_signal) |sig| {
-        _ = std.posix.prctl(std.posix.PR.SET_PDEATHSIG, .{sig}) catch |e| {
-            reportChildError("unable to set parent death signal: {s}", .{@errorName(e)});
-        };
+        const ret = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_PDEATHSIG), sig, 0, 0, 0);
+        switch (std.os.linux.errno(ret)) {
+            .SUCCESS => {},
+            else => |e| reportChildError("unable to set parent death signal: {s}", .{@tagName(e)}),
+        }
     }
 
-    if (args.tracing_child) {
+    while (args.tracing_child) {
         const dummy_handler = struct {
             pub fn handler(_: sig_t) callconv(.c) void {}
         }.handler;
 
-        const usr1_act: std.posix.Sigaction = .{
+        const usr1_act: std.os.linux.Sigaction = .{
             .handler = .{ .handler = dummy_handler },
-            .mask = std.posix.sigemptyset(),
+            .mask = std.os.linux.sigemptyset(),
             .flags = 0,
         };
 
-        var old_act: std.posix.Sigaction = undefined;
-        std.posix.sigaction(sig_t.USR1, &usr1_act, &old_act);
+        var old_act: std.os.linux.Sigaction = undefined;
+        var ret = std.os.linux.sigaction(sig_t.USR1, &usr1_act, &old_act);
+        switch (std.os.linux.errno(ret)) {
+            .SUCCESS => {},
+            else => |e| {
+                Logger.debug("failed to set signal action for USR1: {s}", .{@tagName(e)});
+                break;
+            },
+        }
+
         _ = std.os.linux.pause();
-        std.posix.sigaction(sig_t.USR1, &old_act, null);
+        ret = std.os.linux.sigaction(sig_t.USR1, &old_act, null);
+        switch (std.os.linux.errno(ret)) {
+            .SUCCESS => {},
+            else => |e| Logger.debug("failed to restore signal action for USR1: {s}", .{@tagName(e)}),
+        }
+
+        break;
     }
 
     const ret = std.os.linux.execve(args.argv[0].?, args.argv, args.envs);
@@ -642,14 +704,14 @@ fn run(args: *Args, sig_conf: *SigConf) !usize {
 const ExitStatusClass = enum { exited, signaled, unknown };
 
 fn classifyExitStatus(status: u32) ExitStatusClass {
-    if (std.posix.W.IFEXITED(status)) return .exited;
-    if (std.posix.W.IFSIGNALED(status)) return .signaled;
+    if (std.os.linux.W.IFEXITED(status)) return .exited;
+    if (std.os.linux.W.IFSIGNALED(status)) return .signaled;
     return .unknown;
 }
 
 fn extractExitCode(status: u32) u8 {
-    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
-    if (std.posix.W.IFSIGNALED(status)) return @intCast(128 + @intFromEnum(std.posix.W.TERMSIG(status)));
+    if (std.os.linux.W.IFEXITED(status)) return std.os.linux.W.EXITSTATUS(status);
+    if (std.os.linux.W.IFSIGNALED(status)) return @intCast(128 + @intFromEnum(std.os.linux.W.TERMSIG(status)));
     return 0;
 }
 
@@ -663,7 +725,7 @@ const ReapResult = union(enum) {
     no_children,
 };
 
-fn reapOne(flags: u32, status: *u32) !ReapResult {
+fn reapOne(flags: u32, status: *i32) !ReapResult {
     while (true) {
         const ret = std.os.linux.waitpid(-1, status, flags);
         if (ret == 0) return .none_ready;
@@ -682,16 +744,18 @@ fn reapOne(flags: u32, status: *u32) !ReapResult {
 }
 
 fn terminateProcessGroup(pid: usize, sig: u32) void {
-    std.posix.kill(-@as(std.posix.pid_t, @intCast(pid)), @enumFromInt(sig)) catch |err| switch (err) {
-        error.ProcessNotFound => {},
-        else => Logger.err("unable to send signal {d} to process group: {s}", .{ sig, @errorName(err) }),
-    };
+    const ret = std.os.linux.kill(-@as(std.os.linux.pid_t, @intCast(pid)), @enumFromInt(sig));
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        .SRCH => Logger.debug("no process group to send signal {d} for pid {d}", .{ sig, pid }),
+        else => |e| Logger.err("unable to send signal {d} to process group: {s}", .{ sig, @tagName(e) }),
+    }
 }
 
 fn logExitedProcess(pid: usize, status: u32) void {
     switch (classifyExitStatus(status)) {
-        .exited => Logger.info("child process {d} exited with code {d}.", .{ pid, std.posix.W.EXITSTATUS(status) }),
-        .signaled => Logger.info("child process {d} exited with signal {d}.", .{ pid, std.posix.W.TERMSIG(status) }),
+        .exited => Logger.info("child process {d} exited with code {d}.", .{ pid, std.os.linux.W.EXITSTATUS(status) }),
+        .signaled => Logger.info("child process {d} exited with signal {d}.", .{ pid, std.os.linux.W.TERMSIG(status) }),
         .unknown => Logger.err("child process {d} exited with unknown status", .{pid}),
     }
 }
@@ -700,7 +764,7 @@ const ProcessState = struct {
     child: usize,
     expected_exit: ?u8,
     rewrites: ?RewriteMap,
-    sigfd: std.posix.fd_t,
+    sigfd: std.os.linux.fd_t,
     shutdown: ?ShutdownState = null,
     new_session: bool,
     ignore_hup: bool = false,
@@ -710,20 +774,23 @@ const ProcessState = struct {
 const ShutdownState = struct {
     main_pid: usize,
     exit_code: u8,
-    timerfd: std.posix.fd_t,
+    timerfd: std.os.linux.fd_t,
     kill_sent: bool = false,
 };
 
 fn handleSignalEvent(state: *ProcessState) ?u8 {
     while (true) {
         var sig_info: std.os.linux.signalfd_siginfo = undefined;
-        _ = std.posix.read(state.sigfd, std.mem.asBytes(&sig_info)) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            else => {
-                Logger.err("unable to read sigfd: {s}", .{@errorName(err)});
+        const ret = std.os.linux.read(state.sigfd, std.mem.asBytes(&sig_info), @sizeOf(std.os.linux.signalfd_siginfo));
+        switch (std.os.linux.errno(ret)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            .AGAIN => return null,
+            else => |e| {
+                Logger.err("unable to read sigfd: {s}", .{@tagName(e)});
                 return 1;
             },
-        };
+        }
 
         Logger.debug("receive signal: {d}", .{sig_info.signo});
 
@@ -748,9 +815,9 @@ fn handleSignalEvent(state: *ProcessState) ?u8 {
     }
 }
 
-fn getSignalDestination(new_session: bool, child_pid: usize) std.posix.pid_t {
+fn getSignalDestination(new_session: bool, child_pid: usize) std.os.linux.pid_t {
     return if (new_session)
-        -@as(std.posix.pid_t, @intCast(child_pid))
+        -@as(std.os.linux.pid_t, @intCast(child_pid))
     else
         @intCast(child_pid);
 }
@@ -771,9 +838,14 @@ fn forwardSignal(state: *ProcessState, signo: u32) void {
 
     const destination = getSignalDestination(state.new_session, state.child);
 
-    std.posix.kill(destination, @enumFromInt(signal_to_send)) catch |err| {
-        Logger.err("unable to send signal to child: {s}", .{@errorName(err)});
-    };
+    const ret = std.os.linux.kill(destination, @enumFromInt(signal_to_send));
+    switch (std.os.linux.errno(ret)) {
+        .SUCCESS => {},
+        .SRCH => Logger.debug("no process to send signal {d} for pid {d}", .{ signal_to_send, destination }),
+        else => |err| {
+            Logger.err("unable to send signal to child: {s}", .{@tagName(err)});
+        },
+    }
 }
 
 fn startShutdown(state: *ProcessState, exit_code: u8) ?u8 {
@@ -811,7 +883,7 @@ fn handleTimerEvent(state: *ProcessState) ?u8 {
     return null;
 }
 
-fn createShutdownTimer() !std.posix.fd_t {
+fn createShutdownTimer() !std.os.linux.fd_t {
     const raw_fd = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
     switch (std.os.linux.errno(raw_fd)) {
         .SUCCESS => {},
@@ -821,7 +893,7 @@ fn createShutdownTimer() !std.posix.fd_t {
         },
     }
 
-    const timerfd: std.posix.fd_t = @intCast(raw_fd);
+    const timerfd: std.os.linux.fd_t = @intCast(raw_fd);
     errdefer tryClose(timerfd);
 
     const timer_spec = std.os.linux.itimerspec{
@@ -842,25 +914,32 @@ fn createShutdownTimer() !std.posix.fd_t {
     }
 }
 
-fn consumeTimer(timerfd: std.posix.fd_t) void {
+fn consumeTimer(timerfd: std.os.linux.fd_t) void {
     var expirations: u64 = 0;
-    _ = std.posix.read(timerfd, std.mem.asBytes(&expirations)) catch |err| if (err != error.WouldBlock) {
-        Logger.err("unable to read timerfd: {s}", .{@errorName(err)});
-    };
+    while (true) {
+        const ret = std.os.linux.read(timerfd, std.mem.asBytes(&expirations), @sizeOf(u64));
+        switch (std.os.linux.errno(ret)) {
+            .SUCCESS, .INTR => continue,
+            .AGAIN => break,
+            else => |err| {
+                Logger.err("unable to read timerfd: {s}", .{@tagName(err)});
+            },
+        }
+    }
 }
 
 fn handleExitedProcess(pid: usize, expected_exit: ?u8) !struct { main_exit_code: ?u8, no_children: bool } {
-    var status: u32 = 0;
+    var status: i32 = 0;
     var main_exit_code: ?u8 = null;
     var no_children = false;
 
     while (true) {
-        switch (try reapOne(std.posix.W.NOHANG, &status)) {
+        switch (try reapOne(std.os.linux.W.NOHANG, &status)) {
             .pid => |reaped_pid| {
-                logExitedProcess(reaped_pid, status);
+                logExitedProcess(reaped_pid, @intCast(status));
 
                 if (reaped_pid == pid) {
-                    main_exit_code = mapExitCode(expected_exit, extractExitCode(status));
+                    main_exit_code = mapExitCode(expected_exit, extractExitCode(@intCast(status)));
                 }
             },
             .none_ready => break,
@@ -875,17 +954,17 @@ fn handleExitedProcess(pid: usize, expected_exit: ?u8) !struct { main_exit_code:
 }
 
 fn reapShutdownChildren() !bool {
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
-        switch (try reapOne(std.posix.W.NOHANG, &status)) {
-            .pid => |reaped_pid| logExitedProcess(reaped_pid, status),
+        switch (try reapOne(std.os.linux.W.NOHANG, &status)) {
+            .pid => |reaped_pid| logExitedProcess(reaped_pid, @intCast(status)),
             .none_ready => return false,
             .no_children => return true,
         }
     }
 }
 
-fn tryClose(fd: std.posix.fd_t) void {
+fn tryClose(fd: std.os.linux.fd_t) void {
     if (fd < 0) {
         return;
     }
@@ -905,9 +984,10 @@ fn tryClose(fd: std.posix.fd_t) void {
 
 test tryClose {
     tryClose(-1);
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0o600);
+    const fd = std.os.linux.openat(std.os.linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0o600);
+    try std.testing.expectEqual(std.os.linux.errno(fd), .SUCCESS);
 
-    tryClose(fd);
+    tryClose(@intCast(fd));
     tryClose(5);
 }
 
@@ -932,14 +1012,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     Logger.setLevel(args.log_level);
 
     const unblocked_sigs = [_]sig_t{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP, .TTIN, .TTOU };
-    var sig_conf = handleSignal(&unblocked_sigs);
+    var sig_conf = handleSignal(&unblocked_sigs) catch |err| {
+        Logger.err("unable to handle signals: {s}", .{@errorName(err)});
+        return 1;
+    };
 
     const should_enable_subreaper = args.subreaper or std.os.linux.getpid() != 1;
     if (should_enable_subreaper) {
-        _ = std.posix.prctl(std.posix.PR.SET_CHILD_SUBREAPER, .{1}) catch |err| {
-            Logger.err("unable to set child subreaper: {s}", .{@errorName(err)});
-            return 1;
-        };
+        const ret = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0);
+        switch (std.os.linux.errno(ret)) {
+            .SUCCESS => {},
+            else => |e| {
+                Logger.err("unable to enable child subreaper mode: {s}", .{@tagName(e)});
+                return 1;
+            },
+        }
     }
 
     const child = run(&args, &sig_conf) catch {
@@ -947,19 +1034,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     };
 
-    const sigfd = std.posix.signalfd(-1, &sig_conf.current_set, std.os.linux.SFD.NONBLOCK) catch |err| {
-        Logger.err("unable to create signalfd: {s}", .{@errorName(err)});
-        return 1;
-    };
+    const sigfd = std.os.linux.signalfd(-1, &sig_conf.current_set, std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC);
+    switch (std.os.linux.errno(sigfd)) {
+        .SUCCESS => {},
+        else => |err| {
+            Logger.err("unable to create signalfd: {s}", .{@tagName(err)});
+            return 1;
+        },
+    }
     defer {
         Logger.debug("close signalfd", .{});
-        tryClose(sigfd);
+        tryClose(@intCast(sigfd));
     }
 
-    var poll_fds: [2]std.posix.pollfd = undefined;
+    var poll_fds: [2]std.os.linux.pollfd = undefined;
     poll_fds[0] = .{
-        .fd = sigfd,
-        .events = std.posix.POLL.IN,
+        .fd = @intCast(sigfd),
+        .events = std.os.linux.POLL.IN,
         .revents = 0,
     };
     var poll_fds_len: usize = 1;
@@ -968,7 +1059,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .child = child,
         .expected_exit = args.expected_exit,
         .rewrites = args.rewrites,
-        .sigfd = sigfd,
+        .sigfd = @intCast(sigfd),
         .new_session = args.new_session,
         .ignore_cont = sig_conf.ignore_detached_sig,
         .ignore_hup = sig_conf.ignore_detached_sig,
@@ -976,10 +1067,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     while (true) {
         Logger.debug("polling", .{});
-        const count = std.posix.poll(poll_fds[0..poll_fds_len], -1) catch |err| {
-            Logger.err("poll failed: {s}", .{@errorName(err)});
-            return 1;
-        };
+        const count = std.os.linux.poll(&poll_fds, poll_fds_len, -1);
+        switch (std.os.linux.errno(count)) {
+            .SUCCESS => {},
+            else => |e| {
+                Logger.err("poll failed: {s}", .{@tagName(e)});
+                return 1;
+            },
+        }
 
         if (count == 0) {
             Logger.err("poll returned 0, continue", .{});
@@ -989,7 +1084,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         for (poll_fds[0..poll_fds_len]) |*pfd| {
             if (pfd.revents == 0) continue;
 
-            if (pfd.revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+            if (pfd.revents & (std.os.linux.POLL.ERR | std.os.linux.POLL.HUP | std.os.linux.POLL.NVAL) != 0) {
                 Logger.err("poll error on fd {d}: revents=0x{x}", .{ pfd.fd, pfd.revents });
                 continue;
             }
@@ -1000,7 +1095,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     if (poll_fds_len == 1) {
                         poll_fds[1] = .{
                             .fd = state.timerfd,
-                            .events = std.posix.POLL.IN,
+                            .events = std.os.linux.POLL.IN,
                             .revents = 0,
                         };
                         poll_fds_len = 2;
@@ -1031,9 +1126,9 @@ test parseSignal {
     try std.testing.expectEqual(15, parseSignal("15") catch unreachable);
     try std.testing.expectEqual(15, parseSignal("SIGTERM") catch unreachable);
     try std.testing.expectEqual(15, parseSignal("TERM") catch unreachable);
-    try std.testing.expectEqual(std.posix.sigrtmin(), parseSignal("SIGRTMIN") catch unreachable);
-    try std.testing.expectEqual(std.posix.sigrtmin() + 2, parseSignal("SIGRTMIN+2") catch unreachable);
-    try std.testing.expectEqual(std.posix.sigrtmax() - 1, parseSignal("RTMAX-1") catch unreachable);
+    try std.testing.expectEqual(std.os.linux.sigrtmin(), parseSignal("SIGRTMIN") catch unreachable);
+    try std.testing.expectEqual(std.os.linux.sigrtmin() + 2, parseSignal("SIGRTMIN+2") catch unreachable);
+    try std.testing.expectEqual(std.os.linux.sigrtmax() - 1, parseSignal("RTMAX-1") catch unreachable);
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("UNKNOWN"));
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("999"));
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("0"));
@@ -1093,8 +1188,8 @@ test hasCycle {
 
     map = .{};
 
-    const rtmin = std.posix.sigrtmin();
-    const rtmax = std.posix.sigrtmax();
+    const rtmin = std.os.linux.sigrtmin();
+    const rtmax = std.os.linux.sigrtmax();
 
     map.set(rtmin, @intCast(rtmin + 1));
     try std.testing.expect(!hasCycle(&map, rtmin));
@@ -1249,8 +1344,8 @@ test isValidU32 {
     try std.testing.expect(!isValidU32(0));
     try std.testing.expect(isValidU32(1));
     try std.testing.expect(isValidU32(15));
-    try std.testing.expect(isValidU32(@as(u32, std.posix.NSIG) - 1));
-    try std.testing.expect(!isValidU32(@as(u32, std.posix.NSIG)));
+    try std.testing.expect(isValidU32(@as(u32, std.os.linux.NSIG) - 1));
+    try std.testing.expect(!isValidU32(@as(u32, std.os.linux.NSIG)));
 }
 
 test classifyExitStatus {
@@ -1265,8 +1360,8 @@ test classifyExitStatus {
 }
 
 test getSignalDestination {
-    try std.testing.expectEqual(@as(std.posix.pid_t, 100), getSignalDestination(false, 100));
-    try std.testing.expectEqual(@as(std.posix.pid_t, -100), getSignalDestination(true, 100));
+    try std.testing.expectEqual(@as(std.os.linux.pid_t, 100), getSignalDestination(false, 100));
+    try std.testing.expectEqual(@as(std.os.linux.pid_t, -100), getSignalDestination(true, 100));
 }
 
 test "tryClose with invalid fd" {
