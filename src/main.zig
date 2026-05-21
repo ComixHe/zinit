@@ -213,7 +213,15 @@ fn parseSignal(s: []const u8) !u32 {
 }
 
 const RewriteMap = struct {
-    entries: [std.os.linux.NSIG]u32 = [_]u32{0} ** std.os.linux.NSIG,
+    entries: [std.os.linux.NSIG]u32,
+
+    pub fn init() RewriteMap {
+        return .{ .entries = @splat(0) };
+    }
+
+    pub fn reset(self: *RewriteMap) void {
+        self.entries = @splat(0);
+    }
 
     pub fn get(self: *const RewriteMap, sig: u32) u32 {
         return self.entries[sig];
@@ -428,7 +436,7 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
             'p' => pdeath_signal = try parseSignal(arg.value.?),
             's' => subreaper_flag = true,
             'r' => {
-                if (rewrite_map == null) rewrite_map = .{};
+                if (rewrite_map == null) rewrite_map = .init();
                 try parseRewrite(&rewrite_map.?, arg.value.?);
             },
             'e' => expected_exit = try parseExpectedExit(arg.value.?),
@@ -450,7 +458,7 @@ fn parseArgsWithIo(io: std.Io, allocator: std.mem.Allocator, args_iter: *std.pro
 
     if (new_session) {
         if (rewrite_map == null) {
-            rewrite_map = .{};
+            rewrite_map = .init();
         }
 
         const stop = @intFromEnum(sig_t.STOP);
@@ -1138,12 +1146,12 @@ test parseSignal {
 test "parseSignal edge cases" {
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("SIG"));
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("A"));
-    const long_name = "SIG" ++ "A" ** 20;
+    const long_name = "SIG" ++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     try std.testing.expectError(ZinitError.InvalidSignal, parseSignal(long_name));
 }
 
 test parseRewrite {
-    var map: RewriteMap = .{};
+    var map: RewriteMap = .init();
 
     try parseRewrite(&map, "TERM:INT");
     const new_sig = map.get(15);
@@ -1152,7 +1160,7 @@ test parseRewrite {
 }
 
 test "parseRewrite error cases" {
-    var map: RewriteMap = .{};
+    var map: RewriteMap = .init();
 
     try std.testing.expectError(ZinitError.InvalidRewrite, parseRewrite(&map, "TERM"));
 
@@ -1163,7 +1171,7 @@ test "parseRewrite error cases" {
     try parseRewrite(&map, "TERM:INT");
     try std.testing.expectError(ZinitError.DuplicateSignal, parseRewrite(&map, "TERM:HUP"));
 
-    map = .{};
+    map.reset();
     try std.testing.expectError(ZinitError.InvalidRewrite, parseRewrite(&map, "TERM:INT:EXTRA"));
 
     map.set(1, 2);
@@ -1173,7 +1181,7 @@ test "parseRewrite error cases" {
 }
 
 test hasCycle {
-    var map: RewriteMap = .{};
+    var map: RewriteMap = .init();
 
     map.set(15, 2);
     try std.testing.expect(!hasCycle(&map, 15));
@@ -1186,7 +1194,7 @@ test hasCycle {
     try std.testing.expect(hasCycle(&map, 2));
     try std.testing.expect(hasCycle(&map, 9));
 
-    map = .{};
+    map.reset();
 
     const rtmin = std.os.linux.sigrtmin();
     const rtmax = std.os.linux.sigrtmax();
@@ -1201,14 +1209,14 @@ test hasCycle {
     try std.testing.expect(hasCycle(&map, rtmin));
 
     if (rtmax > 60) {
-        map = .{};
+        map.reset();
         map.set(@intCast(rtmax), @intCast(rtmax - 1));
         try std.testing.expect(!hasCycle(&map, rtmax));
     }
 }
 
 test mapSignal {
-    var map: RewriteMap = .{};
+    var map: RewriteMap = .init();
 
     map.set(15, 2);
 
@@ -1228,10 +1236,10 @@ test Args {
 
     const p_args: []const []const u8 = &[_][]const u8{ "foo", "--bar=x", "-v", "-c" };
 
-    var map: RewriteMap = .{};
+    var map: RewriteMap = .init();
     map.set(15, 2);
 
-    var args = try Args.init(allocator, environ.block.slice, .debug, 15, map, 143, true, true, true, true, p_args);
+    var args: Args = try .init(allocator, environ.block.slice, .debug, 15, map, 143, true, true, true, true, p_args);
     defer args.deinit();
 
     try std.testing.expectEqual(LogLevel.debug, args.log_level);
@@ -1291,7 +1299,7 @@ test "Args.init without rewrite" {
     defer environ.block.deinit(allocator);
 
     const p_args: []const []const u8 = &[_][]const u8{"test"};
-    var args = try Args.init(allocator, environ.block.slice, .warn, null, null, null, false, false, false, false, p_args);
+    var args: Args = try .init(allocator, environ.block.slice, .warn, null, null, null, false, false, false, false, p_args);
     defer args.deinit();
 
     try std.testing.expect(args.rewrites == null);
@@ -1308,7 +1316,7 @@ test "Args.init with empty env" {
     defer environ.block.deinit(allocator);
 
     const p_args: []const []const u8 = &[_][]const u8{"test"};
-    var args = try Args.init(allocator, environ.block.slice, .warn, null, null, null, false, false, false, false, p_args);
+    var args: Args = try .init(allocator, environ.block.slice, .warn, null, null, null, false, false, false, false, p_args);
     defer args.deinit();
 
     var found = false;
