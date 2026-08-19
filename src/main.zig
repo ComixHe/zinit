@@ -52,15 +52,15 @@ const Logger = struct {
         if (@backingInt(level) > @backingInt(runtime_log_level)) return;
         var buf: [512]u8 = undefined;
         const pfx = if (use_color) switch (level) {
-            .err => "\x1b[31m[zinit] ERROR:\x1b[0m",
-            .warn => "\x1b[33m[zinit] WARNING:\x1b[0m",
-            .info => "\x1b[32m[zinit] INFO:\x1b[0m",
-            .debug => "\x1b[36m[zinit] DEBUG:\x1b[0m",
+            .err => "\x1b[31m[zinit] ERROR:\x1b[0m ",
+            .warn => "\x1b[33m[zinit] WARNING:\x1b[0m ",
+            .info => "\x1b[32m[zinit] INFO:\x1b[0m ",
+            .debug => "\x1b[36m[zinit] DEBUG:\x1b[0m ",
         } else switch (level) {
-            .err => "[zinit] ERROR:",
-            .warn => "[zinit] WARNING:",
-            .info => "[zinit] INFO:",
-            .debug => "[zinit] DEBUG:",
+            .err => "[zinit] ERROR: ",
+            .warn => "[zinit] WARNING: ",
+            .info => "[zinit] INFO: ",
+            .debug => "[zinit] DEBUG: ",
         };
         const formatted = std.fmt.bufPrint(&buf, "{s}{s}\n", .{ pfx, msg }) catch "(log too long)\n";
 
