@@ -7,7 +7,7 @@ A tiny init process written in Zig for Linux containers, designed for signal for
 ## Features
 
 - **Signal Forwarding**: Forward signals from parent process to child processes
-- **Orphan Process Collection**: Acts as a child subreaper to collect orphaned processes
+- **Orphan Process Collection**: Reaps orphaned descendants — automatically as PID 1, or with `-s`/`ZINIT_SUBREAPER` otherwise
 - **Parent Death Signal**: Configurable signal when parent process dies
 - **Signal Rewriting**: Remap incoming signals before forwarding them
 - **Exit Code Mapping**: Translate known child exit codes to success when needed
@@ -16,45 +16,71 @@ A tiny init process written in Zig for Linux containers, designed for signal for
 
 ## Requirements
 
-- Zig compiler (>= 0.16.0-dev.3153)
-- Linux >= 3.4 (for PR_SET_CHILD_SUBREAPER)
-- Linux kernel with signalfd support
+- Zig compiler (see `minimum_zig_version` in `build.zig.zon`)
+- Linux, statically linked, no libc
+
+The kernel version needed depends on which features are used:
+
+| Used | Minimum kernel | Syscalls / mechanism |
+| ------ | ---------------- | ---------------------- |
+| Always (signal forwarding, reaping) | **2.6.27** | `signalfd4`, `poll`, `fork`, `execve`, `wait4`, `kill`, `rt_sig*`, `ioctl` (termios/TTY), `setpgid` |
+| Shutdown grace period | 2.6.16 | `clock_gettime` (only when the main child exits while descendants remain) |
+| `-p` | 2.6.9 | `prctl(PR_SET_PDEATHSIG)` |
+| `-s` / `ZINIT_SUBREAPER` | **3.4** | `prctl(PR_SET_CHILD_SUBREAPER)` |
+| Automatic acceleration | 5.3 / 6.9 | `pidfd_open` (5.3) and `pidfd_send_signal` with the process-group flag (6.9) |
+
+So a plain run as PID 1 (no `-s`) needs **Linux 2.6.27+**. Subreaper mode raises that to **3.4+**.
 
 ## Installation
 
 ```bash
 git clone <repo_url> && cd zinit
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseSmall
 ```
 
 The binary will be installed to `zig-out/bin/zinit`.
 
 ## Usage
 
-```
-Usage: zinit [OPTIONS] -- <command> [args...]
+see
 
-Options:
-  -h, --help                  Show help and exit
-  -v, --version               Show version and exit
-  --log-level <LEVEL>         Set log level: error, warning, info, or debug
-  -p, --signal <SIGNAL>       Signal to send when parent process dies
-  -s, --subreaper             Enable child subreaper mode explicitly
-  -n, --new-session           Enable new session mode for process groups
-  -r, --rewrite <OLD:NEW>     Rewrite a signal before forwarding (can be repeated)
-  -e, --expect-exit <CODE>    Treat child exit code as success (0)
-
-Signal formats:
-  - Number: 15, 9, 2
-  - Name: TERM, KILL, INT (with or without SIG prefix)
-  - Realtime: RTMIN, RTMIN+1, RTMAX, RTMAX-1
+``` bash
+zinit --help
 ```
+
+`--` is optional: the first non-option begins the command. Signals are given by
+number (`15`) or name (`TERM`, `SIGTERM`).
+
+Realtime signals are not accepted.
+
+### Environment Variables
+
+Because a container image usually fixes the entrypoint and arguments, the most
+commonly tuned options can also be set through the environment variables.
+
+| Variable | Equivalent | Values |
+| ---------- | ----------- | -------- |
+| `ZINIT_LOG_LEVEL` | `--log-level` | `error`, `warn`, `info`, `debug` |
+| `ZINIT_SUBREAPER` | `-s` | presence-based (any value enables) |
+| `ZINIT_SHUTDOWN_TIMEOUT` | `-t` | seconds |
+| `ZINIT_TRACING_CHILD` | `-Dtracing-child` | `ON` / `OFF` |
+
+## Exit Status
+
+| Code | Meaning |
+| ------ | --------- |
+| `0` | Success, or an explicit `--help` / `--version` |
+| `1` | Usage or startup error (unknown option, invalid `-r`/`-e`/`-t`, syscall failure) |
+| `126` | Child found but not executable |
+| `127` | Child not found (`execve` failed with `ENOENT`) |
+| otherwise | The child's exit code, or `128 + N` if the child was killed by signal `N`. `-e <CODE>` maps that code to `0`. |
 
 ## Best Practices
 
 ### Run as PID 1 in Containers
 
-When `zinit` runs as PID 1, it automatically enables child subreaper mode to properly reap orphaned descendant processes. This is the recommended usage:
+When `zinit` runs as PID 1, the kernel re-parents orphaned descendants to it, so
+they are reaped without any extra flag. This is the recommended usage:
 
 ```bash
 # Dockerfile
@@ -64,21 +90,35 @@ ENTRYPOINT ["/sbin/zinit", "--", "/bin/sh", "-c", "exec my-app"]
 
 ### Use `--subreaper` Outside PID 1
 
-When running `zinit` outside of PID 1 (e.g., as a supervisor process), explicitly enable subreaper mode:
+Subreaper mode is explicit. When running `zinit` outside of PID 1 (e.g. as a
+supervisor process), pass `-s`/`--subreaper`. Otherwise orphans are re-parented
+to the real init, not to zinit (zinit prints a warning in that case):
 
 ```bash
-zinit --subreaper -- /usr/bin/my-daemon
+zinit -s -- /usr/bin/my-daemon
 ```
 
-### Use New Session for Process Groups
+### Forward to the Process Group
 
-For applications that spawn worker processes, use `--new-session` to create a new session and forward signals to the entire process group:
+The child is always placed in its own process group, which `zinit` uses to
+terminate the whole tree on shutdown. By default a received signal is forwarded
+only to the direct child. Use `-g`/`--forward-group` to forward it to the whole
+process group instead — useful when a shell script does not signal its children:
 
 ```bash
-zinit --new-session -- /bin/sh -c "stress-ng --cpu 4"
+zinit -g -- /bin/sh -c "my-server & wait"
 ```
 
-This option also automatically rewrites job control signals (TSTP, TTOU, TTIN) to STOP to avoid issues when running in background process groups.
+### Use New Session
+
+`--new-session` creates a new session and detaches from the controlling terminal.
+It also automatically rewrites job control signals (TSTP, TTOU, TTIN) to STOP to
+avoid issues when running in background process groups. Combine it with `-g` if
+you also want incoming signals forwarded to the whole process group:
+
+```bash
+zinit --new-session -g -- /bin/sh -c "stress-ng --cpu 4"
+```
 
 ### Handle Application-Specific Exit Codes
 
@@ -87,6 +127,9 @@ Some applications exit with specific codes that should be treated as success:
 ```bash
 # Java applications often exit with 143 (128 + SIGTERM)
 zinit -e 143 -- java -jar app.jar
+
+# `-e` is repeatable, so several codes can be remapped to success
+zinit -e 143 -e 130 -- java -jar app.jar
 ```
 
 ### Rewrite Signals for Legacy Applications
@@ -96,6 +139,12 @@ Some applications expect different signals than what the container runtime sends
 ```bash
 # Convert SIGTERM to SIGINT for graceful shutdown
 zinit -r TERM:INT -- /bin/sh -c "trap 'exit 0' INT; sleep infinity"
+
+# `-r` is repeatable: one OLD:NEW pair per flag
+zinit -r TERM:INT -r HUP:USR1 -- /usr/bin/my-app
+
+# Drop a signal entirely by rewriting it to 0
+zinit -r USR1:0 -- /usr/bin/my-app
 ```
 
 ### Set Parent Death Signal
@@ -140,30 +189,27 @@ kill -USR1 <child_pid>
 
 ## Configuration
 
-### Environment Variables
-
-| Variable | Values | Description |
-|----------|--------|-------------|
-| `ZINIT_TRACING_CHILD` | `ON`, `OFF` | Override build-time tracing configuration |
-
 ### Build Options
 
 | Option | Description |
-|--------|-------------|
+| -------- | ------------- |
+| `-Doptimize=ReleaseSmall` | Smallest binary, optimized for size |
+| `-Doptimize=ReleaseSafe` | Optimized, with runtime safety checks |
+| `-Doptimize=ReleaseFast` | Optimized, without runtime safety checks |
+| `-Dstack-traces=true` | Include crash stack traces. adds ~120 KB of std.debug/ELF code and is **off by default in release builds** |
 | `-Dtracing-child=true` | Child waits for SIGUSR1 before exec (for debugging) |
-| `-Doptimize=ReleaseSafe` | Build with safety checks and optimizations |
-| `-Doptimize=ReleaseFast` | Build with maximum optimizations |
-| `-Doptimize=ReleaseSmall` | Build for minimal binary size |
+| `-Dtest-coverage=true` | Build the tests for kcov and write `kcov-output/` |
+| `-Dsize-analysis=true` | Keep symbols in release builds, for `bloaty`/`nm` |
 
 ## How It Works
 
 1. **Signal Setup**: Blocks all signals and creates a signalfd for synchronous signal handling
-2. **Subreaper Mode**: Enables child subreaper (automatic when PID 1, or with `--subreaper`)
-3. **Fork**: Creates child process with new session and process group
-4. **Terminal Setup**: Sets up controlling terminal for interactive applications
-5. **Event Loop**: Polls signalfd and timerfd for events
+2. **Subreaper Mode**: Optional (`-s`/`--subreaper`). As PID 1 the kernel already re-parents orphaned descendants to us
+3. **Isolate**: The child is placed in its own process group (and made the foreground group when attached to a TTY). `--new-session` additionally creates a new session
+4. **Terminal Setup**: Acquires/forwards the controlling terminal for interactive applications
+5. **Event Loop**: Polls the signalfd, using the shutdown grace period as the poll timeout
 6. **Signal Forwarding**: Forwards signals to child (with optional rewriting)
-7. **Graceful Shutdown**: On child exit, sends SIGTERM to descendants, then SIGKILL after 5 seconds
+7. **Graceful Shutdown**: On child exit, sends SIGTERM to the child's process group, then SIGKILL once the grace period elapses (`-t`, default 5 s). zinit then exits without waiting indefinitely, so an unkillable or detached descendant can never hang it. When running as PID 1 the kernel tears down the rest of the PID namespace.
 
 ## Development
 

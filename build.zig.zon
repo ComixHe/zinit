@@ -2,7 +2,7 @@
     .name = .zinit,
     .version = "0.1.0",
     .fingerprint = 0x9270341b70f1e3c6,
-    .minimum_zig_version = "0.17.0-dev.813+2153f8143",
+    .minimum_zig_version = "0.18.0-dev.146+35accc06e",
     .paths = .{
         "build.zig",
         "build.zig.zon",

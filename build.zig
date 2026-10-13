@@ -38,10 +38,18 @@ pub fn build(b: *std.Build) void {
         .version = packageVersion(b),
     });
 
+    // Leave the ELF stack-size hint at 0. The linker's default makes
+    // `std.start` raise RLIMIT_STACK at startup, which the child would then
+    // inherit; 0 keeps the container's own limit intact and drops the
+    // `prlimit64` dependency.
+    exe.stack_size = 0;
+
     const config = b.addOptions();
     const tracing_child = b.option(bool, "tracing-child", "zinit will wait for SIGUSR1 to continue executing child process") orelse false;
+    const stack_traces = b.option(bool, "stack-traces", "Include crash stack traces (segfault handler + std.debug panic); ~120 KB of std.debug/ELF code. Opt-in, off by default.") orelse false;
     config.addOption(std.SemanticVersion, "version", exe.version orelse unreachable);
     config.addOption(bool, "tracing_child", tracing_child);
+    config.addOption(bool, "stack_traces", stack_traces);
     exe.root_module.addOptions("config", config);
 
     b.installArtifact(exe);
