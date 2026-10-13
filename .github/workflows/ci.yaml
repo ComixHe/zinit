@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    # https://github.com/actions/runner-images/issues/14748
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kcov
+        run: |
+          sudo apt update
+          sudo apt install kcov -y
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Run zig fmt
+        run: zig fmt --check .
+      - name: Build
+        run: zig build
+      - name: Release build is reproducible
+        run: |
+          # Releases are stripped, so nothing path- or cache-dependent may
+          # survive. Check both a cached rebuild and a differently-named tree.
+          zig build -Doptimize=ReleaseSmall
+          a=$(sha256sum zig-out/bin/zinit | cut -d' ' -f1)
+          rm -rf .zig-cache zig-out
+          zig build -Doptimize=ReleaseSmall
+          b=$(sha256sum zig-out/bin/zinit | cut -d' ' -f1)
+          [ "$a" = "$b" ] || { echo "not reproducible on rebuild: $a != $b"; exit 1; }
+
+          rm -rf /tmp/repro && mkdir -p /tmp/repro
+          tar -cf - --exclude=./.git --exclude=./.zig-cache --exclude=./zig-out --exclude=./kcov-output . \
+            | tar -xf - -C /tmp/repro
+          ( cd /tmp/repro && zig build -Doptimize=ReleaseSmall )
+          c=$(sha256sum /tmp/repro/zig-out/bin/zinit | cut -d' ' -f1)
+          rm -rf /tmp/repro
+          [ "$a" = "$c" ] || { echo "not reproducible across paths: $a != $c"; exit 1; }
+          echo "reproducible: $a"
+      - name: Run test with kcov
+        run: |
+          kcov --version
+          zig build test -Dtest-coverage=true --summary all
+      - name: Upload coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          directory: ./kcov-output
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          fail_ci_if_error: true

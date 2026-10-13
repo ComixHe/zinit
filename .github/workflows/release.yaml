@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, riscv64-linux]
+        optimize: [ReleaseSmall, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Tag matches the manifest version
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          want=$(sed -n 's/.*\.version *= *"\([^"]*\)".*/\1/p' build.zig.zon)
+          echo "tag=$v build.zig.zon=$want"
+          [ "$v" = "$want" ]
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }}
+      - name: Package
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          name=zinit-$v-${{ matrix.target }}-${{ matrix.optimize }}
+          mkdir -p "stage/$name"
+          cp zig-out/bin/zinit "stage/$name/zinit"
+          cp LICENSE README.md "stage/$name/"
+          tar -C stage -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz"
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.optimize }}-${{ matrix.target }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Collect the tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: ./dist
+          format: spdx-json
+          output-file: dist/zinit-${{ github.ref_name }}.spdx.json
+          artifact-name: zinit-${{ github.ref_name }}.spdx.json
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.spdx.json > SHA256SUMS
+          cat SHA256SUMS
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign the artifacts
+        run: |
+          cd dist
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          for f in ./*.tar.gz ./*.spdx.json; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+            dist/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Idempotent: a re-run of the workflow re-uploads instead of failing.
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/* \
+            || gh release upload "$GITHUB_REF_NAME" --clobber dist/*
