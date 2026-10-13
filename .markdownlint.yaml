@@ -1,0 +1,6 @@
+# Keep the 80-column limit for prose. Markdown tables cannot be wrapped and
+# code blocks are verbatim, so both are exempt rather than left unchecked.
+MD013:
+  line_length: 80
+  tables: false
+  code_blocks: false

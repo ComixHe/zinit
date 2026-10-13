@@ -1,0 +1,8 @@
+# GitHub publishes a hosted runner image before actionlint learns its label.
+# `ubuntu-26.04` is live (this repo's v0.2.0 release ran on it), but actionlint
+# v1.7.12 -- the latest -- only lists labels up to `ubuntu-24.04`.
+# `self-hosted-runner.labels` is actionlint's only knob for "extra labels to
+# accept"; drop the entry once a release knows the label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

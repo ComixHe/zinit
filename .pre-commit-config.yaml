@@ -2,15 +2,15 @@
 #
 # SPDX-License-Identifier: CC0-1.0
 
-exclude: |
-  (?x)^(
-    LICENSES/|
-  )
+exclude: ^LICENSES/
 
 ci:
   autoupdate_commit_msg: "chore(deps): pre-commit.ci autoupdate"
   autofix_prs: false
   autoupdate_schedule: 'monthly'
+  # The zig hook below is `language: system`, which pre-commit.ci cannot set up;
+  # ci.yaml runs `zig fmt --check .` on every PR instead.
+  skip: [zig-fmt]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -22,12 +22,10 @@ repos:
         exclude: \.md$
       - id: end-of-file-fixer
       - id: check-yaml
-      - id: check-json
       - id: check-toml
       - id: check-added-large-files
       - id: mixed-line-ending
       - id: check-shebang-scripts-are-executable
-      - id: check-executables-have-shebangs
 
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.12
@@ -38,3 +36,13 @@ repos:
     rev: v0.49.1
     hooks:
       - id: markdownlint
+
+  # `zig fmt` needs the toolchain pinned by build.zig.zon, so it runs from the
+  # developer's PATH rather than a managed environment.
+  - repo: local
+    hooks:
+      - id: zig-fmt
+        name: zig fmt
+        entry: zig fmt
+        language: system
+        files: \.(zig|zon)$

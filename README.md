@@ -2,16 +2,19 @@
 
 [![Coverage Status](https://img.shields.io/codecov/c/github/ComixHe/zinit?style=flat-square&logo=codecov)](https://codecov.io/gh/ComixHe/zinit)
 
-A tiny init process written in Zig for Linux containers, designed for signal forwarding, orphan process collection, and safer PID 1 shutdown behavior.
+A tiny init process written in Zig for Linux containers, designed for signal
+forwarding, orphan process collection, and safer PID 1 shutdown behavior.
 
 ## Features
 
 - **Signal Forwarding**: Forward signals from parent process to child processes
-- **Orphan Process Collection**: Reaps orphaned descendants — automatically as PID 1, or with `-s`/`ZINIT_SUBREAPER` otherwise
+- **Orphan Process Collection**: Reaps orphaned descendants — automatically as
+  PID 1, or with `-s`/`ZINIT_SUBREAPER` otherwise
 - **Parent Death Signal**: Configurable signal when parent process dies
 - **Signal Rewriting**: Remap incoming signals before forwarding them
 - **Exit Code Mapping**: Translate known child exit codes to success when needed
-- **Terminal Control**: Properly handles terminal process groups for interactive applications
+- **Terminal Control**: Properly handles terminal process groups for
+  interactive applications
 - **Debug Support**: Optional tracing mode for debugging child processes
 
 ## Requirements
@@ -29,7 +32,8 @@ The kernel version needed depends on which features are used:
 | `-s` / `ZINIT_SUBREAPER` | **3.4** | `prctl(PR_SET_CHILD_SUBREAPER)` |
 | Automatic acceleration | 5.3 / 6.9 | `pidfd_open` (5.3) and `pidfd_send_signal` with the process-group flag (6.9) |
 
-So a plain run as PID 1 (no `-s`) needs **Linux 2.6.27+**. Subreaper mode raises that to **3.4+**.
+So a plain run as PID 1 (no `-s`) needs **Linux 2.6.27+**. Subreaper mode raises
+that to **3.4+**.
 
 ## Installation
 
@@ -111,7 +115,8 @@ zinit -g -- /bin/sh -c "my-server & wait"
 
 ### Use New Session
 
-`--new-session` creates a new session and detaches from the controlling terminal.
+`--new-session` creates a new session and detaches from the controlling
+terminal.
 It also automatically rewrites job control signals (TSTP, TTOU, TTIN) to STOP to
 avoid issues when running in background process groups. Combine it with `-g` if
 you also want incoming signals forwarded to the whole process group:
@@ -134,7 +139,8 @@ zinit -e 143 -e 130 -- java -jar app.jar
 
 ### Rewrite Signals for Legacy Applications
 
-Some applications expect different signals than what the container runtime sends:
+Some applications expect different signals than what the container runtime
+sends:
 
 ```bash
 # Convert SIGTERM to SIGINT for graceful shutdown
@@ -149,7 +155,8 @@ zinit -r USR1:0 -- /usr/bin/my-app
 
 ### Set Parent Death Signal
 
-Ensure the child process receives a signal when `zinit` itself dies unexpectedly:
+Ensure the child process receives a signal when `zinit` itself dies
+unexpectedly:
 
 ```bash
 zinit -p KILL -- /usr/bin/critical-service
@@ -203,13 +210,24 @@ kill -USR1 <child_pid>
 
 ## How It Works
 
-1. **Signal Setup**: Blocks the signals it forwards and reads them through a signalfd; fault signals keep their terminating default, and TTIN/TTOU are ignored rather than left pending for the child
-2. **Subreaper Mode**: Optional (`-s`/`--subreaper`). As PID 1 the kernel already re-parents orphaned descendants to us
-3. **Isolate**: The child is placed in its own process group (and made the foreground group when attached to a TTY). `--new-session` additionally creates a new session
-4. **Terminal Setup**: Acquires/forwards the controlling terminal for interactive applications
-5. **Event Loop**: Polls the signalfd, using the shutdown grace period as the poll timeout
+1. **Signal Setup**: Blocks the signals it forwards and reads them through a
+   signalfd; fault signals keep their terminating default, and TTIN/TTOU are
+   ignored rather than left pending for the child
+2. **Subreaper Mode**: Optional (`-s`/`--subreaper`). As PID 1 the kernel
+   already re-parents orphaned descendants to us
+3. **Isolate**: The child is placed in its own process group (and made the
+   foreground group when attached to a TTY). `--new-session` additionally
+   creates a new session
+4. **Terminal Setup**: Acquires/forwards the controlling terminal for
+   interactive applications
+5. **Event Loop**: Polls the signalfd, using the shutdown grace period as the
+   poll timeout
 6. **Signal Forwarding**: Forwards signals to child (with optional rewriting)
-7. **Graceful Shutdown**: On child exit, sends SIGTERM to the child's process group, then SIGKILL once the grace period elapses (`-t`, default 5 s). zinit then exits without waiting indefinitely, so an unkillable or detached descendant can never hang it. When running as PID 1 the kernel tears down the rest of the PID namespace.
+7. **Graceful Shutdown**: On child exit, sends SIGTERM to the child's process
+   group, then SIGKILL once the grace period elapses (`-t`, default 5 s). zinit
+   then exits without waiting indefinitely, so an unkillable or detached
+   descendant can never hang it. When running as PID 1 the kernel tears down
+   the rest of the PID namespace.
 
 ## Development
 
