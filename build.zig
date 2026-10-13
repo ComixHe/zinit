@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2025 - 2026 YuMing He <ComixHe1895@outlook.com>
+//
+// SPDX-License-Identifier: MIT
+
 const std = @import("std");
 
 fn packageVersion(b: *std.Build) std.SemanticVersion {

@@ -1,0 +1,15 @@
+version = 1
+SPDX-PackageName = "zinit"
+SPDX-PackageSupplier = "YuMing He <ComixHe1895@outlook.com>"
+SPDX-PackageDownloadLocation = "https://github.com/ComixHe/zinit"
+SPDX-PackageLicenseConcluded = "MIT"
+
+[[annotations]]
+path = [
+    ".gitignore",
+    ".github/**",
+    "README.md",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2025 - 2026 YuMing He <ComixHe1895@outlook.com>"
+SPDX-License-Identifier = "CC0-1.0"

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2025 - 2026 YuMing He <ComixHe1895@outlook.com>
+//
+// SPDX-License-Identifier: MIT
+
 //! A tiny, allocation-free, libc-less init for Linux
 //! containers, focused on signal forwarding and orphan reaping.
 //!
