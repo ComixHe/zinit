@@ -540,7 +540,8 @@ const Args = struct {
 
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--")) {
-                child_start = init.args.vector.len - args_iter.inner.remaining.len;
+                const next = init.args.vector.len - args_iter.inner.remaining.len;
+                if (next < init.args.vector.len) child_start = next;
                 break;
             }
 
@@ -612,6 +613,8 @@ const Args = struct {
         if (has_help) return .help;
         if (has_version) return .version;
 
+        // A trailing `--` (or no command at all) used to leave `start` one past
+        // the last argument, which then dereferenced the argv NULL terminator.
         const start = child_start orelse return ZinitError.InvalidParams;
 
         const log_level: std.log.Level = log_level_opt orelse blk: {
@@ -754,7 +757,8 @@ const Args = struct {
         // Make the child's group the foreground group, otherwise an interactive
         // program reading the terminal would be stopped by SIGTTIN.
         // This must run while SIGTTOU is still SIG_IGN (i.e. before restoring child signals):
-        // the kernel refuses to change the foreground group for a background caller unless SIGTTOU is ignored.
+        // the kernel refuses to change the foreground group for a background caller
+        // unless SIGTTOU is ignored.
         if (builtin.mode == .debug) std.debug.assert(signalIsIgnored(Sig.TTOU));
         const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
         switch (std.os.linux.errno(std.os.linux.tcsetpgrp(std.os.linux.STDIN_FILENO, &pgrp))) {
@@ -1672,6 +1676,19 @@ test "Args.parse maps argv, environment and options" {
     }
 
     try std.testing.expect(found_env);
+}
+
+test "Args.parse rejects a missing command" {
+    const env = [_:null]?[*:0]const u8{};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
+
+    const argvs = [_][]const [*:0]const u8{
+        &.{"zinit"}, &.{ "zinit", "--" }, &.{ "zinit", "-s", "--" },
+    };
+    for (argvs) |argv| {
+        const init: std.process.Init.Minimal = .{ .args = .{ .vector = argv }, .environ = environ };
+        try std.testing.expectError(ZinitError.InvalidParams, Args.parse(init));
+    }
 }
 
 test "group forwarding: -g is independent of --new-session" {
