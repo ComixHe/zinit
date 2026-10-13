@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
 
     const config = b.addOptions();
     const tracing_child = b.option(bool, "tracing-child", "zinit will wait for SIGUSR1 to continue executing child process") orelse false;
-    const stack_traces = b.option(bool, "stack-traces", "Include crash stack traces (segfault handler + std.debug panic); ~120 KB of std.debug/ELF code. Opt-in, off by default.") orelse false;
+    const stack_traces = b.option(bool, "stack-traces", "Include crash stack traces (segfault handler + std.debug panic). Opt-in, off by default.") orelse false;
     config.addOption(std.SemanticVersion, "version", exe.version orelse unreachable);
     config.addOption(bool, "tracing_child", tracing_child);
     config.addOption(bool, "stack_traces", stack_traces);

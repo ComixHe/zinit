@@ -196,14 +196,14 @@ kill -USR1 <child_pid>
 | `-Doptimize=ReleaseSmall` | Smallest binary, optimized for size |
 | `-Doptimize=ReleaseSafe` | Optimized, with runtime safety checks |
 | `-Doptimize=ReleaseFast` | Optimized, without runtime safety checks |
-| `-Dstack-traces=true` | Include crash stack traces. adds ~120 KB of std.debug/ELF code and is **off by default in release builds** |
+| `-Dstack-traces=true` | Include crash stack traces, **Off by default** |
 | `-Dtracing-child=true` | Child waits for SIGUSR1 before exec (for debugging) |
 | `-Dtest-coverage=true` | Build the tests for kcov and write `kcov-output/` |
 | `-Dsize-analysis=true` | Keep symbols in release builds, for `bloaty`/`nm` |
 
 ## How It Works
 
-1. **Signal Setup**: Blocks all signals and creates a signalfd for synchronous signal handling
+1. **Signal Setup**: Blocks the signals it forwards and reads them through a signalfd; fault signals keep their terminating default, and TTIN/TTOU are ignored rather than left pending for the child
 2. **Subreaper Mode**: Optional (`-s`/`--subreaper`). As PID 1 the kernel already re-parents orphaned descendants to us
 3. **Isolate**: The child is placed in its own process group (and made the foreground group when attached to a TTY). `--new-session` additionally creates a new session
 4. **Terminal Setup**: Acquires/forwards the controlling terminal for interactive applications
