@@ -1,5 +1,25 @@
 const std = @import("std");
 
+fn packageVersion(b: *std.Build) std.SemanticVersion {
+    const Manifest = struct { version: []const u8 };
+
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const manifest = std.zon.parse.fromSlice(Manifest, .{
+        .gpa = b.allocator,
+        .arena = b.allocator,
+        .source = @embedFile("build.zig.zon"),
+        .diagnostics = &diagnostics,
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        diagnostics.log("build.zig.zon");
+        std.debug.panic("unable to parse build.zig.zon: {s}", .{@errorName(err)});
+    };
+
+    return std.SemanticVersion.parse(manifest.version) catch |err| {
+        std.debug.panic("invalid version {s} in build.zig.zon: {s}", .{ manifest.version, @errorName(err) });
+    };
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = .{
         .os_tag = .linux,
@@ -15,7 +35,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "zinit",
         .root_module = exe_mod,
-        .version = .{ .major = 0, .minor = 1, .patch = 0 },
+        .version = packageVersion(b),
     });
 
     const config = b.addOptions();
