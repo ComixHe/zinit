@@ -27,22 +27,22 @@ jobs:
           want=$(sed -n 's/.*\.version *= *"\([^"]*\)".*/\1/p' build.zig.zon)
           echo "tag=$v build.zig.zon=$want"
           [ "$v" = "$want" ]
-      - name: Build
-        run: zig build -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }}
-      - name: Package
+      - name: Build and package
         run: |
-          v=${GITHUB_REF_NAME#v}
-          name=zinit-$v-${{ matrix.target }}-${{ matrix.optimize }}
-          mkdir -p "stage/$name"
-          cp zig-out/bin/zinit "stage/$name/zinit"
-          cp LICENSE README.md "stage/$name/"
-          tar -C stage -czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz"
+          # tools/release.zig writes the archive through std's tar/gzip writers,
+          # so the payload -- not just the binary in it -- is reproducible.
+          # SOURCE_DATE_EPOCH fixes the archive timestamps and the SBOM date.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          zig build release \
+            -Doptimize=${{ matrix.optimize }} \
+            -Dtarget=${{ matrix.target }} \
+            -Dsbom=true -Dcommit=${{ github.sha }}
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.optimize }}-${{ matrix.target }}
-          path: "*.tar.gz"
+          path: "zig-out/artifacts/*"
           if-no-files-found: error
 
   release:
@@ -50,18 +50,11 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Collect the tarballs
+      - name: Collect the artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
-      - name: SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: ./dist
-          format: spdx-json
-          output-file: dist/zinit-${{ github.ref_name }}.spdx.json
-          artifact-name: zinit-${{ github.ref_name }}.spdx.json
       - name: Checksums
         run: |
           cd dist
