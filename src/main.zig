@@ -82,7 +82,7 @@ fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) void {
                 if (rc == 0) return;
                 offset += @intCast(rc);
             },
-            .INTR => continue,
+            .INTR => unreachable,
             else => return,
         }
     }
@@ -217,10 +217,7 @@ fn errName(e: std.os.linux.E) []const u8 {
         .NOMEM => "ENOMEM",
         .ACCES => "EACCES",
         .FAULT => "EFAULT",
-        .BUSY => "EBUSY",
-        .EXIST => "EEXIST",
         .NOTDIR => "ENOTDIR",
-        .ISDIR => "EISDIR",
         .INVAL => "EINVAL",
         .NFILE => "ENFILE",
         .MFILE => "EMFILE",
@@ -228,9 +225,6 @@ fn errName(e: std.os.linux.E) []const u8 {
         .TXTBSY => "ETXTBSY",
         .FBIG => "EFBIG",
         .NOSPC => "ENOSPC",
-        .SPIPE => "ESPIPE",
-        .ROFS => "EROFS",
-        .MLINK => "EMLINK",
         .PIPE => "EPIPE",
         .NAMETOOLONG => "ENAMETOOLONG",
         .NOSYS => "ENOSYS",
@@ -359,7 +353,7 @@ fn parseSignal(s: []const u8) !u32 {
         if (parseDecimal(u32, s)) |sig_num| {
             if (isStandardSignal(sig_num)) return sig_num;
             return ZinitError.InvalidSignal;
-        } else |_| {}
+        } else |_| return ZinitError.InvalidSignal;
     }
 
     const name_to_check = if (std.ascii.startsWithIgnoreCase(s, "SIG"))
@@ -407,7 +401,8 @@ const RewriteMap = struct {
 
     fn apply(rewrites: ?RewriteMap, signo: u32) u32 {
         if (rewrites) |m| {
-            if (m.has(signo)) return m.get(signo);
+            const target = m.get(signo);
+            if (target != unset) return target;
         }
 
         return signo;
@@ -419,11 +414,9 @@ const RewriteMap = struct {
         const old_sig = try parseSignal(old);
 
         const rest = value[sep + 1 ..];
-        const rest_sep = indexOfByte(rest, ':');
-        const new = if (rest_sep) |s| rest[0..s] else rest;
-        const new_sig = try parseRewriteTarget(new);
+        if (indexOfByte(rest, ':') != null) return ZinitError.InvalidRewrite;
 
-        if (rest_sep != null) return ZinitError.InvalidRewrite;
+        const new_sig = try parseRewriteTarget(rest);
 
         if (old_sig == new_sig) return ZinitError.DuplicateSignal;
 
@@ -613,8 +606,8 @@ const Args = struct {
         if (has_help) return .help;
         if (has_version) return .version;
 
-        // A trailing `--` (or no command at all) used to leave `start` one past
-        // the last argument, which then dereferenced the argv NULL terminator.
+        // A trailing `--` used to leave `start` one past the last argument, which
+        // then dereferenced the argv NULL terminator. No command leaves it null.
         const start = child_start orelse return ZinitError.InvalidParams;
 
         const log_level: std.log.Level = log_level_opt orelse blk: {
@@ -700,6 +693,7 @@ const Args = struct {
         const pid = std.os.linux.fork();
         const err = std.os.linux.errno(pid);
         if (err != .SUCCESS) {
+            @branchHint(.cold);
             log.err("unable to fork: {s}", .{errName(err)});
             return ZinitError.SysCallError;
         }
@@ -771,7 +765,6 @@ const Args = struct {
 const default_shutdown_timeout_s: u64 = 5;
 
 const SigConf = struct {
-    old_set: std.os.linux.sigset_t,
     current_set: std.os.linux.sigset_t,
     ttin_action: std.os.linux.Sigaction,
     ttou_action: std.os.linux.Sigaction,
@@ -781,11 +774,17 @@ const SigConf = struct {
         var set = std.os.linux.sigfillset();
         for (sig_list) |sig| std.os.linux.sigdelset(&set, sig);
 
-        var old_set: std.os.linux.sigset_t = undefined;
-        var ret = std.os.linux.sigprocmask(Sig.SETMASK, &set, &old_set);
+        // Anything that could asynchronously interrupt a blocking syscall is
+        // blocked here and delivered through the signalfd instead; TTIN/TTOU are
+        // ignored rather than left pending for the child, and the fault signals
+        // keep their terminating default. No handler is ever installed in this
+        // process, and none of our blocking calls is a stop-signal exception
+        // (epoll_wait and friends), so no syscall here needs EINTR handling.
+        var ret = std.os.linux.sigprocmask(Sig.SETMASK, &set, null);
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
             else => {
+                @branchHint(.cold);
                 log.err("unable to set signal mask: {s}", .{errName(std.os.linux.errno(ret))});
                 return ZinitError.SysCallError;
             },
@@ -802,6 +801,7 @@ const SigConf = struct {
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
             else => |e| {
+                @branchHint(.cold);
                 log.err("unable to set signal action for TTIN: {s}", .{errName(e)});
                 return ZinitError.SysCallError;
             },
@@ -812,13 +812,13 @@ const SigConf = struct {
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
             else => |e| {
+                @branchHint(.cold);
                 log.err("unable to set signal action for TTOU: {s}", .{errName(e)});
                 return ZinitError.SysCallError;
             },
         }
 
         return .{
-            .old_set = old_set,
             .current_set = set,
             .ttin_action = old_ttin_action,
             .ttou_action = old_ttou_action,
@@ -826,14 +826,10 @@ const SigConf = struct {
     }
 
     fn restoreChild(self: *const SigConf) void {
-        var ret = std.os.linux.sigprocmask(Sig.SETMASK, &self.old_set, null);
-        switch (std.os.linux.errno(ret)) {
-            .SUCCESS => {},
-            else => |e| childErrorExit(1, &.{ "unable to restore signal mask: ", errName(e) }),
-        }
-
+        // Unblocked wholesale rather than restored to the parent's mask: `execve`
+        // keeps the mask, so anything left blocked would leak into the target.
         var unblock_all = std.os.linux.sigfillset();
-        ret = std.os.linux.sigprocmask(Sig.UNBLOCK, &unblock_all, null);
+        var ret = std.os.linux.sigprocmask(Sig.UNBLOCK, &unblock_all, null);
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
             else => |e| childErrorExit(1, &.{ "unable to unblock signals: ", errName(e) }),
@@ -1007,7 +1003,7 @@ fn drainChildren(main_pid: ?usize, expected_exit: ExitCodeSet) !DrainResult {
 
         const err = std.os.linux.errno(ret);
         switch (err) {
-            .INTR => continue,
+            .INTR => unreachable,
             .SUCCESS => {
                 const pid: usize = @intCast(ret);
                 const is_main = if (main_pid) |mp| pid == mp else false;
@@ -1192,9 +1188,10 @@ const ProcessState = struct {
 
             switch (std.os.linux.errno(ret)) {
                 .SUCCESS => {},
-                .INTR => continue,
+                .INTR => unreachable,
                 .AGAIN => return null,
                 else => |e| {
+                    @branchHint(.cold);
                     log.err("unable to read sigfd: {s}", .{errName(e)});
                     return 1;
                 },
@@ -1203,6 +1200,7 @@ const ProcessState = struct {
             log.debug("receive signal: {d}", .{sig_info.signo});
 
             if (sig_info.signo != @backingInt(Sig.CHLD)) {
+                @branchHint(.unpredictable);
                 if (isStandardSignal(sig_info.signo)) {
                     self.forwardSignal(sig_info.signo);
                 } else {
@@ -1213,6 +1211,7 @@ const ProcessState = struct {
             }
 
             const reap = drainChildren(self.child, self.expected_exit) catch |err| {
+                @branchHint(.cold);
                 log.err("waitpid failed: {s}", .{@errorName(err)});
                 return 1;
             };
@@ -1277,16 +1276,9 @@ fn monotonicNs() u64 {
 fn tryClose(fd: std.os.linux.fd_t) void {
     if (fd < 0) return;
 
-    while (true) {
-        const close_rc = std.os.linux.close(fd);
-        switch (std.os.linux.errno(close_rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => |err| {
-                log.err("unable to close fd {d}: {s}", .{ @as(u64, @intCast(fd)), errName(err) });
-                break;
-            },
-        }
+    switch (std.os.linux.errno(std.os.linux.close(fd))) {
+        .SUCCESS => {},
+        else => |err| log.err("unable to close fd {d}: {s}", .{ @as(u64, @intCast(fd)), errName(err) }),
     }
 }
 
@@ -1312,6 +1304,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     logInit();
 
     const args = switch (Args.parse(init) catch |err| {
+        @branchHint(.cold);
         log.err("unable to parse arguments: {s}", .{@errorName(err)});
         // Usage shown because of an error is a diagnostic: send it to stderr,
         // keeping stdout for the program's requested output.
@@ -1333,6 +1326,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     const unblocked_sigs = [_]Sig{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP, .TTIN, .TTOU };
     var sig_conf = SigConf.init(&unblocked_sigs) catch |err| {
+        @branchHint(.cold);
         log.err("unable to handle signals: {s}", .{@errorName(err)});
         return 1;
     };
@@ -1347,20 +1341,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
             else => |e| {
+                @branchHint(.cold);
                 log.err("unable to enable child subreaper mode: {s}", .{errName(e)});
                 return 1;
             },
         }
     } else if (std.os.linux.getpid() != 1) {
         log.warn(
-            \\not PID 1 and not a subreaper: orphaned descendants will not be reaped here,
-            \\pass -s/--subreaper to adopt them
-        ,
+            "not PID 1 and not a subreaper: orphaned descendants will not be reaped here, pass -s/--subreaper to adopt them",
             .{},
         );
     }
 
     const child = args.spawn(&sig_conf) catch {
+        @branchHint(.cold);
         log.err("failed to start child process", .{});
         return 1;
     };
@@ -1416,7 +1410,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const count = std.os.linux.poll(@ptrCast(&sig_pollfd), 1, timeout);
         switch (std.os.linux.errno(count)) {
             .SUCCESS => {},
+            .INTR => unreachable,
             else => |e| {
+                @branchHint(.cold);
                 log.err("poll failed: {s}", .{errName(e)});
                 return 1;
             },
