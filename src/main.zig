@@ -57,21 +57,6 @@ fn minimalPanic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noretur
     std.os.linux.exit(1);
 }
 
-const log_state = struct {
-    var level: std.log.Level = .info;
-    var color: bool = false;
-};
-
-fn logInit() void {
-    var termios: std.os.linux.termios = undefined;
-    const rc = std.os.linux.tcgetattr(std.os.linux.STDERR_FILENO, &termios);
-    log_state.color = std.os.linux.errno(rc) == .SUCCESS;
-}
-
-fn setLogLevel(level: std.log.Level) void {
-    log_state.level = level;
-}
-
 fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -184,18 +169,6 @@ const fmt = struct {
         return out + written;
     }
 };
-
-/// Byte search without `std.mem`'s vectorized `findScalarPos`: every needle
-/// here is a single byte in a short string, no need to pull in the whole SIMD machinery
-/// for binary size.
-fn indexOfByte(s: []const u8, c: u8) ?usize {
-    for (s, 0..) |b, i| {
-        if (b == c) return i;
-    }
-
-    return null;
-}
-
 /// Short name for the errno values zinit's syscalls can plausibly return.
 /// The names here are plain string literals, so the huge @tagName(std.os.linux.E)
 /// table is never emitted; anything outside this set prints as a number instead.
@@ -238,10 +211,23 @@ fn errName(e: std.os.linux.E) []const u8 {
 /// Minimal logger: applies the runtime level, prefixes and writes to stderr
 /// with no allocation and no dependency on `std.log`.
 const log = struct {
-    fn emit(level: std.log.Level, msg: []const u8) void {
-        if (@backingInt(level) > @backingInt(log_state.level)) return;
+    var min_level: std.log.Level = .info;
+    var color: bool = false;
 
-        const prefix: []const u8 = if (log_state.color) switch (level) {
+    fn init() void {
+        var termios: std.os.linux.termios = undefined;
+        const rc = std.os.linux.tcgetattr(std.os.linux.STDERR_FILENO, &termios);
+        color = std.os.linux.errno(rc) == .SUCCESS;
+    }
+
+    fn setLevel(l: std.log.Level) void {
+        min_level = l;
+    }
+
+    fn emit(level: std.log.Level, msg: []const u8) void {
+        if (@backingInt(level) > @backingInt(min_level)) return;
+
+        const prefix: []const u8 = if (color) switch (level) {
             .err => "\x1b[31m[zinit] ERROR:\x1b[0m ",
             .warn => "\x1b[33m[zinit] WARN:\x1b[0m ",
             .info => "\x1b[32m[zinit] INFO:\x1b[0m ",
@@ -297,32 +283,70 @@ const log = struct {
     }
 };
 
-const Sig = std.os.linux.SIG;
+const str = struct {
+    /// Byte search without `std.mem`'s vectorized `findScalarPos`: every needle
+    /// here is a single byte in a short string, no need to pull in the whole SIMD machinery
+    /// for binary size.
+    fn indexOfByte(s: []const u8, c: u8) ?usize {
+        for (s, 0..) |b, i| {
+            if (b == c) return i;
+        }
 
-fn lookupSignal(name: []const u8) ?u32 {
-    const map = comptime std.StaticStringMap(Sig).initEnum();
-    return if (map.get(name)) |s| @backingInt(s) else null;
-}
-
-fn parseDecimal(comptime T: type, s: []const u8) error{ InvalidCharacter, Overflow }!T {
-    if (s.len == 0) return error.InvalidCharacter;
-    var v: u64 = 0;
-    for (s) |c| {
-        if (c < '0' or c > '9') return error.InvalidCharacter;
-        v = v * 10 + (c - '0');
-        if (v > std.math.maxInt(T)) return error.Overflow;
+        return null;
     }
 
-    return @intCast(v);
-}
+    fn parseDecimal(comptime T: type, s: []const u8) error{ InvalidCharacter, Overflow }!T {
+        if (s.len == 0) return error.InvalidCharacter;
+        var v: u64 = 0;
+        for (s) |c| {
+            if (c < '0' or c > '9') return error.InvalidCharacter;
+            v = v * 10 + (c - '0');
+            if (v > std.math.maxInt(T)) return error.Overflow;
+        }
 
-fn parseLogLevel(s: []const u8) ?std.log.Level {
-    if (std.ascii.eqlIgnoreCase(s, "error")) return .err;
-    if (std.ascii.eqlIgnoreCase(s, "warn")) return .warn;
-    if (std.ascii.eqlIgnoreCase(s, "info")) return .info;
-    if (std.ascii.eqlIgnoreCase(s, "debug")) return .debug;
-    return null;
-}
+        return @intCast(v);
+    }
+};
+
+const Sig = std.os.linux.SIG;
+
+const signals = struct {
+    fn lookupSignal(name: []const u8) ?u32 {
+        const map = comptime std.StaticStringMap(Sig).initEnum();
+        return if (map.get(name)) |s| @backingInt(s) else null;
+    }
+
+    fn isStandardSignal(sig: u32) bool {
+        return sig > 0 and sig <= standard_signal_max;
+    }
+
+    /// Parse a signal from a number or a name (`TERM`, `SIGTERM`).
+    /// Realtime signals are deliberately rejected.
+    fn parseSignal(s: []const u8) !u32 {
+        if (s.len == 0) return ZinitError.InvalidParams;
+
+        if (s[0] >= '0' and s[0] <= '9') {
+            if (str.parseDecimal(u32, s)) |sig_num| {
+                if (isStandardSignal(sig_num)) return sig_num;
+                return ZinitError.InvalidSignal;
+            } else |_| return ZinitError.InvalidSignal;
+        }
+
+        const name_to_check = if (std.ascii.startsWithIgnoreCase(s, "SIG"))
+            s[3..]
+        else
+            s;
+
+        if (name_to_check.len == 0 or name_to_check.len > 15) return ZinitError.InvalidSignal;
+
+        var buf: [16]u8 = undefined;
+        const upper_name = std.ascii.upperString(&buf, name_to_check);
+
+        const sig = lookupSignal(upper_name) orelse return ZinitError.InvalidSignal;
+        if (!isStandardSignal(sig)) return ZinitError.InvalidSignal;
+        return sig;
+    }
+};
 
 const ZinitError = error{
     InvalidSignal,
@@ -339,38 +363,6 @@ const ExitCodeSet = std.StaticBitSet(256);
 /// Standard (non-realtime) signals are 1..=31; realtime signals start at
 /// SIGRTMIN (32) and are deliberately not supported.
 const standard_signal_max: u32 = std.os.linux.sigrtmin() - 1;
-
-fn isStandardSignal(sig: u32) bool {
-    return sig > 0 and sig <= standard_signal_max;
-}
-
-/// Parse a signal from a number or a name (`TERM`, `SIGTERM`).
-/// Realtime signals are deliberately rejected.
-fn parseSignal(s: []const u8) !u32 {
-    if (s.len == 0) return ZinitError.InvalidParams;
-
-    if (s[0] >= '0' and s[0] <= '9') {
-        if (parseDecimal(u32, s)) |sig_num| {
-            if (isStandardSignal(sig_num)) return sig_num;
-            return ZinitError.InvalidSignal;
-        } else |_| return ZinitError.InvalidSignal;
-    }
-
-    const name_to_check = if (std.ascii.startsWithIgnoreCase(s, "SIG"))
-        s[3..]
-    else
-        s;
-
-    if (name_to_check.len == 0 or name_to_check.len > 15) return ZinitError.InvalidSignal;
-
-    var buf: [16]u8 = undefined;
-    const upper_name = std.ascii.upperString(&buf, name_to_check);
-
-    const sig = lookupSignal(upper_name) orelse return ZinitError.InvalidSignal;
-    if (!isStandardSignal(sig)) return ZinitError.InvalidSignal;
-    return sig;
-}
-
 /// Signal rewrites applied to forwarded signals
 const RewriteMap = struct {
     /// Sentinel value indicating no rewrite is defined.
@@ -409,14 +401,14 @@ const RewriteMap = struct {
     }
 
     fn parse(self: *RewriteMap, value: []const u8) !void {
-        const sep = indexOfByte(value, ':') orelse return ZinitError.InvalidRewrite;
+        const sep = str.indexOfByte(value, ':') orelse return ZinitError.InvalidRewrite;
         const old = value[0..sep];
-        const old_sig = try parseSignal(old);
+        const old_sig = try signals.parseSignal(old);
 
         const rest = value[sep + 1 ..];
-        if (indexOfByte(rest, ':') != null) return ZinitError.InvalidRewrite;
+        if (str.indexOfByte(rest, ':') != null) return ZinitError.InvalidRewrite;
 
-        const new_sig = try parseRewriteTarget(rest);
+        const new_sig = try parseTarget(rest);
 
         if (old_sig == new_sig) return ZinitError.DuplicateSignal;
 
@@ -445,51 +437,11 @@ const RewriteMap = struct {
 
         return false;
     }
+    fn parseTarget(s: []const u8) !u32 {
+        if (std.mem.eql(u8, s, "0")) return 0;
+        return signals.parseSignal(s);
+    }
 };
-
-fn parseRewriteTarget(s: []const u8) !u32 {
-    if (std.mem.eql(u8, s, "0")) return 0;
-    return parseSignal(s);
-}
-
-fn printHelp(fd: std.os.linux.fd_t) void {
-    writeAll(fd,
-        \\zinit - A tiny init for linux containers.
-        \\
-        \\Usage: zinit [options] <ARG>...
-        \\
-        \\Options:
-        \\  -h, --help                                                   Display this help and exit
-        \\  -V, --version                                                Output version information and exit
-        \\      --log-level <LEVEL> (Env: ZINIT_LOG_LEVEL)               Set log level: error, warn, info (default), or debug
-        \\  -p, --signal <SIGNAL>                                        The triggered signal when parent process dies
-        \\  -s, --subreaper (Env: ZINIT_SUBREAPER)                       Enable child subreaper mode explicitly
-        \\  -n, --new-session                                            Enable new session mode explicitly
-        \\  -g, --forward-group                                          Forward signals to the whole process group
-        \\  -t, --shutdown-timeout <SECS> (Env: ZINIT_SHUTDOWN_TIMEOUT)  Grace period before SIGKILL on shutdown (default 5)
-        \\  -r, --rewrite <OLD:NEW>...                                   Rewrite a forwarded signal before sending to the child
-        \\                                                               (repeatable; use "0" as NEW to drop the signal)
-        \\  -e, --expect-exit <CODE>...                                  Map child exit codes to 0 (repeatable)
-        \\
-        \\Environment variables:
-        \\
-        \\  ZINIT_TRACING_CHILD: If set, zinit will wait for SIGUSR1 to continue executing child process
-        \\
-        \\Full help or any issues, please visit https://github.com/ComixHe/zinit
-        \\
-    );
-}
-
-fn printVersion() void {
-    var buf: [64]u8 = undefined;
-    const text = fmt.put(&buf, "{d}.{d}.{d}\n", .{
-        config.version.major,
-        config.version.minor,
-        config.version.patch,
-    });
-
-    writeAll(std.os.linux.STDOUT_FILENO, text);
-}
 
 const Args = struct {
     log_level: std.log.Level,
@@ -512,6 +464,53 @@ const Args = struct {
         help,
         version,
     };
+
+    fn parseLogLevel(s: []const u8) ?std.log.Level {
+        if (std.ascii.eqlIgnoreCase(s, "error")) return .err;
+        if (std.ascii.eqlIgnoreCase(s, "warn")) return .warn;
+        if (std.ascii.eqlIgnoreCase(s, "info")) return .info;
+        if (std.ascii.eqlIgnoreCase(s, "debug")) return .debug;
+        return null;
+    }
+
+    fn printHelp(fd: std.os.linux.fd_t) void {
+        writeAll(fd,
+            \\zinit - A tiny init for linux containers.
+            \\
+            \\Usage: zinit [options] <ARG>...
+            \\
+            \\Options:
+            \\  -h, --help                                                   Display this help and exit
+            \\  -V, --version                                                Output version information and exit
+            \\      --log-level <LEVEL> (Env: ZINIT_LOG_LEVEL)               Set log level: error, warn, info (default), or debug
+            \\  -p, --signal <SIGNAL>                                        The triggered signal when parent process dies
+            \\  -s, --subreaper (Env: ZINIT_SUBREAPER)                       Enable child subreaper mode explicitly
+            \\  -n, --new-session                                            Enable new session mode explicitly
+            \\  -g, --forward-group                                          Forward signals to the whole process group
+            \\  -t, --shutdown-timeout <SECS> (Env: ZINIT_SHUTDOWN_TIMEOUT)  Grace period before SIGKILL on shutdown (default 5)
+            \\  -r, --rewrite <OLD:NEW>...                                   Rewrite a forwarded signal before sending to the child
+            \\                                                               (repeatable; use "0" as NEW to drop the signal)
+            \\  -e, --expect-exit <CODE>...                                  Map child exit codes to 0 (repeatable)
+            \\
+            \\Environment variables:
+            \\
+            \\  ZINIT_TRACING_CHILD: If set, zinit will wait for SIGUSR1 to continue executing child process
+            \\
+            \\Full help or any issues, please visit https://github.com/ComixHe/zinit
+            \\
+        );
+    }
+
+    fn printVersion() void {
+        var buf: [64]u8 = undefined;
+        const text = fmt.put(&buf, "{d}.{d}.{d}\n", .{
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        });
+
+        writeAll(std.os.linux.STDOUT_FILENO, text);
+    }
 
     fn parse(init: std.process.Init.Minimal) !Action {
         var args_iter = init.args.iterate();
@@ -565,7 +564,7 @@ const Args = struct {
 
             if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--shutdown-timeout")) {
                 const v = args_iter.next() orelse return ZinitError.InvalidParams;
-                shutdown_timeout_s = parseDecimal(u64, v) catch return ZinitError.InvalidParams;
+                shutdown_timeout_s = str.parseDecimal(u64, v) catch return ZinitError.InvalidParams;
                 continue;
             }
 
@@ -578,7 +577,7 @@ const Args = struct {
             if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--signal")) {
                 if (pdeath_signal != null) return ZinitError.InvalidParams;
                 const v = args_iter.next() orelse return ZinitError.InvalidParams;
-                pdeath_signal = try parseSignal(v);
+                pdeath_signal = try signals.parseSignal(v);
                 continue;
             }
 
@@ -590,7 +589,7 @@ const Args = struct {
 
             if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expect-exit")) {
                 const v = args_iter.next() orelse return ZinitError.InvalidExitCode;
-                const code = parseDecimal(u8, v) catch return ZinitError.InvalidExitCode;
+                const code = str.parseDecimal(u8, v) catch return ZinitError.InvalidExitCode;
                 expected_exit.set(code);
                 continue;
             }
@@ -618,7 +617,7 @@ const Args = struct {
         const shutdown_timeout_s_final: u64 = shutdown_timeout_s orelse blk: {
             const v = init.environ.getPosix("ZINIT_SHUTDOWN_TIMEOUT") orelse
                 break :blk default_shutdown_timeout_s;
-            break :blk parseDecimal(u64, v) catch return ZinitError.InvalidParams;
+            break :blk str.parseDecimal(u64, v) catch return ZinitError.InvalidParams;
         };
 
         const subreaper = subreaper_flag or init.environ.getPosix("ZINIT_SUBREAPER") != null;
@@ -666,99 +665,6 @@ const Args = struct {
                 .envs = init.environ.block.slice,
             },
         };
-    }
-
-    fn spawn(self: *const Args, sig_conf: *SigConf) !usize {
-        if (self.new_session and self.is_terminal) {
-            const rc = std.os.linux.ioctl(std.os.linux.STDIN_FILENO, std.os.linux.T.IOCNOTTY, 0);
-            const err = std.os.linux.errno(rc);
-            if (err != .SUCCESS) {
-                log.debug("unable to detach from terminal: {s}", .{errName(err)});
-            } else {
-                if (std.os.linux.getsid(0) == std.os.linux.getpid()) {
-                    sig_conf.ignore_detached_sig = true;
-                    log.debug(
-                        "detaching from controlling terminal, ignoring initial HUP/CONT",
-                        .{},
-                    );
-                } else {
-                    log.debug(
-                        "detached from controlling terminal, but was not session leader",
-                        .{},
-                    );
-                }
-            }
-        }
-
-        const pid = std.os.linux.fork();
-        const err = std.os.linux.errno(pid);
-        if (err != .SUCCESS) {
-            @branchHint(.cold);
-            log.err("unable to fork: {s}", .{errName(err)});
-            return ZinitError.SysCallError;
-        }
-
-        if (pid != 0) return @intCast(pid);
-
-        // Terminal/process-group setup must happen before restoring the child's
-        // TTIN/TTOU dispositions: tcsetpgrp relies on SIGTTOU still being ignored.
-        self.setupChildTerminal();
-        sig_conf.restoreChild();
-
-        if (self.pdeath_signal) |sig| {
-            const option = @backingInt(std.os.linux.PR.SET_PDEATHSIG);
-            const ret = std.os.linux.prctl(option, sig, 0, 0, 0);
-            switch (std.os.linux.errno(ret)) {
-                .SUCCESS => {},
-                else => |e| childErrorExit(1, &.{
-                    "unable to set parent death signal: ", errName(e),
-                }),
-            }
-        }
-
-        if (self.tracing_child) waitForTracer();
-
-        execChild(self.argv, self.envs);
-    }
-
-    fn setupChildTerminal(self: Args) void {
-        // Always isolate the child into its own process group so that shutdown can
-        // signal the whole subtree.
-        if (self.new_session) {
-            const sid = std.os.linux.setsid();
-            const err = std.os.linux.errno(sid);
-            if (err != .SUCCESS) {
-                childErrorExit(1, &.{ "unable to create session: ", errName(err) });
-            }
-        } else {
-            const rc = std.os.linux.setpgid(0, 0);
-            const err = std.os.linux.errno(rc);
-            if (err != .SUCCESS) {
-                childErrorExit(1, &.{ "unable to create process group: ", errName(err) });
-            }
-        }
-
-        if (!self.is_terminal) return;
-
-        if (self.new_session) {
-            const rc = std.os.linux.ioctl(std.os.linux.STDIN_FILENO, std.os.linux.T.IOCSCTTY, 0);
-            const err = std.os.linux.errno(rc);
-            if (err != .SUCCESS) {
-                log.debug("unable to acquire controlling tty: {s}", .{errName(err)});
-            }
-        }
-
-        // Make the child's group the foreground group, otherwise an interactive
-        // program reading the terminal would be stopped by SIGTTIN.
-        // This must run while SIGTTOU is still SIG_IGN (i.e. before restoring child signals):
-        // the kernel refuses to change the foreground group for a background caller
-        // unless SIGTTOU is ignored.
-        if (builtin.mode == .debug) std.debug.assert(signalIsIgnored(Sig.TTOU));
-        const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
-        switch (std.os.linux.errno(std.os.linux.tcsetpgrp(std.os.linux.STDIN_FILENO, &pgrp))) {
-            .SUCCESS, .NOTTY, .NXIO => {},
-            else => |e| log.debug("unable to set foreground process group: {s}", .{errName(e)}),
-        }
     }
 };
 
@@ -832,13 +738,13 @@ const SigConf = struct {
         var ret = std.os.linux.sigprocmask(Sig.UNBLOCK, &unblock_all, null);
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
-            else => |e| childErrorExit(1, &.{ "unable to unblock signals: ", errName(e) }),
+            else => |e| child.childErrorExit(1, &.{ "unable to unblock signals: ", errName(e) }),
         }
 
         ret = std.os.linux.sigaction(Sig.TTIN, &self.ttin_action, null);
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
-            else => |e| childErrorExit(1, &.{
+            else => |e| child.childErrorExit(1, &.{
                 "unable to restore signal action for TTIN: ", errName(e),
             }),
         }
@@ -846,127 +752,222 @@ const SigConf = struct {
         ret = std.os.linux.sigaction(Sig.TTOU, &self.ttou_action, null);
         switch (std.os.linux.errno(ret)) {
             .SUCCESS => {},
-            else => |e| childErrorExit(1, &.{
+            else => |e| child.childErrorExit(1, &.{
                 "unable to restore signal action for TTOU: ", errName(e),
             }),
         }
     }
 };
 
-fn childErrorExit(code: u8, parts: []const []const u8) noreturn {
-    var buf: [512]u8 = undefined;
-    var out: usize = 0;
-    out = fmt.putBytes(&buf, out, "zinit child error: ");
-    for (parts) |p| out = fmt.putBytes(&buf, out, p);
-    out = fmt.putBytes(&buf, out, "\n");
-    _ = std.os.linux.write(std.os.linux.STDERR_FILENO, buf[0..out].ptr, out);
-    std.os.linux.exit(code);
-}
+const child = struct {
+    fn childErrorExit(code: u8, parts: []const []const u8) noreturn {
+        var buf: [512]u8 = undefined;
+        var out: usize = 0;
+        out = fmt.putBytes(&buf, out, "zinit child error: ");
+        for (parts) |p| out = fmt.putBytes(&buf, out, p);
+        out = fmt.putBytes(&buf, out, "\n");
+        _ = std.os.linux.write(std.os.linux.STDERR_FILENO, buf[0..out].ptr, out);
+        std.os.linux.exit(code);
+    }
 
-fn execExitCode(e: std.os.linux.E) u8 {
-    return switch (e) {
-        .NOENT => 127,
-        .ACCES, .NOEXEC => 126,
-        else => 1,
-    };
-}
+    fn execExitCode(e: std.os.linux.E) u8 {
+        return switch (e) {
+            .NOENT => 127,
+            .ACCES, .NOEXEC => 126,
+            else => 1,
+        };
+    }
 
-fn signalIsIgnored(sig: Sig) bool {
-    var act: std.os.linux.Sigaction = undefined;
-    if (std.os.linux.errno(std.os.linux.sigaction(sig, null, &act)) != .SUCCESS) return false;
-    return act.handler.handler == Sig.IGN;
-}
+    fn signalIsIgnored(sig: Sig) bool {
+        var act: std.os.linux.Sigaction = undefined;
+        if (std.os.linux.errno(std.os.linux.sigaction(sig, null, &act)) != .SUCCESS) return false;
+        return act.handler.handler == Sig.IGN;
+    }
 
-/// Default search path used when `PATH` is unset (mirrors execvp).
-const default_path = "/usr/local/bin:/usr/bin:/bin";
+    /// Default search path used when `PATH` is unset (mirrors execvp).
+    const default_path = "/usr/local/bin:/usr/bin:/bin";
 
-fn envValue(envp: [*:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (envp[i]) |entry| : (i += 1) {
-        const s = std.mem.span(entry);
-        if (s.len > name.len and s[name.len] == '=' and std.mem.eql(u8, s[0..name.len], name)) {
-            return s[name.len + 1 ..];
+    fn envValue(envp: [*:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (envp[i]) |entry| : (i += 1) {
+            const s = std.mem.span(entry);
+            if (s.len > name.len and s[name.len] == '=' and std.mem.eql(u8, s[0..name.len], name)) {
+                return s[name.len + 1 ..];
+            }
+        }
+
+        return null;
+    }
+
+    fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
+        var path_buf: [std.os.linux.PATH_MAX]u8 = undefined;
+        const file = std.mem.span(argv[0].?);
+
+        if (str.indexOfByte(file, '/') != null) {
+            const e = std.os.linux.errno(std.os.linux.execve(argv[0].?, argv, envp));
+            childErrorExit(execExitCode(e), &.{ "unable to execve ", file, ": ", errName(e) });
+        }
+
+        const path = envValue(envp, "PATH") orelse default_path;
+        var last_errno: std.os.linux.E = .NOENT;
+        var rest = path;
+        while (true) {
+            const colon = str.indexOfByte(rest, ':');
+            const dir = if (colon) |c| rest[0..c] else rest;
+
+            const candidate: ?[*:0]const u8 = blk: {
+                // An empty PATH entry means the current directory.
+                if (dir.len == 0) break :blk argv[0].?;
+                if (dir.len + 1 + file.len >= path_buf.len) break :blk null; // won't fit
+                @memcpy(path_buf[0..dir.len], dir);
+                path_buf[dir.len] = '/';
+                @memcpy(path_buf[dir.len + 1 ..][0..file.len], file);
+                path_buf[dir.len + 1 + file.len] = 0;
+                break :blk @ptrCast(&path_buf);
+            };
+
+            if (candidate) |c| {
+                const e = std.os.linux.errno(std.os.linux.execve(c, argv, envp));
+                switch (e) {
+                    .SUCCESS => unreachable,
+                    .ACCES, .NOENT, .NOTDIR, .NAMETOOLONG, .LOOP => last_errno = e,
+                    else => childErrorExit(execExitCode(e), &.{
+                        "unable to execve ", file, ": ", errName(e),
+                    }),
+                }
+            }
+
+            const adv = colon orelse break;
+            rest = rest[adv + 1 ..];
+        }
+
+        childErrorExit(execExitCode(last_errno), &.{
+            "unable to execve ", file, ": ", errName(last_errno),
+        });
+    }
+
+    /// Block until the tracer sends SIGUSR1, so a debugger can attach before `exec`.
+    fn waitForTracer() void {
+        const dummy_handler = struct {
+            fn handler(_: Sig) callconv(.c) void {}
+        }.handler;
+
+        const usr1_act: std.os.linux.Sigaction = .{
+            .handler = .{ .handler = dummy_handler },
+            .mask = std.os.linux.sigemptyset(),
+            .flags = 0,
+        };
+
+        var old_act: std.os.linux.Sigaction = undefined;
+        switch (std.os.linux.errno(std.os.linux.sigaction(Sig.USR1, &usr1_act, &old_act))) {
+            .SUCCESS => {},
+            else => |e| {
+                log.debug("failed to set signal action for USR1: {s}", .{errName(e)});
+                return;
+            },
+        }
+
+        _ = std.os.linux.pause();
+
+        switch (std.os.linux.errno(std.os.linux.sigaction(Sig.USR1, &old_act, null))) {
+            .SUCCESS => {},
+            else => |e| log.debug("failed to restore signal action for USR1: {s}", .{errName(e)}),
         }
     }
 
-    return null;
-}
+    fn spawn(args: *const Args, sig_conf: *SigConf) !usize {
+        if (args.new_session and args.is_terminal) {
+            const rc = std.os.linux.ioctl(std.os.linux.STDIN_FILENO, std.os.linux.T.IOCNOTTY, 0);
+            const err = std.os.linux.errno(rc);
+            if (err != .SUCCESS) {
+                log.debug("unable to detach from terminal: {s}", .{errName(err)});
+            } else {
+                if (std.os.linux.getsid(0) == std.os.linux.getpid()) {
+                    sig_conf.ignore_detached_sig = true;
+                    log.debug(
+                        "detaching from controlling terminal, ignoring initial HUP/CONT",
+                        .{},
+                    );
+                } else {
+                    log.debug(
+                        "detached from controlling terminal, but was not session leader",
+                        .{},
+                    );
+                }
+            }
+        }
 
-fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
-    var path_buf: [std.os.linux.PATH_MAX]u8 = undefined;
-    const file = std.mem.span(argv[0].?);
+        const pid = std.os.linux.fork();
+        const err = std.os.linux.errno(pid);
+        if (err != .SUCCESS) {
+            @branchHint(.cold);
+            log.err("unable to fork: {s}", .{errName(err)});
+            return ZinitError.SysCallError;
+        }
 
-    if (indexOfByte(file, '/') != null) {
-        const e = std.os.linux.errno(std.os.linux.execve(argv[0].?, argv, envp));
-        childErrorExit(execExitCode(e), &.{ "unable to execve ", file, ": ", errName(e) });
-    }
+        if (pid != 0) return @intCast(pid);
 
-    const path = envValue(envp, "PATH") orelse default_path;
-    var last_errno: std.os.linux.E = .NOENT;
-    var rest = path;
-    while (true) {
-        const colon = indexOfByte(rest, ':');
-        const dir = if (colon) |c| rest[0..c] else rest;
+        // Terminal/process-group setup must happen before restoring the child's
+        // TTIN/TTOU dispositions: tcsetpgrp relies on SIGTTOU still being ignored.
+        setupTerminal(args);
+        sig_conf.restoreChild();
 
-        const candidate: ?[*:0]const u8 = blk: {
-            // An empty PATH entry means the current directory.
-            if (dir.len == 0) break :blk argv[0].?;
-            if (dir.len + 1 + file.len >= path_buf.len) break :blk null; // won't fit
-            @memcpy(path_buf[0..dir.len], dir);
-            path_buf[dir.len] = '/';
-            @memcpy(path_buf[dir.len + 1 ..][0..file.len], file);
-            path_buf[dir.len + 1 + file.len] = 0;
-            break :blk @ptrCast(&path_buf);
-        };
-
-        if (candidate) |c| {
-            const e = std.os.linux.errno(std.os.linux.execve(c, argv, envp));
-            switch (e) {
-                .SUCCESS => unreachable,
-                .ACCES, .NOENT, .NOTDIR, .NAMETOOLONG, .LOOP => last_errno = e,
-                else => childErrorExit(execExitCode(e), &.{
-                    "unable to execve ", file, ": ", errName(e),
+        if (args.pdeath_signal) |sig| {
+            const option = @backingInt(std.os.linux.PR.SET_PDEATHSIG);
+            const ret = std.os.linux.prctl(option, sig, 0, 0, 0);
+            switch (std.os.linux.errno(ret)) {
+                .SUCCESS => {},
+                else => |e| childErrorExit(1, &.{
+                    "unable to set parent death signal: ", errName(e),
                 }),
             }
         }
 
-        const adv = colon orelse break;
-        rest = rest[adv + 1 ..];
+        if (args.tracing_child) waitForTracer();
+
+        execChild(args.argv, args.envs);
     }
 
-    childErrorExit(execExitCode(last_errno), &.{
-        "unable to execve ", file, ": ", errName(last_errno),
-    });
-}
+    fn setupTerminal(args: *const Args) void {
+        // Always isolate the child into its own process group so that shutdown can
+        // signal the whole subtree.
+        if (args.new_session) {
+            const sid = std.os.linux.setsid();
+            const err = std.os.linux.errno(sid);
+            if (err != .SUCCESS) {
+                childErrorExit(1, &.{ "unable to create session: ", errName(err) });
+            }
+        } else {
+            const rc = std.os.linux.setpgid(0, 0);
+            const err = std.os.linux.errno(rc);
+            if (err != .SUCCESS) {
+                childErrorExit(1, &.{ "unable to create process group: ", errName(err) });
+            }
+        }
 
-/// Block until the tracer sends SIGUSR1, so a debugger can attach before `exec`.
-fn waitForTracer() void {
-    const dummy_handler = struct {
-        fn handler(_: Sig) callconv(.c) void {}
-    }.handler;
+        if (!args.is_terminal) return;
 
-    const usr1_act: std.os.linux.Sigaction = .{
-        .handler = .{ .handler = dummy_handler },
-        .mask = std.os.linux.sigemptyset(),
-        .flags = 0,
-    };
+        if (args.new_session) {
+            const rc = std.os.linux.ioctl(std.os.linux.STDIN_FILENO, std.os.linux.T.IOCSCTTY, 0);
+            const err = std.os.linux.errno(rc);
+            if (err != .SUCCESS) {
+                log.debug("unable to acquire controlling tty: {s}", .{errName(err)});
+            }
+        }
 
-    var old_act: std.os.linux.Sigaction = undefined;
-    switch (std.os.linux.errno(std.os.linux.sigaction(Sig.USR1, &usr1_act, &old_act))) {
-        .SUCCESS => {},
-        else => |e| {
-            log.debug("failed to set signal action for USR1: {s}", .{errName(e)});
-            return;
-        },
+        // Make the child's group the foreground group, otherwise an interactive
+        // program reading the terminal would be stopped by SIGTTIN.
+        // This must run while SIGTTOU is still SIG_IGN (i.e. before restoring child signals):
+        // the kernel refuses to change the foreground group for a background caller
+        // unless SIGTTOU is ignored.
+        if (builtin.mode == .debug) std.debug.assert(signalIsIgnored(Sig.TTOU));
+        const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
+        switch (std.os.linux.errno(std.os.linux.tcsetpgrp(std.os.linux.STDIN_FILENO, &pgrp))) {
+            .SUCCESS, .NOTTY, .NXIO => {},
+            else => |e| log.debug("unable to set foreground process group: {s}", .{errName(e)}),
+        }
     }
-
-    _ = std.os.linux.pause();
-
-    switch (std.os.linux.errno(std.os.linux.sigaction(Sig.USR1, &old_act, null))) {
-        .SUCCESS => {},
-        else => |e| log.debug("failed to restore signal action for USR1: {s}", .{errName(e)}),
-    }
-}
+};
 
 const WaitStatus = struct {
     raw: u32,
@@ -1201,7 +1202,7 @@ const ProcessState = struct {
 
             if (sig_info.signo != @backingInt(Sig.CHLD)) {
                 @branchHint(.unpredictable);
-                if (isStandardSignal(sig_info.signo)) {
+                if (signals.isStandardSignal(sig_info.signo)) {
                     self.forwardSignal(sig_info.signo);
                 } else {
                     log.debug("ignoring non-standard signal: {d}", .{sig_info.signo});
@@ -1301,28 +1302,28 @@ test tryClose {
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
-    logInit();
+    log.init();
 
     const args = switch (Args.parse(init) catch |err| {
         @branchHint(.cold);
         log.err("unable to parse arguments: {s}", .{@errorName(err)});
         // Usage shown because of an error is a diagnostic: send it to stderr,
         // keeping stdout for the program's requested output.
-        printHelp(std.os.linux.STDERR_FILENO);
+        Args.printHelp(std.os.linux.STDERR_FILENO);
         return 1;
     }) {
         .run => |args| args,
         .help => {
-            printHelp(std.os.linux.STDOUT_FILENO);
+            Args.printHelp(std.os.linux.STDOUT_FILENO);
             return 0;
         },
         .version => {
-            printVersion();
+            Args.printVersion();
             return 0;
         },
     };
 
-    setLogLevel(args.log_level);
+    log.setLevel(args.log_level);
 
     const unblocked_sigs = [_]Sig{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP, .TTIN, .TTOU };
     var sig_conf = SigConf.init(&unblocked_sigs) catch |err| {
@@ -1353,14 +1354,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         );
     }
 
-    const child = args.spawn(&sig_conf) catch {
+    const child_pid = child.spawn(&args, &sig_conf) catch {
         @branchHint(.cold);
         log.err("failed to start child process", .{});
         return 1;
     };
 
     const child_pidfd: std.os.linux.fd_t = blk: {
-        const raw = std.os.linux.pidfd_open(@intCast(child), 0);
+        const raw = std.os.linux.pidfd_open(@intCast(child_pid), 0);
         switch (std.os.linux.errno(raw)) {
             .SUCCESS => break :blk @intCast(raw),
             else => |e| {
@@ -1392,7 +1393,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
 
     var process_state = ProcessState{
-        .child = child,
+        .child = child_pid,
         .child_pidfd = child_pidfd,
         .expected_exit = args.expected_exit,
         .rewrites = args.rewrites,
@@ -1438,24 +1439,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 }
 
 test "parseSignal accepts numbers and names, rejects realtime and junk" {
-    try std.testing.expectEqual(15, parseSignal("15") catch unreachable);
-    try std.testing.expectEqual(15, parseSignal("SIGTERM") catch unreachable);
-    try std.testing.expectEqual(15, parseSignal("TERM") catch unreachable);
-    try std.testing.expectEqual(9, parseSignal("SIGKILL") catch unreachable);
+    try std.testing.expectEqual(15, signals.parseSignal("15") catch unreachable);
+    try std.testing.expectEqual(15, signals.parseSignal("SIGTERM") catch unreachable);
+    try std.testing.expectEqual(15, signals.parseSignal("TERM") catch unreachable);
+    try std.testing.expectEqual(9, signals.parseSignal("SIGKILL") catch unreachable);
     // Realtime signals are intentionally not supported.
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("SIGRTMIN"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("SIGRTMIN+2"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("RTMAX-1"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("34"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("64"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("UNKNOWN"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("999"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("0"));
-    try std.testing.expectError(ZinitError.InvalidParams, parseSignal(""));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("SIG"));
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal("A"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("SIGRTMIN"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("SIGRTMIN+2"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("RTMAX-1"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("34"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("64"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("UNKNOWN"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("999"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("0"));
+    try std.testing.expectError(ZinitError.InvalidParams, signals.parseSignal(""));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("SIG"));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal("A"));
     const long_name = "SIG" ++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    try std.testing.expectError(ZinitError.InvalidSignal, parseSignal(long_name));
+    try std.testing.expectError(ZinitError.InvalidSignal, signals.parseSignal(long_name));
 }
 
 test "RewriteMap.parse rejects malformed, duplicate and cyclic rewrites" {
@@ -1624,10 +1625,10 @@ test "signalIsIgnored reflects the installed disposition" {
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
     defer _ = std.os.linux.sigaction(Sig.USR2, &saved, null);
 
-    try std.testing.expect(signalIsIgnored(Sig.USR2));
+    try std.testing.expect(child.signalIsIgnored(Sig.USR2));
     const rc2 = std.os.linux.sigaction(Sig.USR2, &dfl, null);
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc2));
-    try std.testing.expect(!signalIsIgnored(Sig.USR2));
+    try std.testing.expect(!child.signalIsIgnored(Sig.USR2));
 }
 
 test "Args.parse maps argv, environment and options" {
@@ -1766,9 +1767,9 @@ test "WaitStatus.exitCode maps wait statuses to exit codes" {
     try std.testing.expectEqual(@as(u8, 0), (WaitStatus{ .raw = 0x1FF }).exitCode());
 }
 
-test execExitCode {
-    try std.testing.expectEqual(@as(u8, 127), execExitCode(.NOENT));
-    try std.testing.expectEqual(@as(u8, 126), execExitCode(.ACCES));
-    try std.testing.expectEqual(@as(u8, 126), execExitCode(.NOEXEC));
-    try std.testing.expectEqual(@as(u8, 1), execExitCode(.INVAL));
+test "execExitCode maps an errno to an exit code" {
+    try std.testing.expectEqual(@as(u8, 127), child.execExitCode(.NOENT));
+    try std.testing.expectEqual(@as(u8, 126), child.execExitCode(.ACCES));
+    try std.testing.expectEqual(@as(u8, 126), child.execExitCode(.NOEXEC));
+    try std.testing.expectEqual(@as(u8, 1), child.execExitCode(.INVAL));
 }
