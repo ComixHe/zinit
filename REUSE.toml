@@ -12,6 +12,7 @@ path = [
     ".markdownlint.yaml",
     "README.md",
     "flake.lock",
+    "SECURITY.md",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "2025 - 2026 YuMing He <ComixHe1895@outlook.com>"
