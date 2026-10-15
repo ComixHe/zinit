@@ -37,6 +37,11 @@ repos:
     hooks:
       - id: markdownlint
 
+  - repo: https://github.com/fsfe/reuse-tool
+    rev: v6.2.0
+    hooks:
+      - id: reuse
+
   # `zig fmt` needs the toolchain pinned by build.zig.zon, so it runs from the
   # developer's PATH rather than a managed environment.
   - repo: local
