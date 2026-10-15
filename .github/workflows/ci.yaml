@@ -10,8 +10,13 @@ jobs:
   build:
     # https://github.com/actions/runner-images/issues/14748
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     steps:
+      # No step here needs git credentials, so keep the token out of .git/config.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install kcov
         run: |
           sudo apt update
@@ -21,25 +26,40 @@ jobs:
         run: zig fmt --check .
       - name: Build
         run: zig build
-      - name: Release build is reproducible
+      - name: Packed release is reproducible, and the SBOM checks out
         run: |
+          commit=$(git rev-parse HEAD)
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+
           # Releases are stripped, so nothing path- or cache-dependent may
-          # survive. Check both a cached rebuild and a differently-named tree.
+          # survive. Build the archive once off a warm .zig-cache and once from a
+          # fresh tree, and compare the packed bytes, which cover the binary in
+          # them. The tag-to-published comparison lives in Rebuild, which runs
+          # after a release exists.
+          rm -rf zig-out/artifacts
+          # Warm .zig-cache in this mode, so the build below is the cached one.
           zig build -Doptimize=ReleaseSmall
-          a=$(sha256sum zig-out/bin/zinit | cut -d' ' -f1)
-          rm -rf .zig-cache zig-out
-          zig build -Doptimize=ReleaseSmall
-          b=$(sha256sum zig-out/bin/zinit | cut -d' ' -f1)
-          [ "$a" = "$b" ] || { echo "not reproducible on rebuild: $a != $b"; exit 1; }
+          zig build release -Doptimize=ReleaseSmall -Dsbom=true -Dcommit="$commit"
+          cp -r zig-out/artifacts /tmp/artifacts
 
           rm -rf /tmp/repro && mkdir -p /tmp/repro
           tar -cf - --exclude=./.git --exclude=./.zig-cache --exclude=./zig-out --exclude=./kcov-output . \
             | tar -xf - -C /tmp/repro
-          ( cd /tmp/repro && zig build -Doptimize=ReleaseSmall )
-          c=$(sha256sum /tmp/repro/zig-out/bin/zinit | cut -d' ' -f1)
-          rm -rf /tmp/repro
-          [ "$a" = "$c" ] || { echo "not reproducible across paths: $a != $c"; exit 1; }
-          echo "reproducible: $a"
+          ( cd /tmp/repro && zig build release -Doptimize=ReleaseSmall -Dsbom=true -Dcommit="$commit" )
+          for f in /tmp/artifacts/*; do
+            cmp "$f" "/tmp/repro/zig-out/artifacts/$(basename "$f")"
+          done
+
+          # The document has to be valid, conformant, and name its artifact.
+          # ntia-checker validates against the SPDX spec as part of its check.
+          pipx install --quiet ntia-conformance-checker
+
+          sbom=$(ls zig-out/artifacts/*.spdx.json)
+          ntia-checker -c ntia "$sbom"
+          binary=$(tar xzOf zig-out/artifacts/*.tar.gz --wildcards '*/zinit' | sha256sum | cut -d' ' -f1)
+          grep -q "$binary" "$sbom"
+
       - name: Run test with kcov
         run: |
           kcov --version

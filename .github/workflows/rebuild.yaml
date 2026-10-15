@@ -1,0 +1,90 @@
+name: Rebuild
+
+# Independent check that a published release really is the tagged source.
+#
+# The release workflow signs the artifacts the build job produced; it never
+# rebuilds them, so on its own it cannot prove where those bytes came from. This
+# workflow starts from the tag on a fresh runner, rebuilds every archive and the
+# SBOM, and compares them byte for byte with what was published.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, riscv64-linux]
+        optimize: [ReleaseSmall, ReleaseSafe]
+    steps:
+      # No step here needs git credentials, so keep the token out of .git/config.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # zizmor: ignore[cache-poisoning] cache writes already need repo write access; v2.2.1
+      - name: Rebuild
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          zig build release \
+            -Doptimize=${{ matrix.optimize }} \
+            -Dtarget=${{ matrix.target }} \
+            -Dsbom=true -Dcommit="$(git rev-parse HEAD)"
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rebuilt-${{ matrix.optimize }}-${{ matrix.target }}
+          path: "zig-out/artifacts/*"
+          if-no-files-found: error
+
+  compare:
+    needs: rebuild
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download the published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release download "$TAG" \
+            --repo "$REPO" \
+            --dir published \
+            --pattern '*.tar.gz' \
+            --pattern '*.spdx.json' \
+            --pattern SHA256SUMS
+      - name: Collect the rebuilt assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: rebuilt
+          merge-multiple: true
+      - name: Compare
+        run: |
+          # Derive SHA256SUMS the way the release job does, so the published one
+          # gets compared like every other file.
+          ( cd rebuilt && sha256sum ./*.tar.gz ./*.spdx.json > SHA256SUMS )
+
+          failed=0
+          count=0
+          for f in published/*; do
+            name=$(basename "$f")
+            if cmp -s "$f" "rebuilt/$name"; then
+              echo "ok: $name"
+              count=$((count + 1))
+            else
+              echo "::error file=$name::$name was not reproduced from the tag"
+              failed=1
+            fi
+          done
+          [ "$failed" = 0 ] || exit 1
+          echo "reproduced $count release files"
