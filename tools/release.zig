@@ -33,12 +33,12 @@ pub fn main(init: std.process.Init) !void {
     const options = try Options.parse(init.minimal.args);
 
     try cwd.createDirPath(io, options.out_dir);
-    try assembleArchive(arena, cwd, io, options);
+    const binary_sha256 = try assembleArchive(arena, cwd, io, options);
     std.debug.print("{s}/{s}.tar.gz\n", .{ options.out_dir, options.name });
 
     if (options.sbom) |sbom| {
-        const path = try std.fmt.allocPrint(arena, "{s}/zinit-v{s}.spdx.json", .{ options.out_dir, sbom.version });
-        const document = try sbom.render(arena, init.environ_map);
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}.spdx.json", .{ options.out_dir, options.name });
+        const document = try sbom.render(arena, init.environ_map, options.name, &binary_sha256);
         try cwd.writeFile(io, .{ .sub_path = path, .data = document });
         std.debug.print("{s}\n", .{path});
     }
@@ -84,8 +84,6 @@ const Options = struct {
         return options;
     }
 
-    /// The SBOM fields are only meaningful once `--sbom` has been seen; taking a
-    /// pointer keeps the assignment in one place whatever the flag order is.
     fn sbomField(options: *Options, comptime field: []const u8) *[]const u8 {
         const sbom = &(options.sbom orelse usageAndExit());
         return &@field(sbom, field);
@@ -96,10 +94,12 @@ fn value(iter: anytype) []const u8 {
     return iter.next() orelse usageAndExit();
 }
 
-/// Writes the deterministic `.tar.gz`.
-/// A release archive is a few tens of kilobytes, so it is assembled in memory and written once.
-fn assembleArchive(arena: std.mem.Allocator, cwd: std.Io.Dir, io: std.Io, options: Options) !void {
+fn assembleArchive(arena: std.mem.Allocator, cwd: std.Io.Dir, io: std.Io, options: Options) ![64]u8 {
+    // A release archive is a few tens of kilobytes, so it is assembled in memory and written once.
     const binary = try cwd.readFileAlloc(io, options.binary, arena, .limited(1 << 26));
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(binary, &digest, .{});
     const license = try cwd.readFileAlloc(io, options.license, arena, .limited(1 << 20));
     const readme = try cwd.readFileAlloc(io, options.readme, arena, .limited(1 << 20));
 
@@ -118,6 +118,7 @@ fn assembleArchive(arena: std.mem.Allocator, cwd: std.Io.Dir, io: std.Io, option
 
     const path = try std.fmt.allocPrint(arena, "{s}/{s}.tar.gz", .{ options.out_dir, options.name });
     try cwd.writeFile(io, .{ .sub_path = path, .data = out.written() });
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 const Sbom = struct {
@@ -125,11 +126,20 @@ const Sbom = struct {
     zig_version: []const u8 = "unknown",
     commit: []const u8 = "unknown",
 
-    fn render(self: Sbom, arena: std.mem.Allocator, environ: *std.process.Environ.Map) ![]u8 {
+    fn render(
+        self: Sbom,
+        arena: std.mem.Allocator,
+        environ: *std.process.Environ.Map,
+        document_name: []const u8,
+        binary_sha256: []const u8,
+    ) ![]u8 {
         const document: Document = .{
-            .name = try std.fmt.allocPrint(arena, "zinit-{s}", .{self.version}),
+            .name = document_name,
             .documentNamespace = try std.fmt.allocPrint(arena, "https://github.com/ComixHe/zinit/spdx/{s}", .{self.commit}),
-            .creationInfo = .{ .created = try self.createdAt(arena, environ), .creators = &.{"Tool: zinit-release"} },
+            .creationInfo = .{
+                .created = try self.createdAt(arena, environ),
+                .creators = &.{ "Person: YuMing He <ComixHe1895@outlook.com>", "Tool: zinit-release" },
+            },
             .packages = &.{
                 .{
                     .SPDXID = "SPDXRef-Package-zinit",
@@ -140,6 +150,16 @@ const Sbom = struct {
                     .licenseDeclared = "MIT",
                     .copyrightText = "2025-2026 YuMing He <ComixHe1895@outlook.com>",
                     .primaryPackagePurpose = "APPLICATION",
+                    .supplier = "Person: YuMing He <ComixHe1895@outlook.com>",
+                    .checksums = &.{.{
+                        .algorithm = "SHA256",
+                        .checksumValue = binary_sha256,
+                    }},
+                    .externalRefs = &.{.{
+                        .referenceCategory = "PACKAGE-MANAGER",
+                        .referenceType = "purl",
+                        .referenceLocator = try std.fmt.allocPrint(arena, "pkg:github/ComixHe/zinit@{s}", .{self.version}),
+                    }},
                 },
                 .{
                     .SPDXID = "SPDXRef-Package-zig-standard-library",
@@ -148,6 +168,13 @@ const Sbom = struct {
                     .downloadLocation = "https://ziglang.org/download/",
                     .licenseConcluded = "MIT",
                     .licenseDeclared = "MIT",
+                    .copyrightText = "2015-2026 Zig contributors",
+                    .supplier = "Organization: Zig Software Foundation",
+                    .externalRefs = &.{.{
+                        .referenceCategory = "PACKAGE-MANAGER",
+                        .referenceType = "purl",
+                        .referenceLocator = try self.purlZig(arena),
+                    }},
                 },
             },
             .relationships = &.{
@@ -157,6 +184,14 @@ const Sbom = struct {
         };
 
         return std.json.Stringify.valueAlloc(arena, document, .{ .whitespace = .indent_2 });
+    }
+
+    fn purlZig(self: Sbom, arena: std.mem.Allocator) ![]const u8 {
+        const v = self.zig_version;
+        const plus = std.mem.indexOfScalar(u8, v, '+') orelse
+            return std.fmt.allocPrint(arena, "pkg:github/ziglang/zig@{s}", .{v});
+
+        return std.fmt.allocPrint(arena, "pkg:github/ziglang/zig@{s}%2B{s}", .{ v[0..plus], v[plus + 1 ..] });
     }
 
     /// SOURCE_DATE_EPOCH keeps the document reproducible; unset means the epoch.
@@ -207,6 +242,20 @@ const Package = struct {
     licenseDeclared: []const u8 = "MIT",
     copyrightText: ?[]const u8 = null,
     primaryPackagePurpose: ?[]const u8 = null,
+    supplier: ?[]const u8 = null,
+    checksums: ?[]const Checksum = null,
+    externalRefs: ?[]const ExternalRef = null,
+};
+
+const ExternalRef = struct {
+    referenceCategory: []const u8,
+    referenceType: []const u8,
+    referenceLocator: []const u8,
+};
+
+const Checksum = struct {
+    algorithm: []const u8,
+    checksumValue: []const u8,
 };
 
 const Relationship = struct {
