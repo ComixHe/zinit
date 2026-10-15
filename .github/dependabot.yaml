@@ -1,16 +1,25 @@
 ---
 version: 2
 updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: 'github-actions'
+    directory: '/'
     schedule:
-      interval: "weekly"
+      interval: 'weekly'
     open-pull-requests-limit: 5
     cooldown:
       default-days: 7
     groups:
       github-actions:
         patterns:
-          - "*"
+          - '*'
     commit-message:
-      prefix: "chore(deps)"
+      prefix: 'chore(deps)'
+  - package-ecosystem: 'docker'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: 'chore(deps)'

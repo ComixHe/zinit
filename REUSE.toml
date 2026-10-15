@@ -6,9 +6,12 @@ SPDX-PackageLicenseConcluded = "MIT"
 
 [[annotations]]
 path = [
+    ".dockerignore",
     ".gitignore",
     ".github/**",
+    ".markdownlint.yaml",
     "README.md",
+    "flake.lock",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "2025 - 2026 YuMing He <ComixHe1895@outlook.com>"
