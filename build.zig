@@ -7,87 +7,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const config = Config.init(b);
 
-    const exe = addZinit(b, config);
+    const config_mod = addConfig(b, config);
+    const lib = addLibrary(b, config, config_mod);
+    const app = addApp(b, config, config_mod, lib);
+    const exe = addExecutable(b, config, app);
+
     installAndRun(b, exe);
+    addTestStep(b, config, lib, app);
+    addFuzzStep(b, config, config_mod);
     addReleaseStep(b, exe, config);
-    addTestStep(b, exe, config);
 }
 
-const Config = struct {
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    manifest: Manifest,
-    size_analysis: bool,
-    coverage: bool,
-
-    fn init(b: *std.Build) Config {
-        return .{
-            .target = b.standardTargetOptions(.{ .default_target = .{ .os_tag = .linux } }),
-            .optimize = b.standardOptimizeOption(.{}),
-            .manifest = readManifest(b),
-            .size_analysis = b.option(bool, "size-analysis", "Keep symbols in release builds for bloaty analysis") orelse false,
-            .coverage = b.option(bool, "test-coverage", "Generate coverage reports") orelse false,
-        };
-    }
-
-    fn isRelease(self: Config) bool {
-        return self.optimize != .debug;
-    }
-
-    fn version(self: Config) std.SemanticVersion {
-        return std.SemanticVersion.parse(self.manifest.version) catch |err|
-            std.debug.panic("invalid version {s} in build.zig.zon: {s}", .{ self.manifest.version, @errorName(err) });
-    }
-
-    /// `0.2.0`
-    fn versionString(self: Config, b: *std.Build) []const u8 {
-        const v = self.version();
-
-        return b.fmt("{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
-    }
-
-    fn shortTarget(self: Config, b: *std.Build) []const u8 {
-        return b.fmt("{s}-{s}", .{
-            @tagName(self.target.result.cpu.arch),
-            @tagName(self.target.result.os.tag),
-        });
-    }
-
-    fn optimizeName(self: Config) []const u8 {
-        return switch (self.optimize) {
-            .Debug => "Debug",
-            .ReleaseSafe => "ReleaseSafe",
-            .ReleaseSmall => "ReleaseSmall",
-            .ReleaseFast => "ReleaseFast",
-        };
-    }
-};
-
-const Manifest = struct {
-    version: []const u8,
-    minimum_zig_version: []const u8 = "",
-};
-
-fn readManifest(b: *std.Build) Manifest {
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-
-    return std.zon.parse.fromSlice(Manifest, .{
-        .gpa = b.allocator,
-        .arena = b.allocator,
-        .source = @embedFile("build.zig.zon"),
-        .diagnostics = &diagnostics,
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        diagnostics.log("build.zig.zon");
-        std.debug.panic("unable to parse build.zig.zon: {s}", .{@errorName(err)});
-    };
-}
-
-fn addZinit(b: *std.Build, config: Config) *std.Build.Step.Compile {
+fn moduleOptions(config: Config) std.Build.Module.CreateOptions {
     const is_release = config.isRelease();
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    return .{
         .target = config.target,
         .optimize = config.optimize,
         .strip = is_release and !config.size_analysis,
@@ -95,25 +29,58 @@ fn addZinit(b: *std.Build, config: Config) *std.Build.Step.Compile {
         .single_threaded = true,
         .unwind_tables = if (is_release) .none else .sync,
         .pic = true,
-    });
+    };
+}
 
+fn addConfig(b: *std.Build, config: Config) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption(std.SemanticVersion, "version", config.version());
+    options.addOption(bool, "tracing_child", config.tracing_child);
+    options.addOption(bool, "stack_traces", config.stack_traces);
+    options.addOption(std.log.Level, "max_log_level", config.max_log_level);
+    options.addOption(std.log.Level, "default_log_level", config.default_log_level);
+
+    return options.createModule();
+}
+
+fn addLibrary(b: *std.Build, config: Config, config_mod: *std.Build.Module) *std.Build.Module {
+    var options = moduleOptions(config);
+    options.root_source_file = b.path("lib/root.zig");
+    options.imports = &.{.{ .name = "config", .module = config_mod }};
+
+    return b.createModule(options);
+}
+
+fn addApp(
+    b: *std.Build,
+    config: Config,
+    config_mod: *std.Build.Module,
+    lib: *std.Build.Module,
+) *std.Build.Module {
+    var options = moduleOptions(config);
+    options.root_source_file = b.path("app/main.zig");
+    options.imports = &.{
+        .{ .name = "config", .module = config_mod },
+        .{ .name = "zinit", .module = lib },
+    };
+
+    return b.createModule(options);
+}
+
+fn addExecutable(b: *std.Build, config: Config, app: *std.Build.Module) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "zinit",
-        .root_module = exe_mod,
+        .root_module = app,
         .version = config.version(),
     });
 
-    // Leave the ELF stack-size hint at 0. The linker's default makes
-    // `std.start` raise RLIMIT_STACK at startup, which the child would then
-    // inherit; 0 keeps the container's own limit intact and drops the
-    // `prlimit64` dependency.
+    // 0 keeps the linker from making `std.start` raise RLIMIT_STACK, which the child
+    // would inherit.
     exe.stack_size = 0;
+    exe.link_function_sections = true;
+    exe.pie = config.pie;
 
-    const options = b.addOptions();
-    options.addOption(std.SemanticVersion, "version", config.version());
-    options.addOption(bool, "tracing_child", b.option(bool, "tracing-child", "zinit will wait for SIGUSR1 to continue executing child process") orelse false);
-    options.addOption(bool, "stack_traces", b.option(bool, "stack-traces", "Include crash stack traces (segfault handler + std.debug panic). Opt-in, off by default.") orelse false);
-    exe.root_module.addOptions("config", options);
+    if (config.isRelease()) exe.lto = .thin;
 
     return exe;
 }
@@ -156,6 +123,7 @@ fn addReleaseStep(b: *std.Build, exe: *std.Build.Step.Compile, config: Config) v
     pack.addFileArg(b.path("LICENSE"));
     pack.addArg("--readme");
     pack.addFileArg(b.path("README.md"));
+
     if (sbom) {
         pack.addArgs(&.{
             "--sbom",
@@ -171,19 +139,151 @@ fn addReleaseStep(b: *std.Build, exe: *std.Build.Step.Compile, config: Config) v
     step.dependOn(&pack.step);
 }
 
-fn addTestStep(b: *std.Build, exe: *std.Build.Step.Compile, config: Config) void {
-    const unit_tests = b.addTest(.{
-        .root_module = exe.root_module,
+fn addFuzzStep(b: *std.Build, config: Config, config_mod: *std.Build.Module) void {
+    var options = moduleOptions(config);
+    options.root_source_file = b.path("lib/root.zig");
+    options.imports = &.{.{ .name = "config", .module = config_mod }};
+    // The fuzz runtime is not single-threaded: with it the rebuilt binary segfaults in its own fuzzer.
+    options.single_threaded = false;
+
+    const fuzz_tests = b.addTest(.{ .root_module = b.createModule(options) });
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+
+    b.step("fuzz", "Fuzz the pure parsers (needs --fuzz on the command line)")
+        .dependOn(&run_fuzz.step);
+}
+
+fn addTestStep(
+    b: *std.Build,
+    config: Config,
+    lib: *std.Build.Module,
+    app: *std.Build.Module,
+) void {
+    const lib_tests = b.addTest(.{
+        .root_module = lib,
         .use_llvm = config.coverage,
         .use_lld = config.coverage,
     });
 
-    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const app_tests = b.addTest(.{
+        .root_module = app,
+        .use_llvm = config.coverage,
+        .use_lld = config.coverage,
+    });
+
+    const test_step = b.step("test", "Run unit tests");
     if (config.coverage) {
-        const system_kcov = b.addSystemCommand(&.{ "kcov", "--clean", "--include-path=./src", "kcov-output" });
-        system_kcov.addArtifactArg(unit_tests);
-        run_unit_tests.step.dependOn(&system_kcov.step);
+        // kcov traces one binary at a time, so both roots are merged into one report.
+        // Test bodies are excluded so the number describes the shipped code.
+        const excludes = "--exclude-region=kcov-exclude-tests:never-matches";
+        const wiring = "--exclude-path=./lib/root.zig";
+        const lib_cov = b.addSystemCommand(&.{
+            "kcov", "--clean", "--dump-summary", excludes, wiring, "--include-path=./lib,./app", "kcov-output-lib",
+        });
+        lib_cov.addArtifactArg(lib_tests);
+
+        const app_cov = b.addSystemCommand(&.{
+            "kcov", "--clean", "--dump-summary", excludes, wiring, "--include-path=./lib,./app", "kcov-output-app",
+        });
+        app_cov.addArtifactArg(app_tests);
+
+        const merge = b.addSystemCommand(&.{
+            "kcov", "--merge", "--cobertura-only", "--dump-summary", excludes, wiring, "kcov-output", "kcov-output-lib", "kcov-output-app",
+        });
+        merge.step.dependOn(&lib_cov.step);
+        merge.step.dependOn(&app_cov.step);
+
+        test_step.dependOn(&merge.step);
+    } else {
+        const run_lib_tests = b.addRunArtifact(lib_tests);
+        const run_app_tests = b.addRunArtifact(app_tests);
+        test_step.dependOn(&run_lib_tests.step);
+        test_step.dependOn(&run_app_tests.step);
+    }
+}
+
+const Config = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    manifest: Manifest,
+    size_analysis: bool,
+    coverage: bool,
+    tracing_child: bool,
+    stack_traces: bool,
+    max_log_level: std.log.Level,
+    default_log_level: std.log.Level,
+    pie: bool,
+
+    fn init(b: *std.Build) Config {
+        return .{
+            .target = b.standardTargetOptions(.{ .default_target = .{ .os_tag = .linux } }),
+            .optimize = b.standardOptimizeOption(.{}),
+            .manifest = readManifest(b),
+            .size_analysis = b.option(bool, "size-analysis", "Keep symbols in builds") orelse false,
+            .coverage = b.option(bool, "test-coverage", "Generate coverage reports") orelse false,
+            .tracing_child = b.option(bool, "tracing-child", "zinit will wait for SIGUSR1 to continue executing child process") orelse false,
+            .stack_traces = b.option(bool, "stack-traces", "Include crash stack traces (segfault handler + std.debug panic). Opt-in, off by default.") orelse false,
+            .pie = b.option(bool, "pie", "Build a position-independent executable, for ASLR on the binary itself. Off by default: the init is one short-lived process inside a container's own PID namespace, where the smaller non-PIE build is worth more than ASLR on the image's own binary.") orelse false,
+            .max_log_level = parseLogLevelOption("log-level", b.option([]const u8, "log-level", "Highest log level this build can print: error, warn, info (the default) or debug. Levels above it are compiled out, and --log-level cannot ask for one.") orelse "info"),
+            .default_log_level = parseLogLevelOption("default-log-level", b.option([]const u8, "default-log-level", "Level printed when neither --log-level nor ZINIT_LOG_LEVEL says anything: error, warn (the default), info or debug. Clamped to the compile-time ceiling.") orelse "warn"),
+        };
     }
 
-    b.step("test", "Run unit tests").dependOn(&run_unit_tests.step);
+    fn isRelease(self: Config) bool {
+        return self.optimize != .debug;
+    }
+
+    fn version(self: Config) std.SemanticVersion {
+        return std.SemanticVersion.parse(self.manifest.version) catch |err|
+            std.debug.panic("invalid version {s} in build.zig.zon: {s}", .{ self.manifest.version, @errorName(err) });
+    }
+
+    fn versionString(self: Config, b: *std.Build) []const u8 {
+        const v = self.version();
+        return b.fmt("{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
+    }
+
+    fn shortTarget(self: Config, b: *std.Build) []const u8 {
+        return b.fmt("{s}-{s}", .{
+            @tagName(self.target.result.cpu.arch),
+            @tagName(self.target.result.os.tag),
+        });
+    }
+
+    fn optimizeName(self: Config) []const u8 {
+        return switch (self.optimize) {
+            .Debug => "Debug",
+            .ReleaseSafe => "ReleaseSafe",
+            .ReleaseSmall => "ReleaseSmall",
+            .ReleaseFast => "ReleaseFast",
+        };
+    }
+};
+
+const Manifest = struct {
+    version: []const u8,
+    minimum_zig_version: []const u8 = "",
+};
+
+fn parseLogLevelOption(option: []const u8, name: []const u8) std.log.Level {
+    if (std.mem.eql(u8, name, "error")) return .err;
+    if (std.mem.eql(u8, name, "warn")) return .warn;
+    if (std.mem.eql(u8, name, "info")) return .info;
+    if (std.mem.eql(u8, name, "debug")) return .debug;
+    std.debug.panic("unknown -D{s} {s}: expected error, warn, info or debug", .{ option, name });
+}
+
+fn readManifest(b: *std.Build) Manifest {
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+
+    return std.zon.parse.fromSlice(Manifest, .{
+        .gpa = b.allocator,
+        .arena = b.allocator,
+        .source = @embedFile("build.zig.zon"),
+        .diagnostics = &diagnostics,
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        diagnostics.log("build.zig.zon");
+        std.debug.panic("unable to parse build.zig.zon: {s}", .{@errorName(err)});
+    };
 }
