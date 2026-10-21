@@ -5,11 +5,9 @@
 //! Assembles one release artifact, plus the SPDX SBOM when asked for.
 //! Invoked by `zig build release`.
 //!
-//! The archive goes through std only — `tar.Writer` (mtime 0, uid/gid 0, no
-//! uname/gname) over `compress.flate`, whose gzip header is a constant
-//! `1f8b 08 00 00000000 00 03` (no mtime) — so the bytes depend on the inputs
-//! and the Zig version alone, never on the host's tar or gzip. That is what
-//! makes the whole payload, not just the binary inside it, reproducible.
+//! The archive is written by `std` alone: `tar.Writer` with mtime/uid/gid 0 and no
+//! uname/gname, over `compress.flate`, whose gzip header carries no timestamp. So the
+//! bytes depend on the inputs and the Zig version, not on the host's tar or gzip.
 //!
 //! Usage:
 //!   release-tool --binary <path> --name <stem> [--out-dir <dir>]

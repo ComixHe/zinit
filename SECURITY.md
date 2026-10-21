@@ -25,7 +25,8 @@ handling, reaping, the shutdown path), the build tooling (`build.zig`,
 Out of scope: the container runtime, the kernel, and whatever workload you put
 behind zinit — a workload that ignores `SIGTERM` is not a zinit bug. zinit
 trusts the arguments and environment it is handed, the way a runtime trusts its
-own configuration.
+own configuration, so a name from them that lands in a log line is echoed
+verbatim: log injection through an argument is out of scope with it.
 
 ## Vulnerability management and disclosure
 
