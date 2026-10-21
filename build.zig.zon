@@ -4,7 +4,7 @@
 
 .{
     .name = .zinit,
-    .version = "0.2.1",
+    .version = "0.3.0",
     .fingerprint = 0x9270341b70f1e3c6,
     .minimum_zig_version = "0.18.0-dev.367+187d0bf9e",
     .paths = .{

@@ -5,7 +5,7 @@
 # The artifact image: a scratch image whose only content is the static zinit
 # binary, meant to be consumed with
 #
-#   COPY --from=ghcr.io/comixhe/zinit:v0.2.1 /zinit /sbin/zinit
+#   COPY --from=ghcr.io/comixhe/zinit:v0.3.0 /zinit /sbin/zinit
 #
 # so other images get an init without vendoring the tarball themselves, and
 # without needing an emulator for their target architecture.

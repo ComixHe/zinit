@@ -123,7 +123,7 @@ zinit in.
 ### Baked into the image
 
 ```dockerfile
-COPY --from=ghcr.io/comixhe/zinit:v0.2.1 /zinit /sbin/zinit
+COPY --from=ghcr.io/comixhe/zinit:v0.3.0 /zinit /sbin/zinit
 ENTRYPOINT ["/sbin/zinit", "--"]
 CMD ["/bin/sh"]
 ```
@@ -160,7 +160,7 @@ image**, one line:
 
 ```dockerfile
 FROM nginx:1.29
-COPY --from=ghcr.io/comixhe/zinit:v0.2.1 /zinit /sbin/zinit
+COPY --from=ghcr.io/comixhe/zinit:v0.3.0 /zinit /sbin/zinit
 ENTRYPOINT ["/sbin/zinit", "--", "/docker-entrypoint.sh"]
 ```
 
@@ -178,7 +178,7 @@ spec:
       volumeMounts: [{ name: zinit, mountPath: /opt/zinit, readOnly: true }]
   volumes:
     - name: zinit
-      image: { reference: ghcr.io/comixhe/zinit:v0.2.1 }
+      image: { reference: ghcr.io/comixhe/zinit:v0.3.0 }
 ```
 
 - `-g` (or `-n`) when the workload is wrapped in a shell.

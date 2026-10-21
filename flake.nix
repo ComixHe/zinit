@@ -20,7 +20,7 @@
   outputs =
     { self, nixpkgs }:
     let
-      release = "v0.2.1";
+      release = "v0.3.0";
 
       manifest = builtins.replaceStrings [ "\n" ] [ " " ] (builtins.readFile ./build.zig.zon);
       version =
@@ -38,12 +38,12 @@
 
       sources = {
         x86_64-linux = {
-          small = "sha256-gr9DGkwOC+X8fpDDWoJiM6D1tLglf35B4MuuJ34/abs=";
-          safe = "sha256-iY2p3LkoAC45pfewv8l8+olmuq6N3jaHuF2VFZPoAE0=";
+          small = "sha256-fbB+FHUP9dHUHxGJdQPyrGUfSWu5x7xnQ9S1PX+KxBc=";
+          safe = "sha256-ctMAcfZbe7CrbHVkRQ4cU/aOvgLbgaUfPpBWgjcjKBE=";
         };
         aarch64-linux = {
-          small = "sha256-5X0AKMxFjmA8urRH+61xceJc7GOMe9FTDfNUQMbxe4s=";
-          safe = "sha256-tBWwn8FAqx8N3a0vLNsjo992OQc3+ugXCkJ/W8m52Tk=";
+          small = "sha256-H/ODdRq/TYhxBJG/UmMNlUDHZIZo6xYsxSck1BcjiXE=";
+          safe = "sha256-PlQsevd9WHUv22M9gdPS9+oOXooI4FGSrPcVv4egnM8=";
         };
       };
 
