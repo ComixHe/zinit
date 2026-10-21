@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     installAndRun(b, exe);
     addTestStep(b, config, lib, app);
     addFuzzStep(b, config, config_mod);
+    addSmokeStep(b, exe);
     addReleaseStep(b, exe, config);
 }
 
@@ -93,6 +94,24 @@ fn installAndRun(b: *std.Build, exe: *std.Build.Step.Compile) void {
     run_cmd.addPassthruArgs();
 
     b.step("run", "Run the app").dependOn(&run_cmd.step);
+}
+
+fn addSmokeStep(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const step = b.step("smoke", "Run the built binary end to end");
+
+    const smoke = b.addExecutable(.{
+        .name = "smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    const run = b.addRunArtifact(smoke);
+    run.addArg("--zinit");
+    run.addFileArg(exe.getEmittedBin());
+    step.dependOn(&run.step);
 }
 
 fn addReleaseStep(b: *std.Build, exe: *std.Build.Step.Compile, config: Config) void {
