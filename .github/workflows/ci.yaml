@@ -6,37 +6,71 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build:
+  test:
     # https://github.com/actions/runner-images/issues/14748
     runs-on: ubuntu-26.04
-    permissions:
-      contents: read
+    env:
+      # Three arguments, expanded unquoted below: one string would be read as the value of
+      # the first option ("expected -Dtracing-child to be a boolean; received: true -D...").
+      ZIG_FLAGS: -Dtracing-child=true -Dlog-level=debug -Ddefault-log-level=debug
     steps:
-      # No step here needs git credentials, so keep the token out of .git/config.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Format
+        run: zig fmt --check .
       - name: Install kcov
         run: |
-          sudo apt update
-          sudo apt install kcov -y
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-      - name: Run zig fmt
-        run: zig fmt --check .
+          sudo apt-get update
+          sudo apt-get install -y kcov
       - name: Build
-        run: zig build
+        run: |
+          # shellcheck disable=SC2086
+          zig build $ZIG_FLAGS --summary all
+      - name: Unit tests
+        run: |
+          kcov --version
+          # shellcheck disable=SC2086
+          zig build test $ZIG_FLAGS -Dtest-coverage=true --summary all
+      - name: Smoke
+        run: |
+          # shellcheck disable=SC2086
+          zig build smoke $ZIG_FLAGS --summary all
+      - name: Upload coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          directory: ./kcov-output
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          fail_ci_if_error: true
+
+  # The artifact: the same bytes from a cold tree, and an SBOM that describes them.
+  release:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       - name: Packed release is reproducible, and the SBOM checks out
         run: |
           commit=$(git rev-parse HEAD)
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           export SOURCE_DATE_EPOCH
 
-          # Releases are stripped, so nothing path- or cache-dependent may
-          # survive. Build the archive once off a warm .zig-cache and once from a
-          # fresh tree, and compare the packed bytes, which cover the binary in
-          # them. The tag-to-published comparison lives in Rebuild, which runs
-          # after a release exists.
+          # Releases are stripped, so nothing path- or cache-dependent may survive:
+          # build once off a warm .zig-cache and once from a fresh tree, then compare
+          # the packed bytes. The tag-to-published comparison lives in Rebuild.
           rm -rf zig-out/artifacts
           # Warm .zig-cache in this mode, so the build below is the cached one.
           zig build -Doptimize=ReleaseSmall
@@ -59,15 +93,3 @@ jobs:
           ntia-checker -c ntia "$sbom"
           binary=$(tar xzOf zig-out/artifacts/*.tar.gz --wildcards '*/zinit' | sha256sum | cut -d' ' -f1)
           grep -q "$binary" "$sbom"
-
-      - name: Run test with kcov
-        run: |
-          kcov --version
-          zig build test -Dtest-coverage=true --summary all
-      - name: Upload coverage
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          directory: ./kcov-output
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
-          fail_ci_if_error: true
