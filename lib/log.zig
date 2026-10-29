@@ -6,44 +6,45 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-
+const tty = @import("tty.zig");
 const fmt = @import("fmt.zig");
 const io = @import("io.zig");
 const wait = @import("wait.zig");
 const WaitStatus = wait.WaitStatus;
 const config = @import("config");
 
-/// Where lines go before `init` chooses a sink. A test starts silent (a descriptor
-/// that is not one) and passes its own pipe to `init` when it wants to read them.
-pub const default_sink: std.os.linux.fd_t = if (builtin.is_test) -1 else std.os.linux.STDERR_FILENO;
-
 /// The level to print at when nothing chose one at runtime: the build's own default,
 /// clamped to its ceiling so a quiet build never defaults to a level it cannot print.
-pub fn defaultLevel() std.log.Level {
-    return @fromBackingInt(@intCast(@min(@backingInt(config.default_log_level), @backingInt(config.max_log_level))));
-}
+pub const default_level: std.log.Level = @fromBackingInt(@min(@backingInt(config.default_log_level), @backingInt(config.max_log_level)));
 
 /// The program's only mutable global: threading a sink through every call would cost more.
 const State = struct {
-    sink: std.os.linux.fd_t = default_sink,
-    level: std.log.Level = if (builtin.is_test) .warn else defaultLevel(),
+    sink: std.os.linux.fd_t = -1,
+    level: std.log.Level = if (builtin.is_test) .warn else default_level,
     color: bool = false,
 };
 
 var state: State = .{};
 
-pub fn init(sink_fd: std.os.linux.fd_t) void {
-    var termios: std.os.linux.termios = undefined;
-    const rc = std.os.linux.tcgetattr(sink_fd, &termios);
-    state.color = std.os.linux.errno(rc) == .SUCCESS;
+pub fn init(sink_fd: std.os.linux.fd_t) !void {
+    if (sink_fd < 0) {
+        @branchHint(.unlikely);
+        return error.InvalidSink;
+    }
+
     state.sink = sink_fd;
+    state.color = tty.isTty(state.sink);
 }
 
-pub fn setLevel(level: std.log.Level) void {
+pub fn deinit() void {
+    state.sink = -1;
+    state.color = false;
+}
+
+pub fn setRuntimeLevel(level: std.log.Level) void {
     state.level = level;
 }
 
-/// Ahead of the formatting: a line that is going to be dropped must not be built first.
 fn dropped(level: std.log.Level) bool {
     return @backingInt(level) > @backingInt(state.level);
 }
@@ -53,8 +54,6 @@ fn aboveCeiling(comptime level: std.log.Level) bool {
 }
 
 fn emit(level: std.log.Level, msg: []const u8) void {
-    if (dropped(level)) return;
-
     const prefix: []const u8 = if (state.color) switch (level) {
         .err => "\x1b[31m[zinit] ERROR:\x1b[0m ",
         .warn => "\x1b[33m[zinit] WARN:\x1b[0m ",
@@ -87,6 +86,7 @@ fn print(comptime level: std.log.Level, comptime format: []const u8, args: anyty
 pub fn err(comptime format: []const u8, args: anytype) void {
     print(.err, format, args);
 }
+
 pub fn warn(comptime format: []const u8, args: anytype) void {
     print(.warn, format, args);
 }
@@ -94,10 +94,9 @@ pub fn warn(comptime format: []const u8, args: anytype) void {
 pub fn debug(comptime format: []const u8, args: anytype) void {
     print(.debug, format, args);
 }
-/// Which process the exit belongs to: the main child decides zinit's own code.
+
 pub const Role = enum { main, orphaned };
 
-/// The main child's exit is why the container stops; a clean orphan exit is routine.
 fn exitLevel(status: WaitStatus, role: Role) std.log.Level {
     if (role == .main) return .info;
 
@@ -108,30 +107,38 @@ fn exitLevel(status: WaitStatus, role: Role) std.log.Level {
 }
 
 pub fn processExited(pid: std.os.linux.pid_t, status: WaitStatus, role: Role) void {
-    // The level test sits ahead of the formatting: this is the reap path's hot line.
     if (comptime aboveCeiling(.info)) return;
 
     const level = exitLevel(status, role);
     if (dropped(level)) return;
 
-    const pid_number: u32 = @intCast(pid);
-    var buf: [128]u8 = undefined;
     const what: []const u8 = switch (role) {
         .main => "child process",
         .orphaned => "orphaned process",
     };
 
-    const code = status.exitCode();
-    const signal_number = status.signalNumber();
-    const msg = switch (status.class()) {
-        .exited => fmt.bufPrint(&buf, "{s} {d} exited with code {d}.", .{ what, pid_number, code }),
-        .signaled => fmt.bufPrint(&buf, "{s} {d} exited with signal {d}.", .{
-            what, pid_number, signal_number,
-        }),
-        .unknown => fmt.bufPrint(&buf, "{s} {d} exited with unknown status", .{ what, pid_number }),
-    };
+    var buf: [128]u8 = undefined;
+    var at: usize = 0;
+    at = fmt.appendBytes(&buf, at, what);
+    at = fmt.appendBytes(&buf, at, " ");
+    at = fmt.appendInt(&buf, at, @intCast(pid), 10);
+    at = fmt.appendBytes(&buf, at, " exited with ");
 
-    emit(level, msg);
+    switch (status.class()) {
+        .exited => {
+            at = fmt.appendBytes(&buf, at, "code ");
+            at = fmt.appendInt(&buf, at, status.exitCode(), 10);
+            at = fmt.appendBytes(&buf, at, ".");
+        },
+        .signaled => {
+            at = fmt.appendBytes(&buf, at, "signal ");
+            at = fmt.appendInt(&buf, at, status.signalNumber(), 10);
+            at = fmt.appendBytes(&buf, at, ".");
+        },
+        .unknown => at = fmt.appendBytes(&buf, at, "unknown status"),
+    }
+
+    emit(level, buf[0..at]);
 }
 
 // kcov-exclude-tests (everything below is test-only).
@@ -142,63 +149,105 @@ const Sink = struct {
         var sink: Sink = .{};
         try std.testing.expectEqual(
             std.os.linux.E.SUCCESS,
-            std.os.linux.errno(std.os.linux.pipe2(&sink.pipe, .{ .NONBLOCK = true })),
+            io.syscallErrno(std.os.linux.pipe2(&sink.pipe, .{ .NONBLOCK = true })),
         );
-        init(sink.pipe[1]);
+
+        try init(sink.pipe[1]);
         return sink;
     }
 
     fn close(self: Sink) void {
-        init(default_sink);
-        io.tryClose(self.pipe[0]);
-        io.tryClose(self.pipe[1]);
+        deinit();
+
+        io.closeQuietly(self.pipe[0]);
+        io.closeQuietly(self.pipe[1]);
     }
 
-    fn read(self: Sink, buf: []u8) []u8 {
-        return buf[0..(std.posix.read(self.pipe[0], buf) catch 0)];
+    fn read(self: Sink, allocator: std.mem.Allocator) ![]u8 {
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(allocator);
+
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const size = std.posix.read(self.pipe[0], &chunk) catch |read_error| switch (read_error) {
+                error.WouldBlock => break, // the non-blocking pipe is drained
+                else => |other| return other,
+            };
+            if (size == 0) break;
+
+            try text.appendSlice(allocator, chunk[0..size]);
+        }
+
+        return text.toOwnedSlice(allocator);
     }
 };
 
 test "processExited words every class of exit" {
-    if (comptime @backingInt(config.max_log_level) < @backingInt(std.log.Level.info)) return;
+    if (comptime @backingInt(config.max_log_level) < @backingInt(std.log.Level.info))
+        return error.SkipZigTest; // this build compiles the level out
 
     const sink = try Sink.open();
     defer sink.close();
-    setLevel(.info);
-    defer setLevel(.warn);
 
-    processExited(42, .{ .raw = @as(u32, 42) << 8 }, .main);
-    processExited(43, .{ .raw = 9 }, .orphaned);
-    processExited(44, .{ .raw = 0x1FF }, .orphaned);
+    setRuntimeLevel(.info);
+    defer setRuntimeLevel(.warn);
 
-    var buf: [256]u8 = undefined;
-    const text = sink.read(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "child process 42 exited with code 42.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "orphaned process 43 exited with signal 9.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "orphaned process 44 exited with unknown status") != null);
+    const cases = [_]struct {
+        pid: std.os.linux.pid_t,
+        status: WaitStatus,
+        role: Role,
+        tokens: []const []const u8,
+    }{
+        .{ .pid = 42, .status = .{ .raw = @as(u32, 7) << 8 }, .role = .main, .tokens = &.{ "child", "42", "code 7" } },
+        .{ .pid = 43, .status = .{ .raw = 9 }, .role = .orphaned, .tokens = &.{ "orphaned", "43", "signal 9" } },
+        .{ .pid = 44, .status = .{ .raw = 0x1ff }, .role = .orphaned, .tokens = &.{ "orphaned", "44", "unknown" } },
+    };
+
+    const allocator = std.testing.allocator;
+
+    for (cases) |case| {
+        processExited(case.pid, case.status, case.role);
+        const text = try sink.read(allocator);
+        defer allocator.free(text);
+
+        try std.testing.expect(std.mem.find(u8, text, "INFO:") != null);
+        for (case.tokens) |token| try std.testing.expect(std.mem.find(u8, text, token) != null);
+    }
 }
 
 test "a clean orphan exit is routine, not a line at info" {
-    if (comptime @backingInt(config.max_log_level) < @backingInt(std.log.Level.info)) return;
+    if (comptime @backingInt(config.max_log_level) < @backingInt(std.log.Level.info))
+        return error.SkipZigTest; // this build compiles the level out
 
     const sink = try Sink.open();
     defer sink.close();
-    setLevel(.info);
-    defer setLevel(.warn);
 
-    var buf: [256]u8 = undefined;
+    setRuntimeLevel(.info);
+    defer setRuntimeLevel(.warn);
+
+    const allocator = std.testing.allocator;
 
     // A helper that did its job and left: nothing worth a line.
     processExited(50, .{ .raw = 0 }, .orphaned);
-    try std.testing.expectEqual(@as(usize, 0), sink.read(&buf).len);
+    const nothing = try sink.read(allocator);
+    defer allocator.free(nothing);
+    try std.testing.expectEqual(@as(usize, 0), nothing.len);
 
     // The same exit with a code is the record that something happened to it.
     processExited(51, .{ .raw = @as(u32, 7) << 8 }, .orphaned);
-    try std.testing.expect(std.mem.indexOf(u8, sink.read(&buf), "orphaned process 51 exited with code 7.") != null);
+    const nonzero = try sink.read(allocator);
+    defer allocator.free(nonzero);
+    for ([_][]const u8{ "INFO:", "orphaned", "51", "code 7" }) |token|
+        try std.testing.expect(std.mem.find(u8, nonzero, token) != null);
 
     if (comptime @backingInt(config.max_log_level) >= @backingInt(std.log.Level.debug)) {
-        setLevel(.debug);
+        setRuntimeLevel(.debug);
         processExited(52, .{ .raw = 0 }, .orphaned);
-        try std.testing.expect(std.mem.indexOf(u8, sink.read(&buf), "orphaned process 52 exited with code 0.") != null);
+
+        const clean = try sink.read(allocator);
+        defer allocator.free(clean);
+
+        for ([_][]const u8{ "DEBUG:", "orphaned", "52", "code 0" }) |token|
+            try std.testing.expect(std.mem.find(u8, clean, token) != null);
     }
 }

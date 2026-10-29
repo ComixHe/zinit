@@ -8,7 +8,9 @@ const std = @import("std");
 
 /// Byte search without `std.mem`'s vectorized `findScalarPos`: every needle here is
 /// one byte in a short string, not worth the SIMD machinery in binary size.
-pub fn indexOfByte(text: []const u8, byte: u8) ?usize {
+/// Inlined because callers search for a literal, which turns the loop into a
+/// constant-length scan at each call site.
+pub inline fn indexOfByte(text: []const u8, byte: u8) ?usize {
     for (text, 0..) |b, i| {
         if (b == byte) return i;
     }
@@ -17,14 +19,21 @@ pub fn indexOfByte(text: []const u8, byte: u8) ?usize {
 }
 
 pub fn parseDecimal(comptime T: type, text: []const u8) error{ InvalidCharacter, Overflow }!T {
+    const info = @typeInfo(T);
+    if (info != .int or info.int.signedness != .unsigned) {
+        @compileError("parseDecimal supports unsigned integers only");
+    }
+
     if (text.len == 0) return error.InvalidCharacter;
 
-    const max: u64 = std.math.maxInt(T);
-    var value: u64 = 0;
+    const Wide = @Int(.unsigned, @max(info.int.bits, 8));
+    const max: Wide = std.math.maxInt(T);
+    var value: Wide = 0;
 
     for (text) |byte| {
         if (byte < '0' or byte > '9') return error.InvalidCharacter;
-        const digit: u64 = byte - '0';
+        const digit: Wide = byte - '0';
+        if (digit > max) return error.Overflow;
         if (value > (max - digit) / 10) return error.Overflow;
         value = value * 10 + digit;
     }
@@ -32,8 +41,9 @@ pub fn parseDecimal(comptime T: type, text: []const u8) error{ InvalidCharacter,
     return @intCast(value);
 }
 
-/// Inline because most call sites compare against a literal, which folds the length check
-/// and the compares away. `std.mem.eql` is a vectorized function several times this size.
+/// Without std.mem's vectorized machinery for binary size.
+/// The right-hand sides are literals, so the length check
+/// and the element loop fold into one fixed-size comparison.
 pub inline fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -55,8 +65,14 @@ test "parseDecimal agrees with std on arbitrary bytes, and never panics" {
             } else bytes.len > 0;
 
             if (!digits) {
-                try std.testing.expectError(error.InvalidCharacter, parseDecimal(u64, bytes));
-                return;
+                // A non-digit may follow an already-overflowing prefix. Both
+                // InvalidCharacter and Overflow are valid rejection orders here.
+                _ = parseDecimal(u64, bytes) catch |err| {
+                    try std.testing.expect(err == error.InvalidCharacter or err == error.Overflow);
+                    return;
+                };
+
+                return error.TestUnexpectedResult;
             }
 
             const expected = std.fmt.parseInt(u64, bytes, 10) catch |err| switch (err) {
@@ -71,7 +87,27 @@ test "parseDecimal agrees with std on arbitrary bytes, and never panics" {
         }
     };
 
-    return std.testing.fuzz(Context{}, Context.testOne, .{});
+    return std.testing.fuzz(Context{}, Context.testOne, .{
+        // `Smith.in` starts with a four-byte little-endian slice length.
+        .corpus = &.{"\x15\x00\x00\x00" ++ "18446744073709551616x"},
+    });
+}
+
+test "parseDecimal covers the width it advertises, including u1 and u128" {
+    try std.testing.expectEqual(@as(u1, 1), try parseDecimal(u1, "1"));
+    try std.testing.expectEqual(@as(u1, 0), try parseDecimal(u1, "0"));
+    try std.testing.expectError(error.Overflow, parseDecimal(u1, "2"));
+
+    // The accumulator is the target type, not a fixed u64.
+    try std.testing.expectEqual(
+        std.math.maxInt(u128),
+        try parseDecimal(u128, "340282366920938463463374607431768211455"),
+    );
+
+    try std.testing.expectError(
+        error.Overflow,
+        parseDecimal(u128, "340282366920938463463374607431768211456"),
+    );
 }
 
 test "parseDecimal rejects an overflow before the accumulator wraps" {

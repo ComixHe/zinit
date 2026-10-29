@@ -3,23 +3,19 @@
 // SPDX-License-Identifier: MIT
 
 //! A tiny, allocation-free, libc-less init for Linux containers: signal forwarding and
-//! orphan reaping. Raw `std.os.linux` syscalls, a comptime formatter and a small logger
-//! instead of `std.posix`/`std.fmt`/`std.log`, all in service of binary size.
+//! orphan reaping.
 
 const std = @import("std");
 const builtin = @import("builtin");
-
 const lib = @import("zinit");
 
-const stack_traces = @import("config").stack_traces;
-
-const io = lib.io;
 const log = lib.log;
-const tryClose = io.tryClose;
 const Sig = lib.signal.Sig;
 const Args = lib.args.Args;
-const child = lib.child;
 const supervisor = lib.supervisor;
+
+const config = @import("config");
+const stack_traces = config.stack_traces;
 
 pub const std_options: std.Options = .{
     .signal_stack_size = null,
@@ -40,14 +36,11 @@ pub const panic = if (stack_traces)
 else
     minimalPanic;
 
-fn minimalPanic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+fn minimalPanic(msg: []const u8, _: ?*std.lang.StackTrace, _: ?usize) noreturn {
+    @branchHint(.cold);
     const prefix = "zinit panic: ";
-    const stderr = std.os.linux.STDERR_FILENO;
-
-    io.writeAll(stderr, prefix);
-    io.writeAll(stderr, msg);
-    io.writeAll(stderr, "\n");
-
+    const iov = [_]std.posix.iovec_const{ .{ .base = prefix, .len = prefix.len }, .{ .base = msg.ptr, .len = msg.len }, .{ .base = "\n", .len = 1 } };
+    _ = std.os.linux.writev(std.os.linux.STDERR_FILENO, &iov, 3);
     std.os.linux.exit(1);
 }
 
@@ -56,61 +49,53 @@ const ParsedBehavior = union(enum) {
     exit: u8,
 };
 
-fn parseArgs(init: std.process.Init.Minimal, out: std.os.linux.fd_t, err: std.os.linux.fd_t) ParsedBehavior {
-    const action = Args.parse(init) catch |e| {
-        @branchHint(.cold);
-        if (e == lib.errors.ZinitError.MissingCommand) Args.printHelp(err);
-        return .{ .exit = 1 };
-    };
+fn run(args: Args, ctx: lib.io.Context) u8 {
+    log.setRuntimeLevel(args.log_level);
 
-    return switch (action) {
-        .run => |args| .{ .run = args },
-        .help => blk: {
-            Args.printHelp(out);
-            break :blk .{ .exit = 0 };
-        },
-        .version => blk: {
-            Args.printVersion(out);
-            break :blk .{ .exit = 0 };
-        },
-    };
-}
-
-pub fn main(init: std.process.Init.Minimal) u8 {
-    log.init(std.os.linux.STDERR_FILENO);
-    const args = switch (parseArgs(init, std.os.linux.STDOUT_FILENO, std.os.linux.STDERR_FILENO)) {
-        .run => |args| args,
-        .exit => |code| return code,
-    };
-
-    log.setLevel(args.log_level);
-
-    const unblocked_sigs = [_]Sig{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP, .TTIN, .TTOU };
-    const signal_config = lib.signalfd.Config.init(&unblocked_sigs) catch {
-        @branchHint(.cold);
+    const unblocked_sigs = [_]Sig{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP };
+    const signal_config = lib.signalfd.Config.install(&unblocked_sigs) catch {
+        @branchHint(.unlikely);
         return 1;
     };
 
     supervisor.setupSubreaper(args.subreaper) catch {
-        @branchHint(.cold);
+        @branchHint(.unlikely);
         return 1;
     };
 
-    const spec: child.SpawnSpec = .{
+    // A fresh PTY is not our controlling terminal yet, but the new session can
+    // acquire it. Prefer our controlling terminal when one is available.
+    var tty_fd: ?std.os.linux.fd_t = null;
+    for ([_]std.os.linux.fd_t{ ctx.in, ctx.out, ctx.err }) |fd| {
+        if (lib.tty.isControlTerminal(fd)) {
+            tty_fd = fd;
+            break;
+        }
+
+        if (args.new_session and tty_fd == null and lib.tty.isTty(fd))
+            tty_fd = fd;
+    }
+
+    const spec: supervisor.SpawnSpec = .{
         .argv = args.argv,
         .envs = args.envs,
         .new_session = args.new_session,
-        .is_terminal = args.is_terminal,
+        .ctty = tty_fd,
         .pdeath_signal = args.pdeath_signal,
         .tracing_child = args.tracing_child,
     };
 
-    // Before the fork: the kernel queues one HUP and one CONT for zinit itself, which
-    // the workload never caused and must not be handed.
-    const detached = child.detachFromTerminal(spec);
+    // Before the fork: the kernel queues one HUP and one CONT for zinit itself,
+    // which the workload never caused and must not be handed. Only a new session
+    // transfers the terminal, and only if there is one to let go of.
+    const detached = blk: {
+        if (!args.new_session) break :blk false;
+        const fd = tty_fd orelse break :blk false;
+        break :blk lib.tty.isControlTerminal(fd) and lib.tty.detachFromControlTerminal(fd);
+    };
 
-    const spawned = child.spawn(spec, &signal_config) catch {
-        @branchHint(.cold);
+    var spawned = supervisor.spawn(spec, &signal_config) catch {
+        @branchHint(.unlikely);
         return 1;
     };
 
@@ -120,74 +105,125 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .forward_group = args.forward_group,
         .shutdown_timeout_ns = args.shutdown_timeout_ns,
         .ignore_initial_hup_cont = detached,
+        .ctty = tty_fd,
     };
 
-    return supervisor.supervise(policy, &signal_config, spawned);
+    return switch (supervisor.supervise(policy, &signal_config, &spawned)) {
+        .exited => |code| code,
+        .failed => 1,
+    };
+}
+
+fn dispatch(init: std.process.Init.Minimal, ctx: lib.io.Context) ParsedBehavior {
+    const action = Args.parse(init) catch |e| {
+        @branchHint(.unlikely);
+        if (e == lib.errors.ZinitError.MissingCommand) Args.printHelp(ctx.err);
+        return .{ .exit = 1 };
+    };
+
+    return switch (action) {
+        .run => |args| .{ .run = args },
+        .help => blk: {
+            Args.printHelp(ctx.out);
+            break :blk .{ .exit = 0 };
+        },
+        .version => blk: {
+            Args.printVersion(ctx.out);
+            break :blk .{ .exit = 0 };
+        },
+    };
+}
+
+pub fn main(init: std.process.Init.Minimal) u8 {
+    const ctx: lib.io.Context = .{
+        .in = std.os.linux.STDIN_FILENO,
+        .out = std.os.linux.STDOUT_FILENO,
+        .err = std.os.linux.STDERR_FILENO,
+    };
+
+    log.init(ctx.err) catch unreachable;
+
+    return switch (dispatch(init, ctx)) {
+        .run => |args| run(args, ctx),
+        .exit => |code| code,
+    };
 }
 
 // kcov-exclude-tests (everything below is test-only).
-test "dispatch routes help/version to out and a usage error to err" {
-    var out_pipe: [2]std.os.linux.fd_t = undefined;
-    var err_pipe: [2]std.os.linux.fd_t = undefined;
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.pipe2(&out_pipe, .{ .NONBLOCK = true })));
-    defer tryClose(out_pipe[0]);
-    defer tryClose(out_pipe[1]);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.pipe2(&err_pipe, .{ .NONBLOCK = true })));
-    defer tryClose(err_pipe[0]);
-    defer tryClose(err_pipe[1]);
-    const out = out_pipe[1];
-    const err = err_pipe[1];
+test "dispatch selects the action and routes help, version and usage output" {
+    const test_io = std.testing.io;
 
-    var buf: [16 * 1024]u8 = undefined;
+    const cases = [_]struct {
+        name: []const u8,
+        argv: [:null]const ?[*:0]const u8,
+        exit: ?u8,
+        stdout: bool = false,
+        stderr: bool = false,
+        version: bool = false,
+    }{
+        .{ .name = "usage", .argv = &.{"zinit"}, .exit = 1, .stderr = true },
+        .{ .name = "help", .argv = &.{ "zinit", "--help" }, .exit = 0, .stdout = true },
+        .{ .name = "version", .argv = &.{ "zinit", "-V" }, .exit = 0, .stdout = true, .version = true },
+        .{ .name = "run", .argv = &.{ "zinit", "--", "true" }, .exit = null },
+        .{ .name = "invalid option", .argv = &.{ "zinit", "--log-level=debug", "--", "true" }, .exit = 1 },
+    };
 
-    const env = [_:null]?[*:0]const u8{};
-    const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
-    const argv_help = [_][*:0]const u8{ "zinit", "--help" };
-    const argv_version = [_][*:0]const u8{ "zinit", "-V" };
-    const argv_bad = [_][*:0]const u8{"zinit"};
-    const argv_run = [_][*:0]const u8{ "zinit", "--", "true" };
+    for (cases) |case| {
+        errdefer std.debug.print("dispatch case: {s}\n", .{case.name});
 
-    const init_bad: std.process.Init.Minimal = .{ .args = .{ .vector = &argv_bad }, .environ = environ };
-    try std.testing.expectEqual(@as(u8, 1), switch (parseArgs(init_bad, out, err)) {
-        .run => return error.TestUnexpectedResult,
-        .exit => |code| code,
-    });
-    try std.testing.expectEqual(@as(usize, 0), drain(out_pipe[0], &buf));
-    try std.testing.expect(drain(err_pipe[0], &buf) > 0);
+        const out_fds = try std.Io.Threaded.pipe2(.{ .NONBLOCK = true });
+        const err_fds = try std.Io.Threaded.pipe2(.{ .NONBLOCK = true });
+        const out_read = std.Io.File{ .handle = out_fds[0], .flags = .{ .nonblocking = true } };
+        const out_write = std.Io.File{ .handle = out_fds[1], .flags = .{ .nonblocking = true } };
+        const err_read = std.Io.File{ .handle = err_fds[0], .flags = .{ .nonblocking = true } };
+        const err_write = std.Io.File{ .handle = err_fds[1], .flags = .{ .nonblocking = true } };
+        defer out_read.close(test_io);
+        defer out_write.close(test_io);
+        defer err_read.close(test_io);
+        defer err_write.close(test_io);
 
-    const init_help: std.process.Init.Minimal = .{ .args = .{ .vector = &argv_help }, .environ = environ };
-    try std.testing.expectEqual(@as(u8, 0), switch (parseArgs(init_help, out, err)) {
-        .run => return error.TestUnexpectedResult,
-        .exit => |code| code,
-    });
-    try std.testing.expect(drain(out_pipe[0], &buf) > 0);
+        const ctx: lib.io.Context = .{
+            .out = out_write.handle,
+            .err = err_write.handle,
+        };
 
-    const init_version: std.process.Init.Minimal = .{ .args = .{ .vector = &argv_version }, .environ = environ };
-    try std.testing.expectEqual(@as(u8, 0), switch (parseArgs(init_version, out, err)) {
-        .run => return error.TestUnexpectedResult,
-        .exit => |code| code,
-    });
-    try std.testing.expect(drain(out_pipe[0], &buf) > 0);
+        const init: std.process.Init.Minimal = .{
+            .args = .{ .vector = @as([*]const [*:0]const u8, @ptrCast(case.argv.ptr))[0..case.argv.len] },
+            .environ = .empty,
+        };
 
-    const init_run: std.process.Init.Minimal = .{ .args = .{ .vector = &argv_run }, .environ = environ };
-    switch (parseArgs(init_run, out, err)) {
-        .run => |args| try std.testing.expectEqualStrings("true", std.mem.span(args.argv[0].?)),
-        .exit => return error.TestUnexpectedResult,
+        switch (dispatch(init, ctx)) {
+            .run => |args| {
+                try std.testing.expectEqual(@as(?u8, null), case.exit);
+                try std.testing.expectEqualStrings("true", std.mem.span(args.argv[0].?));
+            },
+            .exit => |code| try std.testing.expectEqual(case.exit, @as(?u8, code)),
+        }
+
+        var out_text: [16 * 1024]u8 = undefined;
+        const out = try drainPipe(out_read, test_io, &out_text);
+        try std.testing.expectEqual(case.stdout, out.len > 0);
+
+        var err_text: [16 * 1024]u8 = undefined;
+        const err = try drainPipe(err_read, test_io, &err_text);
+        try std.testing.expectEqual(case.stderr, err.len > 0);
+
+        if (case.version)
+            try std.testing.expectEqualStrings(config.version ++ "\n", out);
     }
-
-    const argv_typo = [_][*:0]const u8{ "zinit", "--log-level=debug", "--", "true" };
-    const init_typo: std.process.Init.Minimal = .{ .args = .{ .vector = &argv_typo }, .environ = environ };
-    try std.testing.expectEqual(@as(u8, 1), switch (parseArgs(init_typo, out, err)) {
-        .run => return error.TestUnexpectedResult,
-        .exit => |code| code,
-    });
-
-    try std.testing.expectEqual(@as(usize, 0), drain(err_pipe[0], &buf));
 }
 
-fn drain(fd: std.posix.fd_t, buf: []u8) usize {
-    return std.posix.read(fd, buf) catch |err| switch (err) {
-        error.WouldBlock => 0,
-        else => unreachable,
-    };
+/// Drain a non-blocking pipe into `buf`; an empty pipe reports `WouldBlock`.
+fn drainPipe(file: std.Io.File, test_io: std.Io, buf: []u8) ![]u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        var iov = [_][]u8{buf[total..]};
+        const n = file.readStreaming(test_io, &iov) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
 }

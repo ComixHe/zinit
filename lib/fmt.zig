@@ -2,7 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Compile-time formatting, and the short errno names it prints.
+//! Compile-time formatting for a deliberately small subset: `{s}` string, `{d}`
+//! unsigned decimal, `{x}` unsigned hex, `{e}` errno name. There is no width,
+//! alignment, sign or escape form; output is truncated at the end of the buffer.
+//! Placeholder count is checked against the argument tuple at compile time, and an
+//! unclosed `{` is a compile error rather than an index-out-of-bounds in the parser.
 
 const std = @import("std");
 
@@ -11,14 +15,13 @@ const Piece = union(enum) {
     arg: enum { str, dec, hex, errno },
 };
 
-fn parse(comptime format: []const u8) []const Piece {
-    // The scan is one branch per byte, so a long format (the help text) needs more
-    // than the default 1000 backwards branches.
+fn parse(format: []const u8, argument_count: usize) []const Piece {
     @setEvalBranchQuota(10_000);
 
     var pieces: [format.len]Piece = undefined;
     var n: usize = 0;
     var i: usize = 0;
+    var placeholders: usize = 0;
 
     while (i < format.len) {
         if (format[i] != '{') {
@@ -29,8 +32,10 @@ fn parse(comptime format: []const u8) []const Piece {
             i = j;
         } else {
             var j = i + 1;
-            while (format[j] != '}') : (j += 1) {}
+            while (j < format.len and format[j] != '}') : (j += 1) {}
+            if (j == format.len) @compileError("unclosed format placeholder in: " ++ format);
             const spec = format[i + 1 .. j];
+
             pieces[n] = .{ .arg = if (std.mem.eql(u8, spec, "s"))
                 .str
             else if (std.mem.eql(u8, spec, "d"))
@@ -42,16 +47,22 @@ fn parse(comptime format: []const u8) []const Piece {
             else
                 @compileError("unsupported format spec: {" ++ spec ++ "}") };
 
+            placeholders += 1;
             n += 1;
             i = j + 1;
         }
+    }
+
+    if (placeholders != argument_count) {
+        @compileError("format placeholders and arguments differ in: " ++ format);
     }
 
     return pieces[0..n];
 }
 
 pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) []u8 {
-    const pieces = comptime parse(format);
+    const pieces = comptime parse(format, @typeInfo(@TypeOf(args)).@"struct".field_names.len);
+
     var at: usize = 0;
     comptime var arg_i: usize = 0;
 
@@ -74,7 +85,7 @@ pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) []u8 {
     return buf[0..at];
 }
 
-pub inline fn appendBytes(buf: []u8, at: usize, bytes: []const u8) usize {
+pub fn appendBytes(buf: []u8, at: usize, bytes: []const u8) usize {
     if (at >= buf.len) return at;
 
     const n = @min(bytes.len, buf.len - at);
@@ -129,7 +140,7 @@ const errno_lookup = blk: {
 
 /// The short name, or `errno <n>`, written straight into `buf`. One body for every
 /// `{e}` site: each would otherwise carry its own copy of the scan.
-pub noinline fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
+pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
     const number = @backingInt(errno);
     if (number < errno_lookup.offsets.len) {
         const start = errno_lookup.offsets[number];
@@ -145,7 +156,7 @@ pub noinline fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
     return appendBytes(buf, at, bufPrint(&scratch, "errno {d}", .{number}));
 }
 
-noinline fn appendInt(buf: []u8, at: usize, value: u64, base: u8) usize {
+pub fn appendInt(buf: []u8, at: usize, value: u64, base: u8) usize {
     const digits = "0123456789abcdef";
     var v: u64 = value;
     var tmp: [20]u8 = undefined;
@@ -173,7 +184,7 @@ noinline fn appendInt(buf: []u8, at: usize, value: u64, base: u8) usize {
 test "put renders strings, decimals and hex, and truncates rather than overruns" {
     // The expectation comes from std's formatter, so the two are cross-checked.
     var expected_buf: [16]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, "{s} {d} {x}", .{ "a", 42, 255 });
+    const expected = try std.mem.print(&expected_buf, "{s} {d} {x}", .{ "a", 42, 255 });
 
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings(expected, bufPrint(&buf, "{s} {d} {x}", .{ "a", 42, 255 }));
@@ -186,13 +197,30 @@ test "put renders strings, decimals and hex, and truncates rather than overruns"
     try std.testing.expectEqualStrings("failed: ENOENT", bufPrint(&errno_buf, "failed: {e}", .{.NOENT}));
 }
 
+test "bufPrint handles an empty buffer and the largest integers" {
+    var empty: [0]u8 = .{};
+    try std.testing.expectEqualStrings("", bufPrint(&empty, "{d}", .{std.math.maxInt(u64)}));
+
+    var buf: [20]u8 = undefined;
+
+    try std.testing.expectEqualStrings(
+        "18446744073709551615",
+        bufPrint(&buf, "{d}", .{std.math.maxInt(u64)}),
+    );
+
+    try std.testing.expectEqualStrings(
+        "ffffffffffffffff",
+        bufPrint(&buf, "{x}", .{std.math.maxInt(u64)}),
+    );
+}
+
 test "appendErrno names the common errnos and falls back to a number" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("ENOENT", buf[0..appendErrno(&buf, 0, .NOENT)]);
     try std.testing.expectEqualStrings("EAGAIN", buf[0..appendErrno(&buf, 0, .AGAIN)]);
 
-    // Outside the hand-written table the number is written instead.
+    const unknown: std.os.linux.E = @fromBackingInt(65535);
     var expected_buf: [24]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, "errno {d}", .{@backingInt(std.os.linux.E.BUSY)});
-    try std.testing.expectEqualStrings(expected, buf[0..appendErrno(&buf, 0, .BUSY)]);
+    const expected = try std.mem.print(&expected_buf, "errno {d}", .{@backingInt(unknown)});
+    try std.testing.expectEqualStrings(expected, buf[0..appendErrno(&buf, 0, unknown)]);
 }

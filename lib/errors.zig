@@ -2,15 +2,20 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The error set every layer returns.
+//! The error vocabulary, split by layer: parsing explains a rejected command
+//! line, the runtime has one syscall failure class, and the entry point sees the
+//! union of both.
 
-pub const ZinitError = error{
+pub const ConfigError = error{
     InvalidSignal,
     InvalidParams,
     MissingCommand,
     InvalidRewrite,
     InvalidExitCode,
-    SysCallError,
     DuplicateSignal,
     CycleRewrite,
 };
+
+pub const SysCallError = error{SysCallError};
+
+pub const ZinitError = ConfigError || SysCallError;

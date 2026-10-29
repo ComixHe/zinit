@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const config = Config.init(b);
 
-    const config_mod = addConfig(b, config);
+    const config_mod = addConfig(b, config, false);
     const lib = addLibrary(b, config, config_mod);
     const app = addApp(b, config, config_mod, lib);
     const exe = addExecutable(b, config, app);
@@ -33,13 +34,15 @@ fn moduleOptions(config: Config) std.Build.Module.CreateOptions {
     };
 }
 
-fn addConfig(b: *std.Build, config: Config) *std.Build.Module {
+fn addConfig(b: *std.Build, config: Config, include_private_integration_tests: bool) *std.Build.Module {
     const options = b.addOptions();
-    options.addOption(std.SemanticVersion, "version", config.version());
+
+    options.addOption([]const u8, "version", config.manifest.version);
     options.addOption(bool, "tracing_child", config.tracing_child);
     options.addOption(bool, "stack_traces", config.stack_traces);
     options.addOption(std.log.Level, "max_log_level", config.max_log_level);
     options.addOption(std.log.Level, "default_log_level", config.default_log_level);
+    options.addOption(bool, "include_private_integration_tests", include_private_integration_tests);
 
     return options.createModule();
 }
@@ -78,7 +81,6 @@ fn addExecutable(b: *std.Build, config: Config, app: *std.Build.Module) *std.Bui
     // 0 keeps the linker from making `std.start` raise RLIMIT_STACK, which the child
     // would inherit.
     exe.stack_size = 0;
-    exe.link_function_sections = true;
     exe.pie = config.pie;
 
     if (config.isRelease()) exe.lto = .thin;
@@ -129,7 +131,7 @@ fn addReleaseStep(b: *std.Build, exe: *std.Build.Step.Compile, config: Config) v
     });
 
     const archive_name = b.fmt("zinit-{s}-{s}-{s}", .{
-        config.versionString(b),
+        config.manifest.version,
         config.shortTarget(b),
         config.optimizeName(),
     });
@@ -147,9 +149,9 @@ fn addReleaseStep(b: *std.Build, exe: *std.Build.Step.Compile, config: Config) v
         pack.addArgs(&.{
             "--sbom",
             "--version",
-            config.versionString(b),
+            config.manifest.version,
             "--zig",
-            config.manifest.minimum_zig_version,
+            builtin.zig_version_string,
             "--commit",
             commit,
         });
@@ -223,7 +225,7 @@ fn addTestStep(
 
 const Config = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     manifest: Manifest,
     size_analysis: bool,
     coverage: bool,
@@ -257,11 +259,6 @@ const Config = struct {
             std.debug.panic("invalid version {s} in build.zig.zon: {s}", .{ self.manifest.version, @errorName(err) });
     }
 
-    fn versionString(self: Config, b: *std.Build) []const u8 {
-        const v = self.version();
-        return b.fmt("{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
-    }
-
     fn shortTarget(self: Config, b: *std.Build) []const u8 {
         return b.fmt("{s}-{s}", .{
             @tagName(self.target.result.cpu.arch),
@@ -271,17 +268,16 @@ const Config = struct {
 
     fn optimizeName(self: Config) []const u8 {
         return switch (self.optimize) {
-            .Debug => "Debug",
-            .ReleaseSafe => "ReleaseSafe",
-            .ReleaseSmall => "ReleaseSmall",
-            .ReleaseFast => "ReleaseFast",
+            .debug => "Debug",
+            .safe => "ReleaseSafe",
+            .small => "ReleaseSmall",
+            .fast => "ReleaseFast",
         };
     }
 };
 
 const Manifest = struct {
     version: []const u8,
-    minimum_zig_version: []const u8 = "",
 };
 
 fn parseLogLevelOption(option: []const u8, name: []const u8) std.log.Level {
