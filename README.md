@@ -2,10 +2,14 @@
 
 [![Coverage Status](https://img.shields.io/codecov/c/github/ComixHe/zinit?style=flat-square&logo=codecov)](https://codecov.io/gh/ComixHe/zinit)
 
-A tiny init for Linux containers: it forwards signals (to the child, or its
-group with `-g`), reaps orphans, rewrites signals and exit codes (`-r`, `-e`),
-handles the terminal and job control, and drives a shutdown that cannot hang.
-Static, libc-less Zig, no threads, no allocation.
+> **Note:** this README was produced with AI assistance. Its claims were
+> checked against the implementation at the time of writing. The code is the
+> source of truth; report anything that has drifted.
+
+A small init for Linux containers. It starts one workload, forwards signals to
+it (or its process group with `-g`), reaps orphans, rewrites signals and exit
+codes (`-r`, `-e`), handles the terminal and job control, and shuts down with a
+bounded grace period. Static, no libc, no threads, no allocation.
 
 ## Requirements
 
@@ -18,7 +22,8 @@ Static, libc-less Zig, no threads, no allocation.
 | Shutdown grace (`clock_gettime`) | 2.6.16 |
 | `-p` (`PR_SET_PDEATHSIG`) | 2.6.9 |
 | `-s` (`PR_SET_CHILD_SUBREAPER`) | **3.4** |
-| pidfd acceleration (`clone(CLONE_PIDFD)`) | 5.2 / 6.9 |
+| pidfd acceleration (`clone(CLONE_PIDFD)`) | 5.2 |
+| Group signalling through a pidfd (`PIDFD_SIGNAL_PROCESS_GROUP`) | 6.9 |
 
 ## Install
 
@@ -28,7 +33,7 @@ zig build -Doptimize=ReleaseSmall
 
 | Prefer | How |
 | --- | --- |
-| `COPY --from` in your Dockerfile | `ghcr.io/comixhe/zinit:<version>` — a `scratch` image, amd64/arm64/riscv64, the bare tag is size-optimized, `-safe` keeps Zig's runtime checks |
+| `COPY --from` in a Dockerfile | `ghcr.io/comixhe/zinit:<version>` — a `scratch` image, amd64/arm64/riscv64, the bare tag is size-optimized, `-safe` keeps Zig's runtime checks |
 | A file | release tarballs with `SHA256SUMS`, an SPDX SBOM and cosign bundles |
 | Building | the checkout, as above |
 
@@ -39,8 +44,7 @@ zinit --help
 ```
 
 `--` is optional: the first non-option starts the command. Signals are numbers
-(`15`) or names (`TERM`, `SIGTERM`). `-p` and `-r` take standard signals only, a
-realtime signal *sent to zinit* is forwarded with its `sigqueue` value.
+(`15`) or names (`TERM`, `SIGTERM`). `-p` and `-r` take standard signals only.
 
 | Variable | Equivalent | Values |
 | --- | --- | --- |
@@ -51,22 +55,24 @@ realtime signal *sent to zinit* is forwarded with its `sigqueue` value.
 
 ### Logging
 
-One line per event on stderr, colour only on a terminal, no timestamp of its own.
+One line per event on stderr, colour only on a terminal, no timestamp.
 
 | Level | Prints |
 | --- | --- |
 | `error` | zinit cannot continue: usage, `clone`/`fork`/`signalfd`/`waitpid`/`execve` |
 | `warn` | A setup did not take effect, or a boundary was hit: not a subreaper, terminal/job-control failure, grace exhausted (**default**) |
 | `info` | The main child's exit, and every adopted descendant that died non-zero or by a signal |
-| `debug` | How the child was created, each forward, the grace starting, `-e` remapping, clean adopted exits (quiet on purpose: a helper finishing is routine) |
+| `debug` | How the child was created, each forward, the grace starting, `-e` remapping, and clean adopted exits |
 
-`-Dlog-level` is the loudest level the binary can print (`info`),
-`-Ddefault-log-level` is what it prints unasked (`warn`, clamped to the ceiling).
-Asking at runtime for a level above the ceiling is an error, not a no-op — that
-includes `ZINIT_LOG_LEVEL`, so a `ZINIT_LOG_LEVEL=debug` left over in an image
-whose zinit was built with the default ceiling stops the container from starting
-(`exit 1`) instead of quietly logging less. Build the binary with
-`-Dlog-level=debug` or drop the variable.
+A clean exit from an adopted descendant is `debug` because a helper finishing is
+routine.
+
+`-Dlog-level` is the loudest level the build can print (`info`);
+`-Ddefault-log-level` is what it prints unasked (`warn`, clamped to the
+ceiling). A runtime request above the ceiling is an error (`exit 1`); this
+includes `ZINIT_LOG_LEVEL`, so a stale `ZINIT_LOG_LEVEL=debug` on a default
+build prevents the container from starting. Rebuild with `-Dlog-level=debug` or
+drop it.
 
 ## Exit Status
 
@@ -79,14 +85,15 @@ whose zinit was built with the default ceiling stops the container from starting
 
 ## Setups
 
-Nothing extra as PID 1. The rest are independent and combinable:
+No options are needed as PID 1. The rest are independent and combinable:
 
 ```bash
 zinit -s -- /usr/bin/my-daemon             # subreaper: adopt orphans, outside
                                            # PID 1 they otherwise go to the real
                                            # init, and zinit warns
-zinit -g -- /bin/sh -c "my-server & wait"  # forward to the child's group too,
-                                           # for shells that do not pass them on
+zinit -g -- /bin/sh -c "my-server & wait"  # forward to the child's process
+                                           # group, for shells that do not pass
+                                           # them on
 zinit -n -- /usr/bin/my-app                # new session: detach the tty,
                                            # TSTP/TTIN/TTOU become STOP
 zinit -e 143 -e 130 -- java -jar app.jar   # exit codes that count as success
@@ -95,8 +102,8 @@ zinit -r USR1:0 -- /usr/bin/my-app         # ... or drop it
 zinit -p KILL -- /usr/bin/critical-service # signal the child if zinit dies
 ```
 
-`-n` matters when running by hand, where job control addresses zinit, so add `-g`
-when the workload is itself a shell. `-e` and `-r` are repeatable.
+`-n` matters when running by hand, where job control addresses zinit, so add
+`-g` when the workload is itself a shell. `-e` and `-r` are repeatable.
 
 ## Container Integration
 
@@ -137,12 +144,12 @@ Multi-arch: one Dockerfile covers amd64, arm64 and riscv64, with no
 nix build github:ComixHe/zinit
 ```
 
-The flake installs the *released* artifact, not a rebuild: a fixed-output
-derivation checked against `SHA256SUMS`, byte-for-byte the GitHub release. A hash
-proves *what* was downloaded, not *who* published it, so see
-[SECURITY.md](SECURITY.md) for that. Set
-`inputs.zinit.inputs.nixpkgs.follows = "nixpkgs";` to avoid a second nixpkgs, and
-use `#zinit-safe` for the safety-checked build:
+The flake installs the released artifact, not a rebuild: a fixed-output
+derivation checked against `SHA256SUMS`, byte-for-byte the GitHub release. That
+proves what was downloaded, not who published it; see
+[SECURITY.md](SECURITY.md). Set
+`inputs.zinit.inputs.nixpkgs.follows = "nixpkgs";` to avoid a second nixpkgs,
+and use `#zinit-safe` for the safety-checked build:
 
 ```nix
 dockerTools.buildImage {
@@ -181,27 +188,18 @@ spec:
       image: { reference: ghcr.io/comixhe/zinit:v0.3.0 }
 ```
 
-- `-g` (or `-n`) when the workload is wrapped in a shell.
 - `shareProcessNamespace: true` leaves the sandbox as PID 1, so add `-s`.
 - `securityContext.runAsUser` covers both, pair it with `runAsNonRoot: true` —
   the check is against the container's own image, which runs as root by default,
   so `runAsUser` is what satisfies it. Add back the workload's capabilities.
-- The image has no shell. Run a command in it through an ephemeral container
-  (this prints PID 1's name, with `shareProcessNamespace` on, that is the
-  sandbox, not zinit):
-
-  ```bash
-  kubectl debug -it <pod> --image=busybox --target=<container> -- cat /proc/1/comm
-  ```
 
 [image volume]: https://kubernetes.io/docs/tasks/configure-pod-container/image-volumes/
 
 ### Compose
 
-`init: true` uses the runtime's init — zinit only once the runtime's default
-init is zinit (see the hook above), otherwise that init, not zinit, is PID 1, so
-a zinit below it needs `-s`. Bake zinit in, and size `stop_grace_period` above
-`-t`.
+`init: true` uses the runtime's init, so it is zinit only when the runtime's
+default init is zinit (see the hook above). Otherwise that init, not zinit, is
+PID 1, and a zinit below it needs `-s`.
 
 ### Grace period
 
@@ -218,17 +216,16 @@ be **larger**, or the workload is killed before it can shut down:
 
 ### Unprivileged
 
-zinit needs no capability of its own: it only signals and reaps processes of its
-own uid, and re-parenting does not depend on uid. What matters is that **init and
-workload share a uid**:
+zinit needs no capability of its own: it signals and reaps processes of its own
+uid, and re-parenting does not depend on uid. Init and workload only have to
+share a uid:
 
 ```yaml
 securityContext: { runAsUser: 1000 }
 ```
 
-The artifact sets no `USER` (that config would not survive `COPY --from`), so the
-downstream image decides. Give the init `CAP_KILL` only when the workload must
-run as another uid.
+The artifact sets no `USER` (it would not survive `COPY --from`), so the image
+decides. Add `CAP_KILL` only when the workload runs as another uid.
 
 ### Verify
 
@@ -246,7 +243,7 @@ cosign verify \
 | `-Doptimize=ReleaseSmall` | Smallest binary, `ReleaseSafe` keeps runtime checks, `ReleaseFast` drops them |
 | `-Dlog-level=<level>` | Loudest level the build can print (`info`), higher levels are compiled out |
 | `-Ddefault-log-level=<level>` | Level printed unasked (`warn`), clamped to the ceiling |
-| `-Dpie=true` | Static PIE, for ASLR on the binary, off by default, non-PIE is ~1.6 kB smaller |
+| `-Dpie=true` | Static PIE, for ASLR on the binary, off by default, non-PIE is ~1.7 kB smaller |
 | `-Dstack-traces=true` | Crash stack traces |
 | `-Dtracing-child=true` | Child waits for SIGUSR1 before `exec` |
 | `-Dtest-coverage=true` | Build tests for kcov into `kcov-output/` |
@@ -254,51 +251,54 @@ cosign verify \
 
 ## How It Works
 
-- **Signals.** Everything forwarded is blocked and read from a `signalfd`, fault
-  signals keep their terminating default and TTIN/TTOU are ignored. Nothing installs
-  a handler for a forwarded signal, so no `EINTR` and no async-signal-safety rules;
-  the `-Dtracing-child` handshake waits on the blocked SIGUSR1 with `sigwaitinfo`
-  instead of a handler.
+- **Signals.** Everything forwarded is blocked and read from a `signalfd`; fault
+  signals keep their terminating default and TTIN/TTOU are ignored. Nothing
+  installs a handler for a forwarded signal, so there is no `EINTR` and no
+  async-signal-safety rules; the `-Dtracing-child` handshake waits on the
+  blocked SIGUSR1 with `sigwaitinfo` instead of a handler.
 - **Spawn.** `clone(CLONE_PIDFD)` where available (`fork` otherwise), the child
   leads its own group (and session with `-n`), and becomes the foreground group
   on a TTY. It keeps the parent's mask through all of that: the mask is cleared
   once, immediately before `execve`, so a forwarded signal waits in the queue
   instead of killing a child that is halfway through its own setup.
 - **Loop.** `poll` the descriptor, forward each signal, then `waitpid(-1,
-  WNOHANG)` until no reapable child is left. Only the signal read is bounded, so
+  WNOHANG | WUNTRACED | WCONTINUED)` until no reapable child is left; a child
+  that stops or continues is an event too. Only the signal read is bounded, so
   a signal flood cannot starve the reaper.
-- **Job control.** A TSTP/TTIN/TTOU that ends up suspending the child suspends
-  zinit with it, so a shell sees the job stopped rather than a running init
-  whose child is not running; SIGCONT resumes both.
+- **Job control.** Outside PID 1, zinit stops itself once the kernel reports the
+  main child stopped, whichever signal stopped it, so a shell sees the job
+  stopped rather than a running init whose child is not running; a stop and a
+  continue seen in the same drain cancel out, and SIGCONT resumes both.
 - **Shutdown.** TERM to the group, KILL when `-t` elapses, one non-blocking
-  sweep, exit — an unkillable descendant cannot hang it.
+  sweep, exit — a descendant that ignores TERM cannot hang it.
 
 ## Limitations
 
-Deliberate, the alternative costs more than it buys here.
-
 - **A descendant that leaves the group is out of reach** (`setpgid`/`setsid`),
   only a cgroup or a PID namespace follows it, and zinit uses neither.
-- **Signalling races what cannot be seen**: a group is signalled only while the
-  kernel can prove it is ours (`waitid(P_PGID)`), and the fallback targets a
-  number rather than a pidfd — a live child leaving the group between the check
-  and the signal, with its id reused in that same microsecond, is missed.
-- **zinit stops when the child does**: the job-control signals above stop the
-  init itself, so with no shell left to send SIGCONT (a stop sent straight to a
-  container's PID 1) the container stays stopped until something external
-  resumes it. The stop is sent after the forward, so a child that exits in that
-  instant leaves zinit stopped with nothing to wait for.
+- **Some signalling races cannot be closed**: a group is signalled only while
+  the kernel can prove it is ours (`waitid(P_PGID)`), and the fallback targets
+  a number rather than a pidfd — a live child leaving the group between the
+  check and the signal, with its id reused in that same microsecond, is missed.
+- **Outside PID 1, zinit stops when the child does**: it stops only after the
+  kernel reports the child stopped; a child that ignores the stop, or exits
+  instead, leaves zinit running. The report and zinit's own SIGSTOP are two
+  syscalls, so a continue arriving in between still leaves zinit stopped. Send
+  SIGCONT to zinit to resume both; sending it only to the child does not resume
+  zinit. As a container's PID 1, zinit cannot stop itself with SIGSTOP: the
+  kernel ignores that signal, so zinit keeps supervising while the workload is
+  stopped.
 - **`-g` follows the child's group, not the one it was born into**: a workload
   that moves itself into another group has that group signalled, because that
   is where the kernel resolves the pidfd at the moment of the send.
-- **The grace period is an upper bound**: a descendant that ignores SIGKILL, or
-  escaped the group, outlives it.
-- **If zinit dies, nothing is cleaned up here**, a PID namespace tears the rest
-  down, without one, pass `-s`, or orphans are never re-parented.
-- **Realtime payloads travel only on the pidfd path**, through `kill` the child
-  gets a plain `SI_USER`. The sender it sees is zinit either way, because the
-  original pid may mean nothing in a child namespace.
-- **SIGCHLD is forced to its default** and handed back to the child on exec, an
+- **The grace period is an upper bound**: a descendant that left the group, or
+  is stuck in uninterruptible sleep, outlives it.
+- **If zinit dies, cleanup depends on the environment**: a PID namespace tears
+  everything down; without one, run with `-s` or orphans are never re-parented.
+- **Realtime payloads travel only on the pidfd path**; through `kill` the child
+  gets a plain `SI_USER`. The child always sees zinit as the sender, because the
+  original pid may not exist in its namespace.
+- **SIGCHLD is forced to its default** and restored in the child on exec; an
   inherited `SIG_IGN` would let the kernel reap the status away.
 - **Only the signalfd is close-on-exec**, other inherited descriptors pass
   through.
