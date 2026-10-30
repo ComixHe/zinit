@@ -29,6 +29,22 @@ pub const Event = struct {
     sender: std.os.linux.pid_t = 0,
 };
 
+pub fn queueInfo(signo: u32, value: u64) std.os.linux.siginfo_t {
+    var info = std.mem.zeroes(std.os.linux.siginfo_t);
+    info.signo = @fromBackingInt(@intCast(signo));
+    info.code = SI.QUEUE;
+    info.fields.common.first.piduid.pid = @intCast(std.os.linux.getpid());
+    info.fields.common.first.piduid.uid = @intCast(std.os.linux.getuid());
+
+    if (value == 0) {
+        info.fields.common.second.value.int = 0;
+    } else {
+        info.fields.common.second.value.ptr = @ptrFromInt(value);
+    }
+
+    return info;
+}
+
 const standard_signal_max: u32 = std.os.linux.sigrtmin() - 1;
 
 /// Names in numeric order with compile-time boundaries, avoiding a length scan at lookup.

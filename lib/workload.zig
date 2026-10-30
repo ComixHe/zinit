@@ -41,24 +41,6 @@ comptime {
     std.debug.assert(signal_batch <= signal_quota);
 }
 
-/// The sender the child sees is zinit: the original pid may mean nothing, or
-/// someone else, in a child namespace.
-fn queuedInfo(sig: u32, payload: Payload) std.os.linux.siginfo_t {
-    var info = std.mem.zeroes(std.os.linux.siginfo_t);
-    info.signo = @fromBackingInt(@intCast(sig));
-    info.code = signal.SI.QUEUE;
-    info.fields.common.first.piduid.pid = @intCast(std.os.linux.getpid());
-    info.fields.common.first.piduid.uid = @intCast(std.os.linux.getuid());
-
-    if (payload.value == 0) {
-        info.fields.common.second.value.int = 0;
-    } else {
-        info.fields.common.second.value.ptr = @ptrFromInt(payload.value);
-    }
-
-    return info;
-}
-
 /// The last event observed for the main child in one drain round. A single value,
 /// updated in kernel order, so "stop, continue, stop" ends stopped and an exit
 /// supersedes everything: a later stop can never resurrect a dead child.
@@ -193,7 +175,7 @@ pub const State = struct {
         flags: u32,
     ) usize {
         if (payload) |p| {
-            var info = queuedInfo(@intCast(@backingInt(target)), p);
+            var info = signal.queueInfo(@intCast(@backingInt(target)), p.value);
             const rc = std.os.linux.pidfd_send_signal(fd, target, &info, flags);
             return switch (io.syscallErrno(rc)) {
                 .INVAL, .PERM => |errno| blk: {
@@ -231,7 +213,7 @@ pub const State = struct {
 
     fn sendChildByNumber(self: *const State, target: Sig, payload: ?Payload) usize {
         if (payload) |p| {
-            var info = queuedInfo(@intCast(@backingInt(target)), p);
+            var info = signal.queueInfo(@intCast(@backingInt(target)), p.value);
             const rc = std.os.linux.syscall3(
                 .rt_sigqueueinfo,
                 @intCast(self.child.pid),
