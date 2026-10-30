@@ -125,7 +125,11 @@ pub fn supervise(
             };
 
             if (timeout_ms) |timeout| {
-                const got = source.waitBatch(&batch, timeout) catch return failSupervision(&state);
+                const got = source.waitBatch(&batch, timeout) catch {
+                    @branchHint(.unlikely);
+                    return state.abortSupervision();
+                };
+
                 if (got != 0) {
                     if (state.handleSignalEvent(&source, batch[0..got])) |outcome| return outcome;
                 }
@@ -134,10 +138,4 @@ pub fn supervise(
 
         if (state.onTimeout()) |outcome| return outcome;
     }
-}
-
-fn failSupervision(state: *workload.State) Outcome {
-    @branchHint(.unlikely);
-    _ = state.abortSupervision();
-    return .failed;
 }

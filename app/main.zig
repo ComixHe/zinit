@@ -90,9 +90,9 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
         .tracing_child = args.tracing_child,
     };
 
-    // Before the fork: the kernel queues one HUP and one CONT for zinit itself,
-    // which the workload never caused and must not be handed. Only a new session
-    // transfers the terminal, and only if there is one to let go of.
+    // Before the fork: only a new session transfers the terminal, and the kernel
+    // then queues one HUP and one CONT for the foreground group (usually zinit).
+    // The workload never caused them and must not receive them.
     const detached = blk: {
         if (!args.new_session) break :blk false;
         const fd = tty_fd orelse break :blk false;

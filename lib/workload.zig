@@ -993,9 +993,9 @@ const integration_tests = struct {
         return if (workloadStopped(test_io, pid) orelse return 3) 4 else 0;
     }
 
-    /// Kill the driver and the workload only through kernel identities. On the
-    /// failure this test targets the workload is stopped and unreaped, so a pidfd
-    /// is available; its number cannot be recycled while the descriptor is open.
+    /// Kill the driver and the workload only through kernel identities: the pidfd
+    /// keeps the workload's identity alive, while its number is freed on reap and
+    /// must never be signalled here.
     fn cleanupBatchDriver(test_io: std.Io, driver_pid: std.os.linux.pid_t, workload: std.os.linux.pid_t) void {
         const raw = std.os.linux.pidfd_open(workload, 0);
         if (io.syscallErrno(raw) == .SUCCESS) {

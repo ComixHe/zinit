@@ -357,7 +357,7 @@ pub const Args = struct {
         } };
     }
 
-    pub fn parse(init: std.process.Init.Minimal) !Action {
+    pub fn parse(init: std.process.Init.Minimal) ConfigError!Action {
         return resolve(init, try scan(init.args.vector));
     }
 };

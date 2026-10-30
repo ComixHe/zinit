@@ -93,7 +93,9 @@ pub const Map = struct {
         self.set(old_sig, new_sig) catch unreachable;
     }
 
-    pub fn reaches(self: *const Map, from: u32, to: u32) ConfigError!bool {
+    /// Not a plain reachability query: an existing cycle also counts, so `parse`
+    /// refuses closing a loop it did not create.
+    fn reaches(self: *const Map, from: u32, to: u32) ConfigError!bool {
         if (from == 0 or from >= self.entries.len) {
             @branchHint(.unlikely);
             return ConfigError.InvalidParams;

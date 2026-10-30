@@ -24,10 +24,10 @@ pub fn isControlTerminal(fd: std.os.linux.fd_t) bool {
     return io.syscallErrno(std.os.linux.tcgetpgrp(fd, &pgrp)) == .SUCCESS;
 }
 
-/// Runs in the parent, before spawning a child into a new session: drop our
-/// controlling terminal so the kernel's HUP/CONT land here and not on the
-/// child-to-be. Returns whether the detach really happened and zinit was the
-/// session leader, which tells the caller to ignore the initial HUP/CONT.
+/// Drops the controlling terminal before a new session takes it, so the HUP/CONT
+/// the kernel queues are not for the child. Returns whether zinit was the session
+/// leader, the pair actually goes to the foreground group, which need not be the
+/// leader, so a later kernel HUP/CONT can be mistaken for it.
 pub fn detachFromControlTerminal(fd: std.os.linux.fd_t) bool {
     const rc = std.os.linux.ioctl(fd, std.os.linux.T.IOCNOTTY, 0);
     switch (io.syscallErrno(rc)) {

@@ -139,7 +139,8 @@ const errno_lookup = blk: {
 };
 
 /// The short name, or `errno <n>`, written straight into `buf`. One body for every
-/// `{e}` site: each would otherwise carry its own copy of the scan.
+/// `{e}` site: each would otherwise carry its own copy of the scan. `at` must
+/// not exceed `buf.len`.
 pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
     const number = @backingInt(errno);
     if (number < errno_lookup.offsets.len) {
@@ -160,6 +161,7 @@ pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
 /// zero, `1` never converges, and anything above 16 indexes past `digits`.
 pub const Base = enum(u8) { dec = 10, hex = 16 };
 
+/// `at` must not exceed `buf.len`.
 pub fn appendInt(buf: []u8, at: usize, value: u64, base: Base) usize {
     const radix: u8 = @backingInt(base);
     const digits = "0123456789abcdef";
