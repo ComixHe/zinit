@@ -867,6 +867,54 @@ const integration_tests = struct {
         try std.testing.expectEqual(count, rounds);
     }
 
+    test "integration: the supervisor entry point re-drains after the reap quota" {
+        const test_io = std.testing.io;
+        const signal_config = try SignalConfig.install(&[_]Sig{});
+        defer _ = signal_config.restoreParent();
+
+        var main = try spawnSleeper(&signal_config);
+        defer main.close();
+        defer killAndReap(test_io, main.pid);
+
+        const worker_count = 40;
+        var workers: [worker_count]supervisor.ProcessHandle = undefined;
+        var spawned: usize = 0;
+        defer {
+            for (workers[0..spawned]) |*worker| {
+                worker.close();
+                _ = killAndReap(test_io, worker.pid);
+            }
+        }
+
+        for (&workers) |*worker| {
+            worker.* = try spawnSleeper(&signal_config);
+            spawned += 1;
+        }
+
+        for (workers) |worker| _ = std.os.linux.kill(worker.pid, Sig.KILL);
+
+        for (workers) |worker|
+            try waitForWaitid(test_io, worker.pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
+
+        var source = try signalfd.Source.open(&signal_config);
+        defer source.close();
+
+        var state = State.init(.{
+            .expected_exit = .empty,
+            .rewrites = null,
+            .forward_group = false,
+            .shutdown_timeout_ns = 0,
+            .ignore_initial_hup_cont = false,
+        }, main.take());
+        defer state.child.close();
+
+        try std.testing.expect(state.handleSignalEvent(&source, &.{}) == null);
+        try std.testing.expect(state.reapPending());
+
+        try std.testing.expect(state.handleSignalEvent(&source, &.{}) == null);
+        try std.testing.expect(!state.reapPending());
+    }
+
     /// Read the kernel's state letter for a workload without consuming its wait
     /// status.
     fn workloadStopped(test_io: std.Io, pid: std.os.linux.pid_t) ?bool {
@@ -1095,6 +1143,83 @@ const integration_tests = struct {
         try std.testing.expect(!state.signalGroupByNumber(@backingInt(Sig.TERM)));
     }
 
+    test "integration: the numeric group path reaches every member of the group" {
+        const test_io = std.testing.io;
+        // A group send and a send to the leader are indistinguishable while the
+        // leader is alone. Ignore TERM in the leader and put a second member in its
+        // group: only a real group send kills that member and lets `wait` return.
+        const signal_config = try SignalConfig.install(&[_]Sig{});
+        defer _ = signal_config.restoreParent();
+        const base: Policy = .{
+            .expected_exit = .empty,
+            .rewrites = null,
+            .forward_group = true,
+            .shutdown_timeout_ns = 0,
+            .ignore_initial_hup_cont = false,
+        };
+
+        var ready: [2]std.os.linux.fd_t = undefined;
+        if (io.syscallErrno(std.os.linux.pipe2(&ready, .{ .NONBLOCK = true })) != .SUCCESS)
+            return error.TestUnexpectedResult;
+        defer closeQuietly(ready[0]);
+
+        var script_buf: [160]u8 = undefined;
+        const script = try std.mem.printSentinel(
+            &script_buf,
+            "trap '' TERM; (trap - TERM; exec sleep 30) & printf r >&{d}; wait; printf d >&{d}",
+            .{ ready[1], ready[1] },
+            0,
+        );
+
+        var spawned = try supervisor.spawn(.{
+            .argv = &[_:null]?[*:0]const u8{ "/bin/sh", "-c", script },
+            .envs = &[_:null]?[*:0]const u8{},
+            .new_session = false,
+            .ctty = null,
+            .pdeath_signal = null,
+            .tracing_child = false,
+        }, &signal_config);
+        defer spawned.close();
+        const pid = spawned.pid;
+        defer {
+            // On failure the leader is still running and owns the group; take the
+            // group down before reaping it. After a wait, pid is no longer ours.
+            var status: i32 = 0;
+            const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
+            if (io.syscallErrno(rc) == .SUCCESS and rc == 0) _ = std.os.linux.kill(-pid, Sig.KILL);
+            _ = killAndReap(test_io, pid);
+        }
+
+        var state = State.init(base, spawned.take());
+        defer state.child.close();
+        closeQuietly(ready[1]); // the shell owns the only copy now
+
+        try expectHandshake(test_io, ready[0], 'r');
+        try std.testing.expect(state.signalGroupByNumber(@backingInt(Sig.TERM)));
+        try expectHandshake(test_io, ready[0], 'd');
+
+        const status = try waitForExit(test_io, pid);
+        state.child_reaped = true;
+        try std.testing.expectEqual(WaitStatus.Class.exited, status.class());
+        try std.testing.expectEqual(@as(u8, 0), status.exitCode());
+    }
+
+    /// One byte of the shell handshake, bounded by the monotonic clock.
+    fn expectHandshake(test_io: std.Io, fd: std.os.linux.fd_t, byte: u8) !void {
+        const deadline = std.Io.Clock.now(.awake, test_io).toNanoseconds() + 5 * std.time.ns_per_s;
+        var buf: [1]u8 = undefined;
+        while (true) {
+            const got = std.os.linux.read(fd, &buf, buf.len);
+            if (io.syscallErrno(got) == .SUCCESS and got == 1) {
+                try std.testing.expectEqual(byte, buf[0]);
+                return;
+            }
+            if (std.Io.Clock.now(.awake, test_io).toNanoseconds() >= deadline)
+                return error.TestUnexpectedResult;
+            try std.Io.sleep(test_io, .fromMilliseconds(1), .awake);
+        }
+    }
+
     fn spawnSleeper(signal_config: *const SignalConfig) !ProcessHandle {
         return supervisor.spawn(.{
             .argv = &[_:null]?[*:0]const u8{ "/bin/sleep", "30" },
@@ -1170,6 +1295,13 @@ const integration_tests = struct {
         cont.code = signal.SI.USER;
         state.forwardSignal(cont);
         try expectChildEvent(test_io, pid, std.os.linux.W.CONTINUED);
+
+        // The swallow is one-shot: a second kernel continue must be forwarded too.
+        _ = std.os.linux.kill(pid, Sig.STOP);
+        try expectChildEvent(test_io, pid, std.os.linux.W.UNTRACED);
+        cont.code = signal.SI.KERNEL;
+        state.forwardSignal(cont);
+        try expectChildEvent(test_io, pid, std.os.linux.W.CONTINUED);
     }
 
     test "integration: a kernel HUP is ignored before releasing the workload" {
@@ -1209,6 +1341,47 @@ const integration_tests = struct {
         state.child_reaped = true;
         try std.testing.expectEqual(WaitStatus.Class.exited, status.class());
         try std.testing.expectEqual(@as(u8, 0), status.exitCode());
+    }
+
+    test "integration: only the first kernel HUP is swallowed" {
+        const test_io = std.testing.io;
+        const signal_config = try SignalConfig.install(&[_]Sig{});
+        defer _ = signal_config.restoreParent();
+        const base: Policy = .{
+            .expected_exit = .empty,
+            .rewrites = null,
+            .forward_group = false,
+            .shutdown_timeout_ns = 0,
+            .ignore_initial_hup_cont = true,
+        };
+
+        var spawned = try supervisor.spawn(.{
+            .argv = &[_:null]?[*:0]const u8{"/bin/true"},
+            .envs = &[_:null]?[*:0]const u8{},
+            .new_session = false,
+            .ctty = null,
+            .pdeath_signal = null,
+            .tracing_child = true,
+        }, &signal_config);
+        defer spawned.close();
+        const pid = spawned.pid;
+        defer killAndReap(test_io, pid);
+
+        var state = State.init(base, spawned.take());
+        defer state.child.close();
+
+        const hup: signal.Event = .{ .signo = @backingInt(Sig.HUP), .code = signal.SI.KERNEL, .value = 0 };
+        // The first kernel HUP belongs to the detach and is swallowed. The second
+        // is a real one: it must be queued, and the tracing gate delivers it when
+        // the child unblocks before exec.
+        state.forwardSignal(hup);
+        state.forwardSignal(hup);
+
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, io.syscallErrno(std.os.linux.kill(pid, Sig.USR1)));
+        const status = try waitForExit(test_io, pid);
+        state.child_reaped = true;
+        try std.testing.expectEqual(WaitStatus.Class.signaled, status.class());
+        try std.testing.expectEqual(@as(u32, @backingInt(Sig.HUP)), status.signalNumber());
     }
 
     test "integration: a rewrite to 0 drops the signal instead of forwarding it" {

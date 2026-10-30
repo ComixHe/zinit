@@ -186,7 +186,7 @@ pub fn appendInt(buf: []u8, at: usize, value: u64, base: Base) usize {
 }
 
 // kcov-exclude-tests (everything below is test-only).
-test "put renders strings, decimals and hex, and truncates rather than overruns" {
+test "bufPrint renders strings, decimals and hex, and truncates rather than overruns" {
     // The expectation comes from std's formatter, so the two are cross-checked.
     var expected_buf: [16]u8 = undefined;
     const expected = try std.mem.print(&expected_buf, "{s} {d} {x}", .{ "a", 42, 255 });
@@ -196,6 +196,13 @@ test "put renders strings, decimals and hex, and truncates rather than overruns"
 
     var tiny: [2]u8 = undefined;
     try std.testing.expectEqualStrings("a ", bufPrint(&tiny, "{s} {d}", .{ "a", 42 }));
+
+    var zero_buf: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("0", bufPrint(&zero_buf, "{d}", .{0}));
+
+    // A number cut mid-way keeps the leading digits, in order.
+    var cut: [3]u8 = undefined;
+    try std.testing.expectEqualStrings("123", bufPrint(&cut, "{d}", .{12345}));
 
     // `{e}` is the errno's short name, so no caller needs its own appender.
     var errno_buf: [16]u8 = undefined;

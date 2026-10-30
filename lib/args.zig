@@ -639,6 +639,65 @@ test "-t is parsed, and the first non-option needs no --" {
     }));
 }
 
+test "an explicit option overrides an invalid environment value" {
+    const env = [_:null]?[*:0]const u8{
+        "ZINIT_LOG_LEVEL=not-a-level",
+        "ZINIT_SHUTDOWN_TIMEOUT=not-seconds",
+    };
+    const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
+
+    const argv = [_:null]?[*:0]const u8{ "zinit", "-t", "5", "--log-level", "warn", "--", "true" };
+    const args = switch (try Args.parse(.{ .args = .{ .vector = asVector(&argv) }, .environ = environ })) {
+        .run => |a| a,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expectEqual(std.log.Level.warn, args.log_level);
+    try std.testing.expectEqual(5 * std.time.ns_per_s, args.shutdown_timeout_ns);
+}
+
+test "a missing option value and a repeated -p are rejected" {
+    const env = [_:null]?[*:0]const u8{};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
+
+    const missing_log_level = [_:null]?[*:0]const u8{ "zinit", "--log-level" };
+    const missing_timeout = [_:null]?[*:0]const u8{ "zinit", "-t" };
+    const missing_signal = [_:null]?[*:0]const u8{ "zinit", "-p" };
+    const missing_rewrite = [_:null]?[*:0]const u8{ "zinit", "-r" };
+    const missing_exit = [_:null]?[*:0]const u8{ "zinit", "-e" };
+
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&missing_log_level) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&missing_timeout) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&missing_signal) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidRewrite, Args.parse(.{
+        .args = .{ .vector = asVector(&missing_rewrite) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidExitCode, Args.parse(.{
+        .args = .{ .vector = asVector(&missing_exit) },
+        .environ = environ,
+    }));
+
+    const repeated = [_:null]?[*:0]const u8{ "zinit", "-p", "TERM", "-p", "INT", "--", "true" };
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&repeated) },
+        .environ = environ,
+    }));
+}
+
 test "help and version together are a usage error" {
     const env = [_:null]?[*:0]const u8{};
     const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
@@ -758,10 +817,15 @@ test "Args.parse never panics on arbitrary argv and environment" {
 
             vector[count] = null;
 
-            _ = Args.parse(.{
+            const action = Args.parse(.{
                 .args = .{ .vector = asVector(vector[0..count :null]) },
                 .environ = environ,
-            }) catch {};
+            }) catch return;
+
+            switch (action) {
+                .run => |parsed| try std.testing.expect(parsed.argv[0] != null),
+                .help, .version => {},
+            }
         }
     };
 
@@ -778,6 +842,10 @@ test "Args.parse never panics on arbitrary argv and environment" {
             "\x0d\x00\x00\x00" ++ "-e\x00143\x00-e\x00130",
             "\x08\x00\x00\x00" ++ "-s\x00-n\x00-g",
             "\x0c\x00\x00\x00" ++ "--\x00/bin/true",
+            "\x11\x00\x00\x00" ++ "-t\x005\x00--\x00/bin/true",
+            "\x0f\x00\x00\x00" ++ "-s\x00--\x00/bin/true",
+            "\x18\x00\x00\x00" ++ "-r\x00TERM:INT\x00--\x00/bin/true",
+            "\x1d\x00\x00\x00" ++ "--log-level\x00info\x00--\x00/bin/true",
             "\x11\x00\x00\x00" ++ "ZINIT_SUBREAPER=1",
             "\x16\x00\x00\x00" ++ "ZINIT_TRACING_CHILD=ON",
             "\x15\x00\x00\x00" ++ "ZINIT_LOG_LEVEL=debug",

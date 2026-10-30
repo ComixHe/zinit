@@ -222,6 +222,7 @@ test "Map.apply maps, drops or passes a signal through" {
     try std.testing.expectEqual(9, Map.apply(&map, 9));
     try map.set(2, 0);
     try std.testing.expectEqual(0, Map.apply(&map, 2));
+    try std.testing.expectEqual(2, Map.apply(&map, 15));
 }
 
 test "Map stays acyclic and atomic over arbitrary rewrite sequences" {
