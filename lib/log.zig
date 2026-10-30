@@ -59,6 +59,8 @@ fn aboveCeiling(comptime level: std.log.Level) bool {
 }
 
 fn emit(level: std.log.Level, msg: []const u8) void {
+    if (state.sink < 0) return; // disabled after a terminal error
+
     const prefix: []const u8 = if (state.color) switch (level) {
         .err => "\x1b[31m[zinit] ERROR:\x1b[0m ",
         .warn => "\x1b[33m[zinit] WARN:\x1b[0m ",
@@ -77,7 +79,11 @@ fn emit(level: std.log.Level, msg: []const u8) void {
     buf[text.len] = '\n';
     // Synchronous by design: a stalled sink can delay this call. Reaping,
     // forwarding and shutdown share the thread, so this is a known limitation.
-    io.writeAll(state.sink, buf[0 .. text.len + 1]);
+    // A broken pipe or a hung-up terminal never recovers, and every retry raises
+    // another SIGPIPE, other errnos may be transient and are retried next line.
+    if (io.writeAll(state.sink, buf[0 .. text.len + 1])) |errno| {
+        if (errno == .PIPE or errno == .IO) state.sink = -1;
+    }
 }
 
 fn print(comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
@@ -257,4 +263,63 @@ test "a clean orphan exit is routine, not a line at info" {
         for ([_][]const u8{ "DEBUG:", "orphaned", "52", "code 0" }) |token|
             try std.testing.expect(std.mem.find(u8, clean, token) != null);
     }
+}
+
+test "a broken sink is disabled after EPIPE, and its SIGPIPE is consumed" {
+    if (comptime @backingInt(config.max_log_level) < @backingInt(std.log.Level.warn))
+        return error.SkipZigTest;
+
+    var pipe_fds: [2]std.os.linux.fd_t = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        io.syscallErrno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })),
+    );
+
+    io.closeQuietly(pipe_fds[0]);
+
+    var blocked: std.os.linux.sigset_t = std.os.linux.sigemptyset();
+    std.os.linux.sigaddset(&blocked, std.os.linux.SIG.PIPE);
+    var previous: std.os.linux.sigset_t = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        io.syscallErrno(std.os.linux.sigprocmask(std.os.linux.SIG.BLOCK, &blocked, &previous)),
+    );
+    defer _ = std.os.linux.sigprocmask(std.os.linux.SIG.SETMASK, &previous, null);
+    defer drainPending(&blocked);
+
+    try init(pipe_fds[1]);
+    defer {
+        deinit();
+        io.closeQuietly(pipe_fds[1]);
+    }
+
+    warn("first line", .{});
+    try std.testing.expect(state.sink < 0);
+
+    warn("second line", .{});
+    try std.testing.expect(state.sink < 0);
+
+    const timeout = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+    var info: std.os.linux.siginfo_t = undefined;
+    const pending = std.os.linux.syscall4(
+        .rt_sigtimedwait,
+        @intFromPtr(&blocked),
+        @intFromPtr(&info),
+        @intFromPtr(&timeout),
+        std.os.linux.NSIG / 8,
+    );
+
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, io.syscallErrno(pending));
+}
+
+fn drainPending(set: *const std.os.linux.sigset_t) void {
+    const timeout = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+    var info: std.os.linux.siginfo_t = undefined;
+    _ = std.os.linux.syscall4(
+        .rt_sigtimedwait,
+        @intFromPtr(set),
+        @intFromPtr(&info),
+        @intFromPtr(&timeout),
+        std.os.linux.NSIG / 8,
+    );
 }

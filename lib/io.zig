@@ -26,22 +26,22 @@ noinline fn sharedSyscallErrno(rc: usize) std.os.linux.E {
     return std.os.linux.errno(rc);
 }
 
-pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) void {
+/// Returns the errno that stopped the write, or null when every byte was written.
+pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const rc = std.os.linux.write(fd, bytes.ptr + offset, bytes.len - offset);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
-                if (rc == 0) {
-                    return;
-                }
-
+                if (rc == 0) return null;
                 offset += rc;
             },
             .INTR => {},
-            else => return, // we can't do anything, just return
+            else => |errno| return errno,
         }
     }
+
+    return null;
 }
 
 pub fn closeQuietly(fd: std.os.linux.fd_t) void {

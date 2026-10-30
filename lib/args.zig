@@ -133,11 +133,11 @@ pub const Args = struct {
             break :blk std.fmt.comptimePrint(help_text, .{logLevelText(log.default_level)});
         };
 
-        writeAll(fd, text);
+        _ = writeAll(fd, text);
     }
 
     pub fn printVersion(fd: std.os.linux.fd_t) void {
-        writeAll(fd, config.version ++ "\n");
+        _ = writeAll(fd, config.version ++ "\n");
     }
 
     fn reject(err: ConfigError, problem: []const u8, token: []const u8) ConfigError {

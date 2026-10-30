@@ -355,20 +355,9 @@ pub const State = struct {
 
     fn forwardSignal(self: *State, event: signal.Event) void {
         const signo = event.signo;
-        // signalfd only reports numbers below NSIG, which is what the rewrite
-        // table is sized for; an out-of-range value would be a kernel ABI bug.
+
         checks.check(signo > 0 and signo < std.os.linux.NSIG);
 
-        // Giving up the terminal queues one HUP and one CONT for us, and the kernel is the
-        // one who sent them: no sender. A HUP from a user is a different event and must
-        // reach the child like any other, even if it is the first one we see.
-        //
-        // `SI_KERNEL` is the generic kernel code, not `code > 0`: positive
-        // signal-specific codes belong to other signals. It also cannot tell the
-        // detach-queued pair from a later kernel HUP/CONT, since neither names a
-        // sender. These one-shot flags therefore swallow the first kernel HUP/CONT
-        // in the detach-to-spawn window; a genuine one arriving there would be
-        // mistaken for the queued pair.
         const from_kernel = event.code == signal.SI.KERNEL;
 
         if (from_kernel and self.ignore_hup and signo == @backingInt(Sig.HUP)) {
@@ -435,7 +424,11 @@ pub const State = struct {
 
             for (events) |event| {
                 if (event.signo != @backingInt(Sig.CHLD)) {
-                    @branchHint(.unpredictable);
+                    if (isOwnBrokenWrite(event)) {
+                        @branchHint(.unlikely);
+                        continue;
+                    }
+
                     log.debug("receive signal: {d}", .{event.signo});
                     self.forwardSignal(event);
                 }
@@ -443,7 +436,7 @@ pub const State = struct {
 
             if (budget == 0) break;
             const got = source.waitBatch(batch[0..@min(budget, batch.len)], 0) catch {
-                @branchHint(.cold);
+                @branchHint(.unlikely);
                 return self.abortSupervision();
             };
 
@@ -454,7 +447,8 @@ pub const State = struct {
         return self.reapAndReport();
     }
 
-    fn reapAndReport(self: *State) ?Outcome {
+    // One call per reap round; outlined, the signal loop keeps a smaller frame.
+    noinline fn reapAndReport(self: *State) ?Outcome {
         const reap = drain(
             self.child.pid,
             self.policy.expected_exit,
@@ -593,6 +587,16 @@ fn applyMainEvent(result: *DrainResult, event: MainEvent) void {
         },
         .exited => |code| result.main = .{ .exited = code },
     }
+}
+
+/// A failed write to a broken log sink raises SIGPIPE for this process: the
+/// kernel reports it as `SI_USER` naming ourselves. It is not a signal for the
+/// workload, and logging about it would only raise another, so the caller drops
+/// it silently. An external SIGPIPE names its sender and is still forwarded.
+fn isOwnBrokenWrite(event: signal.Event) bool {
+    return event.signo == @backingInt(Sig.PIPE) and
+        event.code == signal.SI.USER and
+        event.sender == std.os.linux.getpid();
 }
 
 fn shouldStopSelf(main_stopped: bool, more: bool) bool {

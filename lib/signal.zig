@@ -26,6 +26,7 @@ pub const Event = struct {
     signo: u32,
     code: i32,
     value: u64,
+    sender: std.os.linux.pid_t = 0,
 };
 
 const standard_signal_max: u32 = std.os.linux.sigrtmin() - 1;

@@ -220,6 +220,7 @@ pub const Source = struct {
                 .signo = raw_info.signo,
                 .code = raw_info.code,
                 .value = raw_info.ptr,
+                .sender = @intCast(raw_info.pid),
             };
         }
 
