@@ -27,11 +27,19 @@ const SignalConfig = signalfd.Config;
 
 const signal_quota: usize = 32;
 
+/// One reap round is capped too: a stream of exits must not postpone the
+/// shutdown deadline, so the supervisor drains the rest on the next iteration.
+const reap_quota: usize = 32;
+
 /// Signals are dequeued in batches of at most this many at a time.
 const signal_batch: usize = signalfd.Source.batch_max;
 
 /// A queued signal's value: `kill` drops it, and for a realtime signal it is the content.
 const Payload = struct { value: u64 };
+
+comptime {
+    std.debug.assert(signal_batch <= signal_quota);
+}
 
 /// The sender the child sees is zinit: the original pid may mean nothing, or
 /// someone else, in a child namespace.
@@ -64,6 +72,8 @@ const MainObservation = union(enum) {
 const DrainResult = struct {
     main: MainObservation = .unchanged,
     no_children: bool,
+    /// The quota was reached before the kernel ran out of reapable children.
+    more: bool = false,
 };
 
 pub const Policy = struct {
@@ -119,6 +129,12 @@ pub const State = struct {
     group_number_only: bool = false,
     /// Once the main child is reaped it can receive nothing, and its number is free again.
     child_reaped: bool = false,
+    /// Set when a reap round stopped at the quota, the next round must not wait
+    /// for a SIGCHLD the kernel may already have coalesced.
+    reap_pending: bool = false,
+    /// The main child's last reported stop state, carried across reap rounds so
+    /// a quota boundary cannot separate a stop from a continue that cancels it.
+    main_stopped: bool = false,
     policy: Policy,
     shutdown: ?ShutdownState = null,
     ignore_hup: bool = false,
@@ -153,6 +169,10 @@ pub const State = struct {
         const shutdown = if (self.shutdown) |*s| s else return .infinite;
         const now = monotonicNs() catch return .clock_failed;
         return .{ .remaining_ms = shutdown.remainingMs(now) };
+    }
+
+    pub fn reapPending(self: *const State) bool {
+        return self.reap_pending;
     }
 
     pub fn onTimeout(self: *State) ?Outcome {
@@ -435,16 +455,32 @@ pub const State = struct {
     }
 
     fn reapAndReport(self: *State) ?Outcome {
-        const reap = drain(self.child.pid, self.policy.expected_exit, &self.child_reaped) catch {
+        const reap = drain(
+            self.child.pid,
+            self.policy.expected_exit,
+            &self.child_reaped,
+            reap_quota,
+        ) catch {
             @branchHint(.unlikely);
             return self.abortSupervision();
         };
 
-        // A stop is mirrored only after the kernel reports it. A stop and a continue
-        // observed in the same round cancel out: the child is running by the time we
-        // would stop, and stopping then would strand zinit with nothing to wait for.
-        if (shouldStopSelf(reap)) {
+        // Optimistic: even with no zombie left right now, the next
+        // round must not wait on a SIGCHLD that may already be coalesced with
+        // the one this round was handling.
+        self.reap_pending = reap.more;
+        self.main_stopped = switch (reap.main) {
+            .stopped => true,
+            .continued, .exited => false,
+            .unchanged => self.main_stopped,
+        };
+
+        // A stop is mirrored only after the kernel reports it, and only once the
+        // round is complete: a continue queued behind the reap quota must cancel
+        // it first. Stopping early would strand zinit with nothing to wait for.
+        if (shouldStopSelf(self.main_stopped, reap.more)) {
             log.debug("child is stopped; stopping with it", .{});
+            self.main_stopped = false;
             _ = std.os.linux.kill(std.os.linux.getpid(), Sig.STOP);
         }
 
@@ -467,7 +503,7 @@ pub const State = struct {
     pub fn abortSupervision(self: *State) Outcome {
         _ = self.signalProcessGroup(@backingInt(Sig.KILL), null);
         _ = self.signalChild(@backingInt(Sig.KILL), null);
-        _ = drain(self.child.pid, .empty, &self.child_reaped) catch {};
+        _ = drain(self.child.pid, .empty, &self.child_reaped, reap_quota) catch {};
         return .failed;
     }
 
@@ -509,7 +545,7 @@ pub const State = struct {
 
     fn finishShutdown(self: *State, exit_code: u8) u8 {
         _ = self.signalProcessGroup(@backingInt(Sig.KILL), null);
-        _ = drain(self.child.pid, .empty, &self.child_reaped) catch {};
+        _ = drain(self.child.pid, .empty, &self.child_reaped, reap_quota) catch {};
 
         return exit_code;
     }
@@ -559,25 +595,30 @@ fn applyMainEvent(result: *DrainResult, event: MainEvent) void {
     }
 }
 
-fn shouldStopSelf(reap: DrainResult) bool {
-    return reap.main == .stopped;
+fn shouldStopSelf(main_stopped: bool, more: bool) bool {
+    return !more and main_stopped;
 }
 
 fn drain(
     child_pid: std.os.linux.pid_t,
     expected_exit: ExitCodeSet,
     main_reaped: *bool,
+    quota: usize,
 ) errors.SysCallError!DrainResult {
+    checks.check(quota > 0);
+
     var result: DrainResult = .{ .no_children = false };
     var status: i32 = 0;
+    var reaped: usize = 0;
 
-    while (true) {
+    while (reaped < quota) {
         const flags = std.os.linux.W.NOHANG | std.os.linux.W.UNTRACED | std.os.linux.W.CONTINUED;
         const rc = std.os.linux.waitpid(-1, &status, flags);
         if (rc == 0) return result; // children remain
 
         switch (io.syscallErrno(rc)) {
             .SUCCESS => {
+                reaped += 1;
                 const pid: std.os.linux.pid_t = @intCast(rc);
                 const wait_status = WaitStatus.fromRaw(status);
                 const is_main = !main_reaped.* and pid == child_pid;
@@ -622,6 +663,13 @@ fn drain(
             },
         }
     }
+
+    // The quota may be hit with no further reapable child, in which case the
+    // next call sees ECHILD. Reporting `more` either way is deliberate: the
+    // supervisor must come back without waiting for a new SIGCHLD, which the
+    // kernel may have coalesced into the one already being handled.
+    result.more = true;
+    return result;
 }
 
 fn monotonicNs() errors.SysCallError!u64 {
@@ -679,31 +727,31 @@ test "the grace deadline is absolute, and a clamped wait does not end it" {
 
 test "the main-event reducer follows order, and exit is terminal" {
     const idle: DrainResult = .{ .no_children = false };
-    try std.testing.expect(!shouldStopSelf(idle));
+    try std.testing.expect(!shouldStopSelf(idle.main == .stopped, idle.more));
 
     // STOP -> CONT.
     var stop_cont: DrainResult = .{ .no_children = false };
     applyMainEvent(&stop_cont, .stopped);
     try std.testing.expectEqual(MainObservation.stopped, stop_cont.main);
-    try std.testing.expect(shouldStopSelf(stop_cont));
+    try std.testing.expect(shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
     applyMainEvent(&stop_cont, .continued);
     try std.testing.expectEqual(MainObservation.continued, stop_cont.main);
-    try std.testing.expect(!shouldStopSelf(stop_cont));
+    try std.testing.expect(!shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
 
     // CONT -> STOP.
     applyMainEvent(&stop_cont, .stopped);
     try std.testing.expectEqual(MainObservation.stopped, stop_cont.main);
-    try std.testing.expect(shouldStopSelf(stop_cont));
+    try std.testing.expect(shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
 
     // STOP -> CONT -> STOP
     applyMainEvent(&stop_cont, .continued);
     applyMainEvent(&stop_cont, .stopped);
-    try std.testing.expect(shouldStopSelf(stop_cont));
+    try std.testing.expect(shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
 
     // STOP -> EXIT
     applyMainEvent(&stop_cont, .{ .exited = 137 });
     try std.testing.expectEqual(MainObservation{ .exited = 137 }, stop_cont.main);
-    try std.testing.expect(!shouldStopSelf(stop_cont));
+    try std.testing.expect(!shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
 
     // S stray stop after an exit cannot undo it.
     applyMainEvent(&stop_cont, .stopped);
@@ -714,7 +762,12 @@ test "the main-event reducer follows order, and exit is terminal" {
     applyMainEvent(&direct, .stopped);
     applyMainEvent(&direct, .{ .exited = 9 });
     try std.testing.expectEqual(MainObservation{ .exited = 9 }, direct.main);
-    try std.testing.expect(!shouldStopSelf(direct));
+    try std.testing.expect(!shouldStopSelf(direct.main == .stopped, direct.more));
+
+    // A round that hit the reap quota defers the decision: a continue behind
+    // the quota must still be able to cancel the stop.
+    try std.testing.expect(!shouldStopSelf(true, true));
+    try std.testing.expect(shouldStopSelf(true, false));
 }
 
 const integration_tests = struct {
@@ -756,11 +809,58 @@ const integration_tests = struct {
         try waitForWaitid(test_io, pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
 
         var reaped = false;
-        const reap = try drain(pid, .empty, &reaped);
+        const reap = try drain(pid, .empty, &reaped, reap_quota);
 
         try std.testing.expectEqual(MainObservation{ .exited = 137 }, reap.main);
         try std.testing.expect(reaped);
-        try std.testing.expect(!shouldStopSelf(reap));
+        try std.testing.expect(!shouldStopSelf(reap.main == .stopped, reap.more));
+    }
+
+    test "integration: a reap round stops at the quota and resumes without a signal" {
+        const test_io = std.testing.io;
+        if (underTracer(test_io)) return error.SkipZigTest;
+
+        const signal_config = try SignalConfig.install(&[_]Sig{});
+        defer _ = signal_config.restoreParent();
+
+        var children: [3]supervisor.ProcessHandle = undefined;
+        var count: usize = 0;
+        defer {
+            for (children[0..count]) |*child| {
+                child.close();
+                killAndReap(test_io, child.pid);
+            }
+        }
+
+        for (&children) |*child| {
+            child.* = try spawnSleeper(&signal_config);
+            count += 1;
+        }
+
+        _ = std.os.linux.kill(children[0].pid, Sig.KILL);
+        try waitForWaitid(test_io, children[0].pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
+
+        var main_reaped = false;
+        var reap = try drain(children[0].pid, .empty, &main_reaped, 1);
+        try std.testing.expect(reap.more);
+        try std.testing.expect(!reap.no_children);
+        try std.testing.expect(main_reaped);
+
+        for (children[1..count]) |child| {
+            _ = std.os.linux.kill(child.pid, Sig.KILL);
+            try waitForWaitid(test_io, child.pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
+        }
+
+        var rounds: usize = 0;
+        while (reap.more) {
+            rounds += 1;
+            try std.testing.expect(rounds <= count);
+            reap = try drain(children[0].pid, .empty, &main_reaped, 1);
+        }
+
+        try std.testing.expect(reap.no_children);
+        try std.testing.expect(main_reaped);
+        try std.testing.expectEqual(count, rounds);
     }
 
     /// Read the kernel's state letter for a workload without consuming its wait

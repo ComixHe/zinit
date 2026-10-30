@@ -115,25 +115,24 @@ pub fn supervise(
 
     var batch: [signalfd.Source.batch_max]signal.Event = undefined;
     while (true) {
-        const wait = state.nextWait();
-        var got: usize = 0;
-        switch (wait) {
-            .clock_failed => {},
-            .infinite, .remaining_ms => {
-                const ms = if (wait == .infinite) -1 else wait.remaining_ms;
-                if (ms != 0) {
-                    got = source.waitBatch(&batch, ms) catch
-                        return failSupervision(&state);
+        if (state.reapPending()) {
+            if (state.handleSignalEvent(&source, &.{})) |outcome| return outcome;
+        } else {
+            const timeout_ms: ?i32 = switch (state.nextWait()) {
+                .infinite => -1,
+                .remaining_ms => |remaining| if (remaining != 0) remaining else null,
+                .clock_failed => null,
+            };
+
+            if (timeout_ms) |timeout| {
+                const got = source.waitBatch(&batch, timeout) catch return failSupervision(&state);
+                if (got != 0) {
+                    if (state.handleSignalEvent(&source, batch[0..got])) |outcome| return outcome;
                 }
-            },
+            }
         }
 
-        if (got == 0) {
-            if (state.onTimeout()) |outcome| return outcome;
-            continue;
-        }
-
-        if (state.handleSignalEvent(&source, batch[0..got])) |outcome| return outcome;
+        if (state.onTimeout()) |outcome| return outcome;
     }
 }
 
