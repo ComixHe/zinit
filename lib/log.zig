@@ -35,13 +35,15 @@ pub fn init(sink_fd: std.os.linux.fd_t) !void {
         return error.InvalidSink;
     }
 
-    state.sink = sink_fd;
-    state.color = tty.isTty(state.sink);
+    state = .{
+        .sink = sink_fd,
+        .level = state.level,
+        .color = tty.isTty(sink_fd),
+    };
 }
 
 pub fn deinit() void {
-    state.sink = -1;
-    state.color = false;
+    state = .{ .level = state.level };
 }
 
 pub fn setRuntimeLevel(level: std.log.Level) void {
@@ -73,6 +75,8 @@ fn emit(level: std.log.Level, msg: []const u8) void {
     // One byte is kept back for the newline
     const text = fmt.bufPrint(buf[0 .. buf.len - 1], "{s}{s}", .{ prefix, msg });
     buf[text.len] = '\n';
+    // Synchronous by design: a stalled sink can delay this call. Reaping,
+    // forwarding and shutdown share the thread, so this is a known limitation.
     io.writeAll(state.sink, buf[0 .. text.len + 1]);
 }
 
