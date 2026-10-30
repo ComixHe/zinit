@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const io = @import("io.zig");
+const checks = @import("checks.zig");
 const log = @import("log.zig");
 const signal = @import("signal.zig");
 const SysCallError = @import("errors.zig").SysCallError;
@@ -19,6 +20,8 @@ pub const Config = struct {
     chld_action: std.os.linux.Sigaction,
 
     /// Installs the process-wide mask and dispositions the supervisor relies on.
+    /// On failure the process signal state may be partly changed: the caller must
+    /// not continue to run the workload (main exits).
     pub fn install(comptime unblocked: []const signal.Sig) !Config {
         const set = comptime mask: {
             var result = std.os.linux.sigfillset();
@@ -142,7 +145,8 @@ pub const Source = struct {
     }
 
     pub fn waitBatch(self: *Source, out: []signal.Event, timeout_ms: i32) SysCallError!usize {
-        std.debug.assert(out.len > 0 and out.len <= batch_max);
+        checks.check(out.len > 0);
+        checks.check(out.len <= batch_max);
 
         if (timeout_ms != 0) {
             var pfd = [_]std.os.linux.pollfd{.{
@@ -191,6 +195,9 @@ pub const Source = struct {
         }
 
         const got = rc / @sizeOf(std.os.linux.signalfd_siginfo);
+        // The kernel writes whole records and never more than the buffer holds.
+        checks.check(rc % @sizeOf(std.os.linux.signalfd_siginfo) == 0);
+        checks.check(got <= out.len);
         for (raw[0..got], out[0..got]) |raw_info, *event| {
             event.* = .{
                 .signo = raw_info.signo,

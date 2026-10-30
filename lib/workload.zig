@@ -12,6 +12,7 @@ const config = @import("config");
 const errors = @import("errors.zig");
 const log = @import("log.zig");
 const io = @import("io.zig");
+const checks = @import("checks.zig");
 const wait = @import("wait.zig");
 const signal = @import("signal.zig");
 const rewrite = @import("rewrite.zig");
@@ -123,6 +124,8 @@ pub const State = struct {
     ignore_cont: bool = false,
 
     pub fn init(policy: Policy, spawned: ProcessHandle) State {
+        checks.check(spawned.pid > 0);
+        if (spawned.pidfd) |fd| checks.check(fd >= 0);
         return .{
             .child = spawned,
             .policy = policy,
@@ -309,6 +312,9 @@ pub const State = struct {
 
     fn forwardSignal(self: *State, event: signal.Event) void {
         const signo = event.signo;
+        // signalfd only reports numbers below NSIG, which is what the rewrite
+        // table is sized for; an out-of-range value would be a kernel ABI bug.
+        checks.check(signo > 0 and signo < std.os.linux.NSIG);
 
         // Giving up the terminal queues one HUP and one CONT for us, and the kernel is the
         // one who sent them: no sender. A HUP from a user is a different event and must
@@ -332,6 +338,9 @@ pub const State = struct {
             return;
         }
 
+        // The assert above keeps `signo` inside the table. The fallback stays for
+        // ReleaseSmall, where asserts are compiled out: a wrong number would only
+        // mean the signal is forwarded unrewritten.
         const signal_to_send = (if (self.policy.rewrites) |m| m.apply(signo) catch null else null) orelse signo;
         if (signal_to_send == 0) {
             log.debug("dropping signal {d}", .{signo});
@@ -358,6 +367,8 @@ pub const State = struct {
     }
 
     pub fn handleSignalEvent(self: *State, source: *signalfd.Source, first: []const signal.Event) ?Outcome {
+        // The caller hands over at most one signalfd batch.
+        checks.check(first.len <= signal_batch);
         var batch: [signal_batch]signal.Event = undefined;
         var events = first;
         var budget: usize = signal_quota;
