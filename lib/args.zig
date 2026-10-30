@@ -84,6 +84,22 @@ pub const Args = struct {
         version,
     };
 
+    /// What the option scan collected. Cross-option checks and environment
+    /// merging happen in `resolve`, so `scan` stays a pure argv pass.
+    const Scanned = struct {
+        rewrite_map: ?rewrite.Map = null,
+        log_level: ?std.log.Level = null,
+        pdeath_signal: ?u32 = null,
+        expected_exit: ExitCodeSet = .empty,
+        shutdown_timeout_s: ?u64 = null,
+        child_start: ?usize = null,
+        subreaper: bool = false,
+        new_session: bool = false,
+        forward_group: bool = false,
+        help: bool = false,
+        version: bool = false,
+    };
+
     // Verbatim help output: breaking a line here would change what --help prints.
     const help_text =
         \\zinit - A tiny init for linux containers.
@@ -206,20 +222,10 @@ pub const Args = struct {
         return level;
     }
 
-    pub fn parse(init: std.process.Init.Minimal) !Action {
-        const vector = init.args.vector;
-
-        var rewrite_map: ?rewrite.Map = null;
-        var log_level_opt: ?std.log.Level = null;
-        var pdeath_signal: ?u32 = null;
-        var subreaper_flag = false;
-        var forward_group = false;
-        var shutdown_timeout_s: ?u64 = null;
-        var expected_exit: ExitCodeSet = .empty;
-        var new_session = false;
-        var has_help = false;
-        var has_version = false;
-        var child_start: ?usize = null;
+    /// Walks argv once and records the options. Each value is validated where
+    /// it is parsed; the combination is checked by `resolve`.
+    fn scan(vector: []const [*:0]const u8) ConfigError!Scanned {
+        var options: Scanned = .{};
 
         var i: usize = 1;
         while (i < vector.len) : (i += 1) {
@@ -227,7 +233,7 @@ pub const Args = struct {
 
             if (str.eql(arg, "--")) {
                 i += 1;
-                if (i < vector.len) child_start = i;
+                if (i < vector.len) options.child_start = i;
                 break;
             }
 
@@ -237,19 +243,19 @@ pub const Args = struct {
                     return reject(ConfigError.InvalidParams, "unknown option", arg);
                 }
 
-                child_start = i;
+                options.child_start = i;
                 break;
             };
 
             switch (option) {
-                .help => has_help = true,
-                .version => has_version = true,
-                .new_session => new_session = true,
-                .subreaper => subreaper_flag = true,
-                .forward_group => forward_group = true,
+                .help => options.help = true,
+                .version => options.version = true,
+                .new_session => options.new_session = true,
+                .subreaper => options.subreaper = true,
+                .forward_group => options.forward_group = true,
                 .shutdown_timeout => {
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    shutdown_timeout_s = str.parseDecimal(u64, v) catch
+                    options.shutdown_timeout_s = str.parseDecimal(u64, v) catch
                         return reject(
                             ConfigError.InvalidParams,
                             "invalid --shutdown-timeout value",
@@ -258,22 +264,22 @@ pub const Args = struct {
                 },
                 .log_level => {
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    log_level_opt = parseLogLevel(v) orelse
+                    options.log_level = parseLogLevel(v) orelse
                         return reject(ConfigError.InvalidParams, "unknown log level", v);
                 },
                 .signal => {
-                    if (pdeath_signal != null) {
+                    if (options.pdeath_signal != null) {
                         return reject(ConfigError.InvalidParams, "duplicate option", arg);
                     }
 
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    pdeath_signal = signal.parse(v) catch |e|
+                    options.pdeath_signal = signal.parse(v) catch |e|
                         return reject(e, "unknown signal", v);
                 },
                 .rewrite => {
-                    if (rewrite_map == null) rewrite_map = rewrite.Map.init();
+                    if (options.rewrite_map == null) options.rewrite_map = rewrite.Map.init();
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidRewrite);
-                    rewrite_map.?.parse(v) catch |e|
+                    options.rewrite_map.?.parse(v) catch |e|
                         return reject(e, "invalid --rewrite value", v);
                 },
                 .expect_exit => {
@@ -285,32 +291,37 @@ pub const Args = struct {
                             v,
                         );
 
-                    expected_exit.set(code);
+                    options.expected_exit.set(code);
                 },
             }
         }
 
-        if (has_help and has_version) {
+        return options;
+    }
+
+    /// Merges the environment, validates the combination and builds the action.
+    fn resolve(init: std.process.Init.Minimal, options: Scanned) ConfigError!Action {
+        if (options.help and options.version) {
             @branchHint(.unlikely);
             log.err("cannot combine: -h/--help and -V/--version", .{});
             return ConfigError.InvalidParams;
         }
 
-        if (has_help) return .help;
+        if (options.help) return .help;
 
-        if (has_version) return .version;
+        if (options.version) return .version;
 
-        const start = child_start orelse {
+        const start = options.child_start orelse {
             @branchHint(.unlikely);
             log.err("no command to run", .{});
             return ConfigError.MissingCommand;
         };
 
-        const log_level = try resolveLogLevel(init, log_level_opt);
+        const log_level = try resolveLogLevel(init, options.log_level);
 
         const shutdown_timeout_s_final = shutdownTimeoutFrom(
             init.environ,
-            shutdown_timeout_s,
+            options.shutdown_timeout_s,
         ) orelse {
             @branchHint(.unlikely);
             log.err("invalid ZINIT_SHUTDOWN_TIMEOUT value: expected seconds", .{});
@@ -323,28 +334,31 @@ pub const Args = struct {
             return ConfigError.InvalidParams;
         }
 
-        const subreaper = subreaper_flag or init.environ.getPosix("ZINIT_SUBREAPER") != null;
+        const subreaper = options.subreaper or init.environ.getPosix("ZINIT_SUBREAPER") != null;
         const tracing_child = tracingChildFrom(init.environ);
 
-        if (new_session) applySessionRewrites(&rewrite_map);
+        var rewrite_map = options.rewrite_map;
+        if (options.new_session) applySessionRewrites(&rewrite_map);
 
         const argv_base: [*:null]const ?[*:0]const u8 = @ptrCast(init.args.vector.ptr);
 
-        return .{
-            .run = .{
-                .log_level = log_level,
-                .pdeath_signal = pdeath_signal,
-                .rewrites = rewrite_map,
-                .expected_exit = expected_exit,
-                .subreaper = subreaper,
-                .new_session = new_session,
-                .forward_group = forward_group,
-                .tracing_child = tracing_child,
-                .shutdown_timeout_ns = shutdown_timeout_s_final * std.time.ns_per_s,
-                .argv = argv_base + start,
-                .envs = init.environ.block.slice,
-            },
-        };
+        return .{ .run = .{
+            .log_level = log_level,
+            .pdeath_signal = options.pdeath_signal,
+            .rewrites = rewrite_map,
+            .expected_exit = options.expected_exit,
+            .subreaper = subreaper,
+            .new_session = options.new_session,
+            .forward_group = options.forward_group,
+            .tracing_child = tracing_child,
+            .shutdown_timeout_ns = shutdown_timeout_s_final * std.time.ns_per_s,
+            .argv = argv_base + start,
+            .envs = init.environ.block.slice,
+        } };
+    }
+
+    pub fn parse(init: std.process.Init.Minimal) !Action {
+        return resolve(init, try scan(init.args.vector));
     }
 };
 
