@@ -39,7 +39,12 @@ else
 fn minimalPanic(msg: []const u8, _: ?*std.lang.StackTrace, _: ?usize) noreturn {
     @branchHint(.cold);
     const prefix = "zinit panic: ";
-    const iov = [_]std.posix.iovec_const{ .{ .base = prefix, .len = prefix.len }, .{ .base = msg.ptr, .len = msg.len }, .{ .base = "\n", .len = 1 } };
+    const iov = [_]std.posix.iovec_const{
+        .{ .base = prefix, .len = prefix.len },
+        .{ .base = msg.ptr, .len = msg.len },
+        .{ .base = "\n", .len = 1 },
+    };
+
     _ = std.os.linux.writev(std.os.linux.STDERR_FILENO, &iov, 3);
     std.os.linux.exit(1);
 }

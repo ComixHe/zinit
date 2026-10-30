@@ -8,8 +8,8 @@ const std = @import("std");
 
 /// Byte search without `std.mem`'s vectorized `findScalarPos`: every needle here is
 /// one byte in a short string, not worth the SIMD machinery in binary size.
-/// Inlined because callers search for a literal, which turns the loop into a
-/// constant-length scan at each call site.
+/// Inlined because every caller passes a literal needle: the inlined copy folds
+/// the byte comparison to a constant instead of loading it from a parameter.
 pub inline fn indexOfByte(text: []const u8, byte: u8) ?usize {
     for (text, 0..) |b, i| {
         if (b == byte) return i;
