@@ -24,7 +24,10 @@ pub const ProcessHandle = workload.ProcessHandle;
 /// naming it through the module that starts the process.
 pub const SpawnSpec = child.SpawnSpec;
 
-pub fn spawn(spec: SpawnSpec, signal_config: *const SignalConfig) errors.SysCallError!ProcessHandle {
+pub fn spawn(
+    spec: SpawnSpec,
+    signal_config: *const SignalConfig,
+) errors.SysCallError!ProcessHandle {
     const self_pid = std.os.linux.getpid();
     const flags: u32 = @backingInt(Sig.CHLD) | std.os.linux.CLONE.PIDFD;
     var pidfd: std.os.linux.fd_t = -1;
@@ -79,7 +82,8 @@ pub fn setupSubreaper(subreaper: bool) errors.SysCallError!void {
         }
     } else if (std.os.linux.getpid() != 1) {
         log.warn(
-            "not PID 1 and not a subreaper: orphaned descendants will not be reaped here, pass -s/--subreaper to adopt them",
+            "not PID 1 and not a subreaper: orphaned descendants will not be reaped " ++
+                "here, pass -s/--subreaper to adopt them",
             .{},
         );
     }
@@ -88,7 +92,11 @@ pub fn setupSubreaper(subreaper: bool) errors.SysCallError!void {
 /// Runs the supervision loop. Consumes `spawned`: the handle is closed on return and
 /// its pidfd cleared, so the caller must not close it again or use the pidfd after
 /// this returns.
-pub fn supervise(policy: Policy, signal_config: *const SignalConfig, spawned: *ProcessHandle) Outcome {
+pub fn supervise(
+    policy: Policy,
+    signal_config: *const SignalConfig,
+    spawned: *ProcessHandle,
+) Outcome {
     defer spawned.close();
 
     var source = signalfd.Source.open(signal_config) catch {
@@ -107,15 +115,17 @@ pub fn supervise(policy: Policy, signal_config: *const SignalConfig, spawned: *P
 
     var batch: [signalfd.Source.batch_max]signal.Event = undefined;
     while (true) {
+        const wait = state.nextWait();
         var got: usize = 0;
-        if (state.deadline()) |timeout| {
-            if (timeout != 0) {
-                got = source.waitBatch(&batch, timeout) catch {
-                    @branchHint(.unlikely);
-                    _ = state.abortSupervision();
-                    return .failed;
-                };
-            }
+        switch (wait) {
+            .clock_failed => {},
+            .infinite, .remaining_ms => {
+                const ms = if (wait == .infinite) -1 else wait.remaining_ms;
+                if (ms != 0) {
+                    got = source.waitBatch(&batch, ms) catch
+                        return failSupervision(&state);
+                }
+            },
         }
 
         if (got == 0) {
@@ -125,4 +135,10 @@ pub fn supervise(policy: Policy, signal_config: *const SignalConfig, spawned: *P
 
         if (state.handleSignalEvent(&source, batch[0..got])) |outcome| return outcome;
     }
+}
+
+fn failSupervision(state: *workload.State) Outcome {
+    @branchHint(.unlikely);
+    _ = state.abortSupervision();
+    return .failed;
 }

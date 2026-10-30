@@ -33,7 +33,8 @@ const signal_batch: usize = signalfd.Source.batch_max;
 /// A queued signal's value: `kill` drops it, and for a realtime signal it is the content.
 const Payload = struct { value: u64 };
 
-/// The sender the child sees is zinit: the original pid may mean nothing, or someone else, in a child namespace.
+/// The sender the child sees is zinit: the original pid may mean nothing, or
+/// someone else, in a child namespace.
 fn queuedInfo(sig: u32, payload: Payload) std.os.linux.siginfo_t {
     var info = std.mem.zeroes(std.os.linux.siginfo_t);
     info.signo = @fromBackingInt(@intCast(sig));
@@ -123,6 +124,16 @@ pub const State = struct {
     ignore_hup: bool = false,
     ignore_cont: bool = false,
 
+    /// What the supervisor should wait for next.
+    pub const Wait = union(enum) {
+        /// No shutdown is in progress: block until a signal arrives.
+        infinite,
+        /// Milliseconds until the shutdown deadline; 0 means it has passed.
+        remaining_ms: i32,
+        /// The monotonic clock could not be read; `onTimeout` resolves it.
+        clock_failed,
+    };
+
     pub fn init(policy: Policy, spawned: ProcessHandle) State {
         checks.check(spawned.pid > 0);
         if (spawned.pidfd) |fd| checks.check(fd >= 0);
@@ -138,21 +149,21 @@ pub const State = struct {
         self.child.close();
     }
 
-    pub fn deadline(self: *const State) ?i32 {
-        const sd = if (self.shutdown) |*s| s else return -1;
-        const now = monotonicNs() catch return null;
-        return sd.remainingMs(now);
+    pub fn nextWait(self: *const State) Wait {
+        const shutdown = if (self.shutdown) |*s| s else return .infinite;
+        const now = monotonicNs() catch return .clock_failed;
+        return .{ .remaining_ms = shutdown.remainingMs(now) };
     }
 
     pub fn onTimeout(self: *State) ?Outcome {
-        const sd = if (self.shutdown) |*s| s else return null;
+        const shutdown = if (self.shutdown) |*s| s else return null;
         const now = monotonicNs() catch {
             @branchHint(.cold);
-            return .{ .exited = self.onClockFailure(sd) };
+            return .{ .exited = self.onClockFailure(shutdown) };
         };
 
-        if (sd.remainingMs(now) != 0) return null;
-        return .{ .exited = self.onShutdownTimeout(sd) };
+        if (shutdown.remainingMs(now) != 0) return null;
+        return .{ .exited = self.onShutdownTimeout(shutdown) };
     }
 
     fn sendPidfd(
@@ -166,9 +177,12 @@ pub const State = struct {
             const rc = std.os.linux.pidfd_send_signal(fd, target, &info, flags);
             return switch (io.syscallErrno(rc)) {
                 .INVAL, .PERM => |errno| blk: {
-                    log.debug("dropping queued value for signal {d}: pidfd_send_signal refused the siginfo ({e})", .{
-                        @backingInt(target), errno,
-                    });
+                    log.debug(
+                        "dropping queued value for signal {d}: pidfd_send_signal " ++
+                            "refused the siginfo ({e})",
+                        .{ @backingInt(target), errno },
+                    );
+
                     break :blk std.os.linux.pidfd_send_signal(fd, target, null, flags);
                 },
                 else => rc,
@@ -198,7 +212,13 @@ pub const State = struct {
     fn sendChildByNumber(self: *const State, target: Sig, payload: ?Payload) usize {
         if (payload) |p| {
             var info = queuedInfo(@intCast(@backingInt(target)), p);
-            const rc = std.os.linux.syscall3(.rt_sigqueueinfo, @intCast(self.child.pid), @backingInt(target), @intFromPtr(&info));
+            const rc = std.os.linux.syscall3(
+                .rt_sigqueueinfo,
+                @intCast(self.child.pid),
+                @backingInt(target),
+                @intFromPtr(&info),
+            );
+
             switch (io.syscallErrno(rc)) {
                 .NOSYS, .INVAL, .PERM => |errno| log.debug(
                     "dropping queued value for signal {d}: rt_sigqueueinfo unavailable ({e})",
@@ -214,7 +234,10 @@ pub const State = struct {
     fn reportChildSend(self: *const State, rc: usize, sig: u32) bool {
         switch (io.syscallErrno(rc)) {
             .SUCCESS => return true,
-            .SRCH => log.debug("no process to send signal {d} for pid {d}", .{ sig, @as(u32, @intCast(self.child.pid)) }),
+            .SRCH => log.debug(
+                "no process to send signal {d} for pid {d}",
+                .{ sig, @as(u32, @intCast(self.child.pid)) },
+            ),
             else => |errno| log.err("unable to send signal to child: {e}", .{errno}),
         }
 
@@ -341,14 +364,24 @@ pub const State = struct {
         // The assert above keeps `signo` inside the table. The fallback stays for
         // ReleaseSmall, where asserts are compiled out: a wrong number would only
         // mean the signal is forwarded unrewritten.
-        const signal_to_send = (if (self.policy.rewrites) |m| m.apply(signo) catch null else null) orelse signo;
+        const rewritten = if (self.policy.rewrites) |m|
+            m.apply(signo) catch null
+        else
+            null;
+
+        const signal_to_send = rewritten orelse signo;
         if (signal_to_send == 0) {
             log.debug("dropping signal {d}", .{signo});
             return;
         }
 
-        // Only a queued signal carries a value, anything else would hand the child a meaningless one.
-        const payload: ?Payload = if (event.code == signal.SI.QUEUE) .{ .value = event.value } else null;
+        // Only a queued signal carries a value, anything else would hand the child
+        // a meaningless one.
+        const payload: ?Payload = if (event.code == signal.SI.QUEUE)
+            .{ .value = event.value }
+        else
+            null;
+
         if (signal_to_send == signo) {
             log.debug("forwarding signal {d}", .{signo});
         } else {
@@ -366,7 +399,11 @@ pub const State = struct {
         }
     }
 
-    pub fn handleSignalEvent(self: *State, source: *signalfd.Source, first: []const signal.Event) ?Outcome {
+    pub fn handleSignalEvent(
+        self: *State,
+        source: *signalfd.Source,
+        first: []const signal.Event,
+    ) ?Outcome {
         // The caller hands over at most one signalfd batch.
         checks.check(first.len <= signal_batch);
         var batch: [signal_batch]signal.Event = undefined;
@@ -437,12 +474,22 @@ pub const State = struct {
     fn beginShutdown(self: *State, exit_code: u8) void {
         const now = monotonicNs() catch {
             @branchHint(.unlikely);
-            self.shutdown = ShutdownState.init(exit_code, 0, 0);
+            self.shutdown = ShutdownState.init(.{
+                .exit_code = exit_code,
+                .now_ns = 0,
+                .timeout_ns = 0,
+            });
+
             _ = self.signalProcessGroup(@backingInt(Sig.TERM), null);
             return;
         };
 
-        self.shutdown = ShutdownState.init(exit_code, now, self.policy.shutdown_timeout_ns);
+        self.shutdown = ShutdownState.init(.{
+            .exit_code = exit_code,
+            .now_ns = now,
+            .timeout_ns = self.policy.shutdown_timeout_ns,
+        });
+
         log.debug("child exited, {d}ms grace for descendants before SIGKILL", .{
             self.policy.shutdown_timeout_ns / std.time.ns_per_ms,
         });
@@ -473,8 +520,17 @@ const ShutdownState = struct {
     /// CLOCK_MONOTONIC deadline (ns) at which the process group gets SIGKILLed.
     deadline_ns: u64,
 
-    fn init(exit_code: u8, now_ns: u64, timeout_ns: u64) ShutdownState {
-        return .{ .exit_code = exit_code, .deadline_ns = now_ns +| timeout_ns };
+    const Init = struct {
+        exit_code: u8,
+        now_ns: u64,
+        timeout_ns: u64,
+    };
+
+    fn init(options: Init) ShutdownState {
+        return .{
+            .exit_code = options.exit_code,
+            .deadline_ns = options.now_ns +| options.timeout_ns,
+        };
     }
 
     pub fn remainingMs(self: *const ShutdownState, now_ns: u64) i32 {
@@ -507,7 +563,11 @@ fn shouldStopSelf(reap: DrainResult) bool {
     return reap.main == .stopped;
 }
 
-fn drain(child_pid: std.os.linux.pid_t, expected_exit: ExitCodeSet, main_reaped: *bool) errors.SysCallError!DrainResult {
+fn drain(
+    child_pid: std.os.linux.pid_t,
+    expected_exit: ExitCodeSet,
+    main_reaped: *bool,
+) errors.SysCallError!DrainResult {
     var result: DrainResult = .{ .no_children = false };
     var status: i32 = 0;
 
@@ -539,7 +599,11 @@ fn drain(child_pid: std.os.linux.pid_t, expected_exit: ExitCodeSet, main_reaped:
                     log.processExited(pid, wait_status, .main);
                     const code = wait_status.exitCode();
                     const final_code = if (expected_exit.isSet(code)) blk: {
-                        if (code != 0) log.debug("exit code {d} mapped to 0 by --expect-exit", .{code});
+                        if (code != 0) log.debug(
+                            "exit code {d} mapped to 0 by --expect-exit",
+                            .{code},
+                        );
+
                         break :blk 0;
                     } else code;
 
@@ -585,7 +649,7 @@ comptime {
 
 // State/deadline checks also run in the unit target.
 test "a shutdown grace that cannot be added to the clock degrades to never" {
-    const shutdown = ShutdownState.init(7, 1_000, std.math.maxInt(u64) - 1);
+    const shutdown = ShutdownState.init(.{ .exit_code = 7, .now_ns = 1_000, .timeout_ns = std.math.maxInt(u64) - 1 });
 
     try std.testing.expectEqual(std.math.maxInt(u64), shutdown.deadline_ns);
     try std.testing.expect(shutdown.remainingMs(1_000) > 0);
@@ -597,17 +661,17 @@ test "the grace deadline is absolute, and a clamped wait does not end it" {
     const start: u64 = 10 * std.time.ns_per_s;
 
     // Half a millisecond is still a millisecond of waiting.
-    const immediate = ShutdownState.init(0, start, 1);
+    const immediate = ShutdownState.init(.{ .exit_code = 0, .now_ns = start, .timeout_ns = 1 });
     try std.testing.expectEqual(@as(i32, 1), immediate.remainingMs(start));
 
     // Already due, and exactly due, both mean "no time left".
-    const done = ShutdownState.init(0, start, 5 * ms);
+    const done = ShutdownState.init(.{ .exit_code = 0, .now_ns = start, .timeout_ns = 5 * ms });
     try std.testing.expectEqual(@as(i32, 0), done.remainingMs(start + 5 * ms));
     try std.testing.expectEqual(@as(i32, 0), done.remainingMs(start + 6 * ms));
 
     // Longer than one poll can express: the first wait is clamped, the deadline is not.
     const long_ns = (@as(u64, std.math.maxInt(i32)) + 1_000) * ms;
-    const long = ShutdownState.init(0, start, long_ns);
+    const long = ShutdownState.init(.{ .exit_code = 0, .now_ns = start, .timeout_ns = long_ns });
     try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), long.remainingMs(start));
     try std.testing.expectEqual(@as(i32, 1_000), long.remainingMs(start + @as(u64, std.math.maxInt(i32)) * ms));
     try std.testing.expectEqual(@as(i32, 0), long.remainingMs(start + long_ns));

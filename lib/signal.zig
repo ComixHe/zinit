@@ -47,7 +47,9 @@ const standard_names = blk: {
 /// Case-insensitive against the uppercase table
 fn lookupStandardSignal(name: []const u8) ?u32 {
     for (0..standard_signal_max) |i| {
-        const candidate = standard_names.text[standard_names.offsets[i]..standard_names.offsets[i + 1]];
+        const start = standard_names.offsets[i];
+        const end = standard_names.offsets[i + 1];
+        const candidate = standard_names.text[start..end];
         if (std.ascii.eqlIgnoreCase(candidate, name)) return @intCast(i + 1);
     }
 

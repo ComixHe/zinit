@@ -15,7 +15,10 @@ const config = @import("config");
 
 /// The level to print at when nothing chose one at runtime: the build's own default,
 /// clamped to its ceiling so a quiet build never defaults to a level it cannot print.
-pub const default_level: std.log.Level = @fromBackingInt(@min(@backingInt(config.default_log_level), @backingInt(config.max_log_level)));
+pub const default_level: std.log.Level = @fromBackingInt(@min(
+    @backingInt(config.default_log_level),
+    @backingInt(config.max_log_level),
+));
 
 /// The program's only mutable global: threading a sink through every call would cost more.
 const State = struct {

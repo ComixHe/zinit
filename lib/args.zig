@@ -25,7 +25,8 @@ const default_shutdown_timeout_s: u64 = 5;
 fn shutdownTimeoutFrom(environ: std.process.Environ, explicit: ?u64) ?u64 {
     if (explicit) |seconds| return seconds;
 
-    const text = environ.getPosix("ZINIT_SHUTDOWN_TIMEOUT") orelse return default_shutdown_timeout_s;
+    const text = environ.getPosix("ZINIT_SHUTDOWN_TIMEOUT") orelse
+        return default_shutdown_timeout_s;
     return str.parseDecimal(u64, text) catch null;
 }
 
@@ -42,7 +43,8 @@ fn applySessionRewrites(session_rewrites: *?rewrite.Map) void {
 
     const to_stop = [_]u32{ @backingInt(Sig.TSTP), @backingInt(Sig.TTOU), @backingInt(Sig.TTIN) };
     for (to_stop) |from| {
-        if ((map.target(from) catch unreachable) == null) map.set(from, @backingInt(Sig.STOP)) catch unreachable;
+        if ((map.target(from) catch unreachable) == null)
+            map.set(from, @backingInt(Sig.STOP)) catch unreachable;
     }
 }
 
@@ -82,6 +84,7 @@ pub const Args = struct {
         version,
     };
 
+    // Verbatim help output: breaking a line here would change what --help prints.
     const help_text =
         \\zinit - A tiny init for linux containers.
         \\
@@ -176,7 +179,10 @@ pub const Args = struct {
         return std.mem.span(vector[index.*]);
     }
 
-    fn resolveLogLevel(init: std.process.Init.Minimal, from_flag: ?std.log.Level) ConfigError!std.log.Level {
+    fn resolveLogLevel(
+        init: std.process.Init.Minimal,
+        from_flag: ?std.log.Level,
+    ) ConfigError!std.log.Level {
         const requested: ?std.log.Level = from_flag orelse blk: {
             const text = init.environ.getPosix("ZINIT_LOG_LEVEL") orelse break :blk null;
             break :blk parseLogLevel(text) orelse
@@ -185,7 +191,10 @@ pub const Args = struct {
 
         const level = requested orelse return log.default_level;
         if (@backingInt(level) > @backingInt(config.max_log_level)) {
-            const ceiling = comptime logLevelText(@fromBackingInt(@intCast(@backingInt(config.max_log_level))));
+            const ceiling = comptime logLevelText(
+                @fromBackingInt(@intCast(@backingInt(config.max_log_level))),
+            );
+
             const asked = logLevelText(level);
             log.err("this build prints up to {s}; rebuild with -Dlog-level={s} for {s}", .{
                 ceiling, asked, asked,
@@ -241,7 +250,11 @@ pub const Args = struct {
                 .shutdown_timeout => {
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
                     shutdown_timeout_s = str.parseDecimal(u64, v) catch
-                        return reject(ConfigError.InvalidParams, "invalid --shutdown-timeout value", v);
+                        return reject(
+                            ConfigError.InvalidParams,
+                            "invalid --shutdown-timeout value",
+                            v,
+                        );
                 },
                 .log_level => {
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
@@ -252,18 +265,26 @@ pub const Args = struct {
                     if (pdeath_signal != null) {
                         return reject(ConfigError.InvalidParams, "duplicate option", arg);
                     }
+
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    pdeath_signal = signal.parse(v) catch |e| return reject(e, "unknown signal", v);
+                    pdeath_signal = signal.parse(v) catch |e|
+                        return reject(e, "unknown signal", v);
                 },
                 .rewrite => {
                     if (rewrite_map == null) rewrite_map = rewrite.Map.init();
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidRewrite);
-                    rewrite_map.?.parse(v) catch |e| return reject(e, "invalid --rewrite value", v);
+                    rewrite_map.?.parse(v) catch |e|
+                        return reject(e, "invalid --rewrite value", v);
                 },
                 .expect_exit => {
                     const v = try takeValue(vector, &i, arg, ConfigError.InvalidExitCode);
                     const code = str.parseDecimal(u8, v) catch
-                        return reject(ConfigError.InvalidExitCode, "invalid --expect-exit code", v);
+                        return reject(
+                            ConfigError.InvalidExitCode,
+                            "invalid --expect-exit code",
+                            v,
+                        );
+
                     expected_exit.set(code);
                 },
             }
@@ -287,7 +308,10 @@ pub const Args = struct {
 
         const log_level = try resolveLogLevel(init, log_level_opt);
 
-        const shutdown_timeout_s_final = shutdownTimeoutFrom(init.environ, shutdown_timeout_s) orelse {
+        const shutdown_timeout_s_final = shutdownTimeoutFrom(
+            init.environ,
+            shutdown_timeout_s,
+        ) orelse {
             @branchHint(.unlikely);
             log.err("invalid ZINIT_SHUTDOWN_TIMEOUT value: expected seconds", .{});
             return ConfigError.InvalidParams;

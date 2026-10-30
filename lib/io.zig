@@ -13,7 +13,10 @@ pub const Context = struct {
     err: std.os.linux.fd_t = -1,
 };
 
-pub const syscallErrno = if (builtin.cpu.arch == .x86_64) sharedSyscallErrno else inlineSyscallErrno;
+pub const syscallErrno = if (builtin.cpu.arch == .x86_64)
+    sharedSyscallErrno
+else
+    inlineSyscallErrno;
 
 inline fn inlineSyscallErrno(rc: usize) std.os.linux.E {
     return std.os.linux.errno(rc);

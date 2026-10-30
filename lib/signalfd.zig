@@ -69,14 +69,23 @@ pub const Config = struct {
         return config;
     }
 
-    fn setAction(sig: signal.Sig, action: *const std.os.linux.Sigaction, old: ?*std.os.linux.Sigaction) ?std.os.linux.E {
+    fn setAction(
+        sig: signal.Sig,
+        action: *const std.os.linux.Sigaction,
+        old: ?*std.os.linux.Sigaction,
+    ) ?std.os.linux.E {
         const errno = io.syscallErrno(std.os.linux.sigaction(sig, action, old));
         return if (errno == .SUCCESS) null else errno;
     }
 
     const Step = enum { ttin, ttou, chld, mask };
 
-    fn setActionOrLog(comptime step: Step, sig: signal.Sig, action: *const std.os.linux.Sigaction, old: ?*std.os.linux.Sigaction) SysCallError!void {
+    fn setActionOrLog(
+        comptime step: Step,
+        sig: signal.Sig,
+        action: *const std.os.linux.Sigaction,
+        old: ?*std.os.linux.Sigaction,
+    ) SysCallError!void {
         if (step == .mask) {
             @compileError("mask isn't an action step.");
         }
@@ -104,7 +113,12 @@ pub const Config = struct {
     }
 
     pub fn restoreMask(self: *const Config) ?RestoreFailure {
-        const errno = io.syscallErrno(std.os.linux.sigprocmask(signal.Sig.SETMASK, &self.previous_set, null));
+        const errno = io.syscallErrno(std.os.linux.sigprocmask(
+            signal.Sig.SETMASK,
+            &self.previous_set,
+            null,
+        ));
+
         return if (errno == .SUCCESS) null else .{ .step = .mask, .errno = errno };
     }
 
@@ -166,7 +180,10 @@ pub const Source = struct {
             }
             if (pfd[0].revents == 0) return 0; // timeout
 
-            const poll_errors = std.os.linux.POLL.ERR | std.os.linux.POLL.HUP | std.os.linux.POLL.NVAL;
+            const poll_errors = std.os.linux.POLL.ERR |
+                std.os.linux.POLL.HUP |
+                std.os.linux.POLL.NVAL;
+
             if (pfd[0].revents & poll_errors != 0) {
                 const revents: u64 = @intCast(pfd[0].revents);
                 log.err("poll error on signalfd: revents=0x{x}", .{revents});

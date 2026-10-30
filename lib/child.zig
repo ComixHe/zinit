@@ -54,7 +54,12 @@ fn signalIsIgnored(sig: Sig) bool {
 /// Default search path used when `PATH` is unset (mirrors execvp).
 const default_path = "/usr/local/bin:/usr/bin:/bin";
 
-fn pathCandidate(dir: []const u8, file: []const u8, file_z: [*:0]const u8, buf: []u8) ?[*:0]const u8 {
+fn pathCandidate(
+    dir: []const u8,
+    file: []const u8,
+    file_z: [*:0]const u8,
+    buf: []u8,
+) ?[*:0]const u8 {
     if (dir.len == 0) return file_z;
     if (dir.len + 1 + file.len >= buf.len) return null;
 
@@ -194,7 +199,10 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
         const rc = std.os.linux.ioctl(tty_fd, std.os.linux.T.IOCSCTTY, 0);
         switch (io.syscallErrno(rc)) {
             .SUCCESS => {},
-            .PERM, .NOTTY, .NXIO => |e| log.debug("{s}: {e}", .{ "unable to acquire controlling tty", e }),
+            .PERM, .NOTTY, .NXIO => |e| log.debug(
+                "{s}: {e}",
+                .{ "unable to acquire controlling tty", e },
+            ),
             else => |e| log.warn("{s}: {e}", .{ "unable to acquire controlling tty", e }),
         }
     }
