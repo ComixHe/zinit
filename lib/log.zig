@@ -121,18 +121,18 @@ pub fn processExited(pid: std.os.linux.pid_t, status: WaitStatus, role: Role) vo
     var at: usize = 0;
     at = fmt.appendBytes(&buf, at, what);
     at = fmt.appendBytes(&buf, at, " ");
-    at = fmt.appendInt(&buf, at, @intCast(pid), 10);
+    at = fmt.appendInt(&buf, at, @intCast(pid), .dec);
     at = fmt.appendBytes(&buf, at, " exited with ");
 
     switch (status.class()) {
         .exited => {
             at = fmt.appendBytes(&buf, at, "code ");
-            at = fmt.appendInt(&buf, at, status.exitCode(), 10);
+            at = fmt.appendInt(&buf, at, status.exitCode(), .dec);
             at = fmt.appendBytes(&buf, at, ".");
         },
         .signaled => {
             at = fmt.appendBytes(&buf, at, "signal ");
-            at = fmt.appendInt(&buf, at, status.signalNumber(), 10);
+            at = fmt.appendInt(&buf, at, status.signalNumber(), .dec);
             at = fmt.appendBytes(&buf, at, ".");
         },
         .unknown => at = fmt.appendBytes(&buf, at, "unknown status"),

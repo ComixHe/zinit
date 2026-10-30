@@ -72,8 +72,8 @@ pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) []u8 {
             .arg => |kind| {
                 at = switch (kind) {
                     .str => appendBytes(buf, at, args[arg_i]),
-                    .dec => appendInt(buf, at, args[arg_i], 10),
-                    .hex => appendInt(buf, at, args[arg_i], 16),
+                    .dec => appendInt(buf, at, args[arg_i], .dec),
+                    .hex => appendInt(buf, at, args[arg_i], .hex),
                     .errno => appendErrno(buf, at, args[arg_i]),
                 };
 
@@ -156,7 +156,12 @@ pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
     return appendBytes(buf, at, bufPrint(&scratch, "errno {d}", .{number}));
 }
 
-pub fn appendInt(buf: []u8, at: usize, value: u64, base: u8) usize {
+/// The radices the formatter emits. An enum rather than a `u8`: `0` divides by
+/// zero, `1` never converges, and anything above 16 indexes past `digits`.
+pub const Base = enum(u8) { dec = 10, hex = 16 };
+
+pub fn appendInt(buf: []u8, at: usize, value: u64, base: Base) usize {
+    const radix: u8 = @backingInt(base);
     const digits = "0123456789abcdef";
     var v: u64 = value;
     var tmp: [20]u8 = undefined;
@@ -166,8 +171,8 @@ pub fn appendInt(buf: []u8, at: usize, value: u64, base: u8) usize {
         tmp[0] = '0';
         n = 1;
     } else {
-        while (v != 0) : (v /= base) {
-            tmp[n] = digits[@intCast(v % base)];
+        while (v != 0) : (v /= radix) {
+            tmp[n] = digits[@intCast(v % radix)];
             n += 1;
         }
     }
