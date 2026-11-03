@@ -33,17 +33,17 @@ repos:
       - id: actionlint
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.31.0
+    rev: v1.31.1
     hooks:
       - id: zizmor
 
   - repo: https://github.com/igorshubovych/markdownlint-cli
-    rev: v0.49.1
+    rev: v0.50.0
     hooks:
       - id: markdownlint
 
   - repo: https://github.com/fsfe/reuse-tool
-    rev: v6.2.0
+    rev: v6.3.0
     hooks:
       - id: reuse
 
