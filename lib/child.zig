@@ -91,8 +91,7 @@ fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const
         return reportExec(file, e);
     }
 
-    const environ: std.process.Environ = .{ .block = .{ .slice = std.mem.span(envp) } };
-    const path = environ.getPosix("PATH") orelse default_path;
+    const path = str.getEnv(std.mem.span(envp), "PATH") orelse default_path;
     var last_errno: std.os.linux.E = .NOENT;
     var denied_errno: ?std.os.linux.E = null;
     var rest = path;

@@ -5,6 +5,7 @@
 //! Text primitives: the byte search and decimal parser the argument and signal parsers share.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 
 /// Byte search without `std.mem`'s vectorized `findScalarPos`: every needle here is
 /// one byte in a short string, not worth the SIMD machinery in binary size.
@@ -41,6 +42,21 @@ pub fn parseDecimal(comptime T: type, text: []const u8) error{ InvalidCharacter,
     return @intCast(value);
 }
 
+/// Finds `key` in a null-terminated environment block. Keys here are literals
+/// without `=`, so the standard library's key validation is not needed.
+pub fn getEnv(envs: [:null]const ?[*:0]const u8, key: []const u8) ?[:0]const u8 {
+    checks.check(key.len > 0, "str: getEnv needs a non-empty key");
+
+    for (envs) |entry_opt| {
+        const entry = entry_opt orelse continue;
+        var i: usize = 0;
+        while (i < key.len and entry[i] == key[i]) : (i += 1) {}
+        if (i == key.len and entry[i] == '=') return std.mem.sliceTo(entry + i + 1, 0);
+    }
+
+    return null;
+}
+
 /// Without std.mem's vectorized machinery for binary size.
 /// The right-hand sides are literals, so the length check
 /// and the element loop fold into one fixed-size comparison.
@@ -54,6 +70,16 @@ pub inline fn eql(a: []const u8, b: []const u8) bool {
 }
 
 // kcov-exclude-tests (everything below is test-only).
+test "getEnv matches a whole key and returns the value without its terminator" {
+    const env = [_:null]?[*:0]const u8{ "A=1", "AB=2", "ZINIT=on" };
+    const envs: [:null]const ?[*:0]const u8 = &env;
+
+    try std.testing.expectEqualStrings("1", getEnv(envs, "A").?);
+    try std.testing.expectEqualStrings("2", getEnv(envs, "AB").?);
+    try std.testing.expectEqualStrings("on", getEnv(envs, "ZINIT").?);
+    try std.testing.expect(getEnv(envs, "B") == null);
+}
+
 test "parseDecimal agrees with std on arbitrary bytes, and never panics" {
     const Context = struct {
         fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {

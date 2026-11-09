@@ -22,16 +22,16 @@ const ExitCodeSet = wait.ExitCodeSet;
 
 const default_shutdown_timeout_s: u64 = 5;
 
-fn shutdownTimeoutFrom(environ: std.process.Environ, explicit: ?u64) ?u64 {
+fn shutdownTimeoutFrom(envs: [:null]const ?[*:0]const u8, explicit: ?u64) ?u64 {
     if (explicit) |seconds| return seconds;
 
-    const text = environ.getPosix("ZINIT_SHUTDOWN_TIMEOUT") orelse
+    const text = str.getEnv(envs, "ZINIT_SHUTDOWN_TIMEOUT") orelse
         return default_shutdown_timeout_s;
     return str.parseDecimal(u64, text) catch null;
 }
 
-fn tracingChildFrom(environ: std.process.Environ) bool {
-    const text = environ.getPosix("ZINIT_TRACING_CHILD") orelse return config.tracing_child;
+fn tracingChildFrom(envs: [:null]const ?[*:0]const u8) bool {
+    const text = str.getEnv(envs, "ZINIT_TRACING_CHILD") orelse return config.tracing_child;
     if (std.ascii.eqlIgnoreCase(text, "OFF")) return false;
     if (std.ascii.eqlIgnoreCase(text, "ON")) return true;
     return config.tracing_child;
@@ -200,7 +200,7 @@ pub const Args = struct {
         from_flag: ?std.log.Level,
     ) ConfigError!std.log.Level {
         const requested: ?std.log.Level = from_flag orelse blk: {
-            const text = init.environ.getPosix("ZINIT_LOG_LEVEL") orelse break :blk null;
+            const text = str.getEnv(init.environ.block.slice, "ZINIT_LOG_LEVEL") orelse break :blk null;
             break :blk parseLogLevel(text) orelse
                 return reject(ConfigError.InvalidParams, "unknown ZINIT_LOG_LEVEL", text);
         };
@@ -320,7 +320,7 @@ pub const Args = struct {
         const log_level = try resolveLogLevel(init, options.log_level);
 
         const shutdown_timeout_s_final = shutdownTimeoutFrom(
-            init.environ,
+            init.environ.block.slice,
             options.shutdown_timeout_s,
         ) orelse {
             @branchHint(.unlikely);
@@ -334,8 +334,8 @@ pub const Args = struct {
             return ConfigError.InvalidParams;
         }
 
-        const subreaper = options.subreaper or init.environ.getPosix("ZINIT_SUBREAPER") != null;
-        const tracing_child = tracingChildFrom(init.environ);
+        const subreaper = options.subreaper or str.getEnv(init.environ.block.slice, "ZINIT_SUBREAPER") != null;
+        const tracing_child = tracingChildFrom(init.environ.block.slice);
 
         var rewrite_map = options.rewrite_map;
         if (options.new_session) applySessionRewrites(&rewrite_map);
