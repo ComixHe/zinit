@@ -133,8 +133,8 @@ pub const State = struct {
     };
 
     pub fn init(policy: Policy, spawned: ProcessHandle) State {
-        checks.check(spawned.pid > 0);
-        if (spawned.pidfd) |fd| checks.check(fd >= 0);
+        checks.check(spawned.pid > 0, "workload: spawned child pid must be positive");
+        checks.check(if (spawned.pidfd) |fd| fd > 0 else true, "workload: spawned pidfd must be a valid descriptor");
         return .{
             .child = spawned,
             .policy = policy,
@@ -338,7 +338,7 @@ pub const State = struct {
     fn forwardSignal(self: *State, event: signal.Event) void {
         const signo = event.signo;
 
-        checks.check(signo > 0 and signo < std.os.linux.NSIG);
+        checks.check(signo > 0 and signo < std.os.linux.NSIG, "workload: signalfd delivered an out-of-range signal");
 
         const from_kernel = event.code == signal.SI.KERNEL;
 
@@ -396,7 +396,7 @@ pub const State = struct {
         first: []const signal.Event,
     ) ?Outcome {
         // The caller hands over at most one signalfd batch.
-        checks.check(first.len <= signal_batch);
+        checks.check(first.len <= signal_batch, "workload: signalfd batch larger than the accepted bound");
         var batch: [signal_batch]signal.Event = undefined;
         var events = first;
         var budget: usize = signal_quota;
@@ -591,7 +591,7 @@ fn drain(
     main_reaped: *bool,
     quota: usize,
 ) errors.SysCallError!DrainResult {
-    checks.check(quota > 0);
+    checks.check(quota > 0, "workload: reap quota must be positive");
 
     var result: DrainResult = .{ .no_children = false };
     var status: i32 = 0;

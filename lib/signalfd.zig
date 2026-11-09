@@ -159,8 +159,8 @@ pub const Source = struct {
     }
 
     pub fn waitBatch(self: *Source, out: []signal.Event, timeout_ms: i32) SysCallError!usize {
-        checks.check(out.len > 0);
-        checks.check(out.len <= batch_max);
+        checks.check(out.len > 0, "signalfd: waitBatch needs room for at least one event");
+        checks.check(out.len <= batch_max, "signalfd: batch buffer exceeds the per-read bound");
 
         if (timeout_ms != 0) {
             var pfd = [_]std.os.linux.pollfd{.{
@@ -213,8 +213,8 @@ pub const Source = struct {
 
         const got = rc / @sizeOf(std.os.linux.signalfd_siginfo);
         // The kernel writes whole records and never more than the buffer holds.
-        checks.check(rc % @sizeOf(std.os.linux.signalfd_siginfo) == 0);
-        checks.check(got <= out.len);
+        checks.check(rc % @sizeOf(std.os.linux.signalfd_siginfo) == 0, "signalfd: kernel returned a partial siginfo record");
+        checks.check(got <= out.len, "signalfd: kernel reported more events than the buffer holds");
         for (raw[0..got], out[0..got]) |raw_info, *event| {
             event.* = .{
                 .signo = raw_info.signo,
