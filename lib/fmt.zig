@@ -2,13 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Compile-time formatting for a deliberately small subset: `{s}` string, `{d}`
-//! unsigned decimal, `{x}` unsigned hex, `{e}` errno name. There is no width,
-//! alignment, sign or escape form; output is truncated at the end of the buffer.
-//! Placeholder count is checked against the argument tuple at compile time, and an
-//! unclosed `{` is a compile error rather than an index-out-of-bounds in the parser.
+//! Project-specific, allocation-free formatting: `{s}` byte slice, `{d}` unsigned
+//! decimal, `{x}` unsigned lowercase hex, `{e}` Linux errno name or `errno N`.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 
 const Piece = union(enum) {
     literal: []const u8,
@@ -24,44 +22,64 @@ fn parse(format: []const u8, argument_count: usize) []const Piece {
     var placeholders: usize = 0;
 
     while (i < format.len) {
-        if (format[i] != '{') {
-            var j = i;
-            while (j < format.len and format[j] != '{') : (j += 1) {}
-            pieces[n] = .{ .literal = format[i..j] };
-            n += 1;
-            i = j;
-        } else {
-            var j = i + 1;
-            while (j < format.len and format[j] != '}') : (j += 1) {}
-            if (j == format.len) @compileError("unclosed format placeholder in: " ++ format);
-            const spec = format[i + 1 .. j];
+        const parsed = if (format[i] == '{')
+            parsePlaceholder(format, i)
+        else
+            parseLiteral(format, i);
 
-            pieces[n] = .{ .arg = if (std.mem.eql(u8, spec, "s"))
-                .str
-            else if (std.mem.eql(u8, spec, "d"))
-                .dec
-            else if (std.mem.eql(u8, spec, "x"))
-                .hex
-            else if (std.mem.eql(u8, spec, "e"))
-                .errno
-            else
-                @compileError("unsupported format spec: {" ++ spec ++ "}") };
+        pieces[n] = parsed.piece;
+        n += 1;
 
-            placeholders += 1;
-            n += 1;
-            i = j + 1;
-        }
+        if (parsed.placeholder) placeholders += 1;
+        i = parsed.next;
     }
 
     if (placeholders != argument_count) {
         @compileError("format placeholders and arguments differ in: " ++ format);
     }
 
+    std.debug.assert(n <= pieces.len);
     return pieces[0..n];
 }
 
+const Parsed = struct {
+    piece: Piece,
+    next: usize,
+    placeholder: bool = false,
+};
+
+fn parseLiteral(format: []const u8, start: usize) Parsed {
+    var end = start;
+    while (end < format.len and format[end] != '{') : (end += 1) {}
+    return .{ .piece = .{ .literal = format[start..end] }, .next = end };
+}
+
+fn parsePlaceholder(format: []const u8, start: usize) Parsed {
+    var end = start + 1;
+    while (end < format.len and format[end] != '}') : (end += 1) {}
+    if (end == format.len) @compileError("unclosed format placeholder in: " ++ format);
+
+    const spec = format[start + 1 .. end];
+    const kind: Piece = .{ .arg = if (std.mem.eql(u8, spec, "s"))
+        .str
+    else if (std.mem.eql(u8, spec, "d"))
+        .dec
+    else if (std.mem.eql(u8, spec, "x"))
+        .hex
+    else if (std.mem.eql(u8, spec, "e"))
+        .errno
+    else
+        @compileError("unsupported format spec: {" ++ spec ++ "}") };
+
+    return .{ .piece = kind, .next = end + 1, .placeholder = true };
+}
+
 pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) []u8 {
-    const pieces = comptime parse(format, @typeInfo(@TypeOf(args)).@"struct".field_names.len);
+    const args_info = @typeInfo(@TypeOf(args));
+    if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
+        @compileError("fmt: expected argument tuple, found " ++ @typeName(@TypeOf(args)));
+    }
+    const pieces = comptime parse(format, args_info.@"struct".field_names.len);
 
     var at: usize = 0;
     comptime var arg_i: usize = 0;
@@ -82,19 +100,21 @@ pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) []u8 {
         }
     }
 
+    checks.check(at <= buf.len, "fmt: bufPrint position past the end of the buffer");
     return buf[0..at];
 }
 
-pub fn appendBytes(buf: []u8, at: usize, bytes: []const u8) usize {
+pub noinline fn appendBytes(buf: []u8, at: usize, bytes: []const u8) usize {
+    checks.check(at <= buf.len, "fmt: appendBytes position past the end of the buffer");
     if (at >= buf.len) return at;
 
     const n = @min(bytes.len, buf.len - at);
     @memcpy(buf[at..][0..n], bytes[0..n]);
-    return at + n;
+    const end = at + n;
+    checks.check(end <= buf.len, "fmt: appendBytes end past the end of the buffer");
+    return end;
 }
 
-/// A NUL-separated blob plus a per-number offset: a `switch` or `@tagName` over this
-/// sparse enum costs several times more.
 const errno_lookup = blk: {
     const entries = [_]struct { number: u32, text: []const u8 }{
         .{ .number = @backingInt(std.os.linux.E.PERM), .text = "EPERM" },
@@ -138,11 +158,11 @@ const errno_lookup = blk: {
     break :blk .{ .offsets = offsets, .names = names };
 };
 
-/// The short name, or `errno <n>`, written straight into `buf`. One body for every
-/// `{e}` site: each would otherwise carry its own copy of the scan. `at` must
-/// not exceed `buf.len`.
 pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
+    checks.check(at <= buf.len, "fmt: appendErrno position past the end of the buffer");
+    if (at == buf.len) return at;
     const number = @backingInt(errno);
+
     if (number < errno_lookup.offsets.len) {
         const start = errno_lookup.offsets[number];
         if (start != 0) {
@@ -153,38 +173,29 @@ pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
         }
     }
 
-    var scratch: [24]u8 = undefined;
-    return appendBytes(buf, at, bufPrint(&scratch, "errno {d}", .{number}));
+    const next = appendBytes(buf, at, "errno ");
+    return appendInt(buf, next, number, .dec);
 }
 
-/// The radices the formatter emits. An enum rather than a `u8`: `0` divides by
-/// zero, `1` never converges, and anything above 16 indexes past `digits`.
 pub const Base = enum(u8) { dec = 10, hex = 16 };
 
-/// `at` must not exceed `buf.len`.
 pub fn appendInt(buf: []u8, at: usize, value: u64, base: Base) usize {
+    checks.check(at <= buf.len, "fmt: appendInt position past the end of the buffer");
+    if (at == buf.len) return at;
     const radix: u8 = @backingInt(base);
     const digits = "0123456789abcdef";
     var v: u64 = value;
     var tmp: [20]u8 = undefined;
-    var n: usize = 0;
+    var index: usize = tmp.len;
 
-    if (v == 0) {
-        tmp[0] = '0';
-        n = 1;
-    } else {
-        while (v != 0) : (v /= radix) {
-            tmp[n] = digits[@intCast(v % radix)];
-            n += 1;
-        }
+    while (true) {
+        index -= 1;
+        tmp[index] = digits[@intCast(v % radix)];
+        v /= radix;
+        if (v == 0) break;
     }
 
-    var written: usize = 0;
-    while (written < n and at + written < buf.len) : (written += 1) {
-        buf[at + written] = tmp[n - 1 - written];
-    }
-
-    return at + written;
+    return appendBytes(buf, at, tmp[index..]);
 }
 
 // kcov-exclude-tests (everything below is test-only).
@@ -202,11 +213,9 @@ test "bufPrint renders strings, decimals and hex, and truncates rather than over
     var zero_buf: [4]u8 = undefined;
     try std.testing.expectEqualStrings("0", bufPrint(&zero_buf, "{d}", .{0}));
 
-    // A number cut mid-way keeps the leading digits, in order.
     var cut: [3]u8 = undefined;
     try std.testing.expectEqualStrings("123", bufPrint(&cut, "{d}", .{12345}));
 
-    // `{e}` is the errno's short name, so no caller needs its own appender.
     var errno_buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("failed: ENOENT", bufPrint(&errno_buf, "failed: {e}", .{.NOENT}));
 }
@@ -229,12 +238,137 @@ test "bufPrint handles an empty buffer and the largest integers" {
 }
 
 test "appendErrno names the common errnos and falls back to a number" {
-    var buf: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("ENOENT", buf[0..appendErrno(&buf, 0, .NOENT)]);
-    try std.testing.expectEqualStrings("EAGAIN", buf[0..appendErrno(&buf, 0, .AGAIN)]);
+    const named = [_]std.os.linux.E{
+        .PERM,   .NOENT, .SRCH,        .INTR,  .IO,    .NXIO,   .@"2BIG",
+        .NOEXEC, .BADF,  .CHILD,       .AGAIN, .NOMEM, .ACCES,  .FAULT,
+        .NOTDIR, .INVAL, .NFILE,       .MFILE, .NOTTY, .TXTBSY, .FBIG,
+        .NOSPC,  .PIPE,  .NAMETOOLONG, .NOSYS, .LOOP,
+    };
 
-    const unknown: std.os.linux.E = @fromBackingInt(65535);
-    var expected_buf: [24]u8 = undefined;
-    const expected = try std.mem.print(&expected_buf, "errno {d}", .{@backingInt(unknown)});
-    try std.testing.expectEqualStrings(expected, buf[0..appendErrno(&buf, 0, unknown)]);
+    for (named) |errno| {
+        var expected_buf: [16]u8 = undefined;
+        const expected = try std.mem.print(&expected_buf, "E{s}", .{@tagName(errno)});
+        try expectErrnoPrefixes(errno, expected);
+    }
+
+    const unnamed = [_]std.os.linux.E{ .SUCCESS, .BUSY, @fromBackingInt(65535) };
+    for (unnamed) |errno| {
+        var expected_buf: [24]u8 = undefined;
+        const expected = try std.mem.print(&expected_buf, "errno {d}", .{@backingInt(errno)});
+        try expectErrnoPrefixes(errno, expected);
+    }
+}
+
+test "appendInt preserves prefixes around decimal and hexadecimal digit boundaries" {
+    for ([_]Base{ .dec, .hex }) |base| {
+        const radix: u64 = @backingInt(base);
+        var power: u64 = 1;
+        while (true) {
+            for ([_]u64{ power - 1, power, power + 1 }) |value| {
+                try expectIntPrefixes(value, base);
+            }
+            if (power > std.math.maxInt(u64) / radix) break;
+            power *= radix;
+        }
+
+        try expectIntPrefixes(std.math.maxInt(u64), base);
+    }
+}
+
+test "append primitives never overrun, and truncate only at the buffer end" {
+    const Context = struct {
+        fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {
+            var buf: [24]u8 = undefined;
+
+            const at = smith.index(buf.len + 1);
+            var payload: [16]u8 = undefined;
+            const payload_len: usize = smith.slice(&payload);
+
+            @memset(&buf, 0xAA);
+            const bytes_end = appendBytes(&buf, at, payload[0..payload_len]);
+            const bytes_copied = @min(payload_len, buf.len - at);
+            try std.testing.expectEqual(at + bytes_copied, bytes_end);
+            try std.testing.expectEqualSlices(u8, payload[0..bytes_copied], buf[at..bytes_end]);
+            try expectUntouched(&buf, at, bytes_end);
+
+            const value = smith.value(u64);
+            const base: Base = if (smith.value(bool)) .dec else .hex;
+            var expected_buf: [20]u8 = undefined; // Enough for any u64 in either radix.
+            const expected = if (base == .dec)
+                try std.mem.print(&expected_buf, "{d}", .{value})
+            else
+                try std.mem.print(&expected_buf, "{x}", .{value});
+
+            const int_at = smith.index(buf.len + 1);
+            @memset(&buf, 0xAA);
+            const int_end = appendInt(&buf, int_at, value, base);
+            const int_copied = @min(expected.len, buf.len - int_at);
+            try std.testing.expectEqual(int_at + int_copied, int_end);
+            try std.testing.expectEqualStrings(expected[0..int_copied], buf[int_at..int_end]);
+            try expectUntouched(&buf, int_at, int_end);
+
+            const errno = smith.value(std.os.linux.E);
+            var full_buf: [24]u8 = undefined;
+            const full = full_buf[0..appendErrno(&full_buf, 0, errno)];
+            try expectErrnoShape(full);
+
+            const errno_at = smith.index(buf.len + 1);
+            @memset(&buf, 0xAA);
+            const errno_end = appendErrno(&buf, errno_at, errno);
+            const errno_copied = @min(full.len, buf.len - errno_at);
+            try std.testing.expectEqual(errno_at + errno_copied, errno_end);
+            try std.testing.expectEqualStrings(full[0..errno_copied], buf[errno_at..errno_end]);
+            try expectUntouched(&buf, errno_at, errno_end);
+        }
+    };
+
+    return std.testing.fuzz(Context{}, Context.testOne, .{
+        .corpus = &.{
+            "\x08\x00\x00\x00" ++ "01234567",
+            "\x10\x00\x00\x00" ++ "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+        },
+    });
+}
+
+fn expectUntouched(buf: []const u8, at: usize, end: usize) !void {
+    for (buf[0..at]) |byte| try std.testing.expectEqual(@as(u8, 0xAA), byte);
+    for (buf[end..]) |byte| try std.testing.expectEqual(@as(u8, 0xAA), byte);
+}
+
+fn expectErrnoPrefixes(errno: std.os.linux.E, expected: []const u8) !void {
+    const at = 3;
+    for (0..expected.len + 2) |capacity| {
+        var buf: [32]u8 = @splat(0xAA);
+        const end = appendErrno(buf[0 .. at + capacity], at, errno);
+        try std.testing.expectEqual(at + @min(capacity, expected.len), end);
+        try std.testing.expectEqualStrings(expected[0 .. end - at], buf[at..end]);
+        try expectUntouched(&buf, at, end);
+    }
+}
+
+fn expectIntPrefixes(value: u64, base: Base) !void {
+    var expected_buf: [20]u8 = undefined;
+    const expected = if (base == .dec)
+        try std.mem.print(&expected_buf, "{d}", .{value})
+    else
+        try std.mem.print(&expected_buf, "{x}", .{value});
+
+    const at = 3;
+    for (0..expected.len + 2) |capacity| {
+        var buf: [32]u8 = @splat(0xAA);
+        const end = appendInt(buf[0 .. at + capacity], at, value, base);
+        try std.testing.expectEqual(at + @min(capacity, expected.len), end);
+        try std.testing.expectEqualStrings(expected[0 .. end - at], buf[at..end]);
+        try expectUntouched(&buf, at, end);
+    }
+}
+
+fn expectErrnoShape(text: []const u8) !void {
+    try std.testing.expect(text.len > 0);
+    if (std.mem.startsWith(u8, text, "errno ")) return;
+
+    try std.testing.expect(text[0] == 'E');
+    for (text[1..]) |byte| {
+        try std.testing.expect((byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9'));
+    }
 }
