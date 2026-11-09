@@ -587,6 +587,7 @@ test "a rejected argument is named, not left to the usage text" {
 
     for (cases) |case| {
         try log.init(writer.handle);
+        defer log.deinit();
 
         try std.testing.expectError(
             ConfigError.InvalidParams,
