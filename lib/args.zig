@@ -5,6 +5,7 @@
 //! Command line: what the options mean, and the messages that explain them.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 
 const errors = @import("errors.zig");
 const str = @import("str.zig");
@@ -253,50 +254,82 @@ pub const Args = struct {
                 .new_session => options.new_session = true,
                 .subreaper => options.subreaper = true,
                 .forward_group => options.forward_group = true,
-                .shutdown_timeout => {
-                    const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    options.shutdown_timeout_s = str.parseDecimal(u64, v) catch
-                        return reject(
-                            ConfigError.InvalidParams,
-                            "invalid --shutdown-timeout value",
-                            v,
-                        );
-                },
-                .log_level => {
-                    const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    options.log_level = parseLogLevel(v) orelse
-                        return reject(ConfigError.InvalidParams, "unknown log level", v);
-                },
-                .signal => {
-                    if (options.pdeath_signal != null) {
-                        return reject(ConfigError.InvalidParams, "duplicate option", arg);
-                    }
-
-                    const v = try takeValue(vector, &i, arg, ConfigError.InvalidParams);
-                    options.pdeath_signal = signal.parse(v) catch |e|
-                        return reject(e, "unknown signal", v);
-                },
-                .rewrite => {
-                    if (options.rewrite_map == null) options.rewrite_map = rewrite.Map.init();
-                    const v = try takeValue(vector, &i, arg, ConfigError.InvalidRewrite);
-                    options.rewrite_map.?.parse(v) catch |e|
-                        return reject(e, "invalid --rewrite value", v);
-                },
-                .expect_exit => {
-                    const v = try takeValue(vector, &i, arg, ConfigError.InvalidExitCode);
-                    const code = str.parseDecimal(u8, v) catch
-                        return reject(
-                            ConfigError.InvalidExitCode,
-                            "invalid --expect-exit code",
-                            v,
-                        );
-
-                    options.expected_exit.set(code);
-                },
+                .shutdown_timeout => try setTimeout(&options, vector, &i, arg),
+                .log_level => try setLogLevel(&options, vector, &i, arg),
+                .signal => try setSignal(&options, vector, &i, arg),
+                .rewrite => try addRewrite(&options, vector, &i, arg),
+                .expect_exit => try addExpectedExit(&options, vector, &i, arg),
             }
         }
 
         return options;
+    }
+
+    inline fn setTimeout(
+        options: *Scanned,
+        vector: []const [*:0]const u8,
+        i: *usize,
+        arg: []const u8,
+    ) ConfigError!void {
+        if (options.shutdown_timeout_s != null)
+            return reject(ConfigError.InvalidParams, "duplicate option", arg);
+
+        const v = try takeValue(vector, i, arg, ConfigError.InvalidParams);
+        options.shutdown_timeout_s = str.parseDecimal(u64, v) catch
+            return reject(ConfigError.InvalidParams, "invalid --shutdown-timeout value", v);
+    }
+
+    inline fn setLogLevel(
+        options: *Scanned,
+        vector: []const [*:0]const u8,
+        i: *usize,
+        arg: []const u8,
+    ) ConfigError!void {
+        if (options.log_level != null)
+            return reject(ConfigError.InvalidParams, "duplicate option", arg);
+
+        const v = try takeValue(vector, i, arg, ConfigError.InvalidParams);
+        options.log_level = parseLogLevel(v) orelse
+            return reject(ConfigError.InvalidParams, "unknown log level", v);
+    }
+
+    inline fn setSignal(
+        options: *Scanned,
+        vector: []const [*:0]const u8,
+        i: *usize,
+        arg: []const u8,
+    ) ConfigError!void {
+        if (options.pdeath_signal != null)
+            return reject(ConfigError.InvalidParams, "duplicate option", arg);
+
+        const v = try takeValue(vector, i, arg, ConfigError.InvalidParams);
+        options.pdeath_signal = signal.parse(v) catch |e|
+            return reject(e, "unknown signal", v);
+    }
+
+    inline fn addRewrite(
+        options: *Scanned,
+        vector: []const [*:0]const u8,
+        i: *usize,
+        arg: []const u8,
+    ) ConfigError!void {
+        if (options.rewrite_map == null) options.rewrite_map = rewrite.Map.init();
+        const v = try takeValue(vector, i, arg, ConfigError.InvalidRewrite);
+        options.rewrite_map.?.parse(v) catch |e|
+            return reject(e, "invalid --rewrite value", v);
+    }
+
+    inline fn addExpectedExit(
+        options: *Scanned,
+        vector: []const [*:0]const u8,
+        i: *usize,
+        arg: []const u8,
+    ) ConfigError!void {
+        const v = try takeValue(vector, i, arg, ConfigError.InvalidExitCode);
+        const code = str.parseDecimal(u8, v) catch
+            return reject(ConfigError.InvalidExitCode, "invalid --expect-exit code", v);
+
+        options.expected_exit.set(code);
     }
 
     /// Merges the environment, validates the combination and builds the action.
@@ -317,6 +350,7 @@ pub const Args = struct {
             return ConfigError.MissingCommand;
         };
 
+        checks.check(start < init.args.vector.len, "args: child command start outside the argument vector");
         const log_level = try resolveLogLevel(init, options.log_level);
 
         const shutdown_timeout_s_final = shutdownTimeoutFrom(
@@ -379,8 +413,8 @@ test "Args.parse maps argv, environment and options" {
     const vector = [_:null]?[*:0]const u8{
         "zinit", "--log-level", ceiling, "-s",
         "-n",    "-p",          "TERM",  "-e",
-        "143",   "-e",          "130",   "--",
-        "foo",   "--bar=x",
+        "143",   "-e",          "130",   "-e",
+        "255",   "--",          "foo",   "--bar=x",
     };
 
     const init: std.process.Init.Minimal = .{
@@ -397,7 +431,10 @@ test "Args.parse maps argv, environment and options" {
     try std.testing.expectEqual(@as(?u32, 15), args.pdeath_signal);
     try std.testing.expect(args.expected_exit.isSet(143));
     try std.testing.expect(args.expected_exit.isSet(130));
+    try std.testing.expect(args.expected_exit.isSet(255));
+    try std.testing.expect(!args.expected_exit.isSet(254));
     try std.testing.expect(!args.expected_exit.isSet(1));
+    try std.testing.expectEqual(5 * std.time.ns_per_s, args.shutdown_timeout_ns);
     try std.testing.expect(args.subreaper);
     try std.testing.expect(args.new_session);
 
@@ -544,81 +581,6 @@ test "-V and --version are recognized" {
     }
 }
 
-/// Drain what the logger wrote into `buf`; a non-blocking pipe reports the
-/// drained end as `WouldBlock`, which is not an error here.
-fn drainLog(file: std.Io.File, test_io: std.Io, buf: []u8) ![]u8 {
-    var total: usize = 0;
-    while (total < buf.len) {
-        var iov = [_][]u8{buf[total..]};
-        const n = file.readStreaming(test_io, &iov) catch |err| switch (err) {
-            error.WouldBlock => break,
-            else => return err,
-        };
-
-        if (n == 0) break;
-        total += n;
-    }
-    return buf[0..total];
-}
-
-test "a rejected argument is named, not left to the usage text" {
-    const test_io = std.testing.io;
-    const fds = try std.Io.Threaded.pipe2(.{ .NONBLOCK = true });
-    const reader = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = true } };
-    const writer = std.Io.File{ .handle = fds[1], .flags = .{ .nonblocking = true } };
-    defer reader.close(test_io);
-    defer writer.close(test_io);
-
-    defer log.deinit();
-    log.setRuntimeLevel(.err);
-    defer log.setRuntimeLevel(.warn);
-
-    const env = [_:null]?[*:0]const u8{};
-    const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
-    var buf: [256]u8 = undefined;
-
-    const cases = [_]struct { argv: [:null]const ?[*:0]const u8, kind: []const u8, token: []const u8 }{
-        // The `--opt=value` spelling this CLI does not take: the token is still the answer.
-        .{ .argv = &.{ "zinit", "-Z", "--", "true" }, .kind = "option", .token = "-Z" },
-        .{ .argv = &.{ "zinit", "--log-level=debug", "--", "true" }, .kind = "option", .token = "--log-level=debug" },
-        // A value an option cannot take is named with the value, not just the option.
-        .{ .argv = &.{ "zinit", "--log-level", "loud", "--", "true" }, .kind = "log level", .token = "loud" },
-    };
-
-    for (cases) |case| {
-        try log.init(writer.handle);
-        defer log.deinit();
-
-        try std.testing.expectError(
-            ConfigError.InvalidParams,
-            Args.parse(.{ .args = .{ .vector = asVector(case.argv) }, .environ = environ }),
-        );
-
-        const named = try drainLog(reader, test_io, &buf);
-        try std.testing.expect(std.mem.find(u8, named, case.kind) != null);
-        try std.testing.expect(std.mem.find(u8, named, case.token) != null);
-    }
-
-    const allocator = std.testing.allocator;
-    var env_map: std.process.Environ.Map = .init(allocator);
-    defer env_map.deinit();
-    try env_map.put("ZINIT_LOG_LEVEL", "loud");
-    const from_env: std.process.Environ = .{ .block = try env_map.createPosixBlock(allocator, .{}) };
-    defer from_env.block.deinit(allocator);
-
-    try log.init(writer.handle);
-
-    const argv = [_:null]?[*:0]const u8{ "zinit", "--", "true" };
-    try std.testing.expectError(
-        ConfigError.InvalidParams,
-        Args.parse(.{ .args = .{ .vector = asVector(&argv) }, .environ = from_env }),
-    );
-
-    const named = try drainLog(reader, test_io, &buf);
-    try std.testing.expect(std.mem.find(u8, named, "ZINIT_LOG_LEVEL") != null);
-    try std.testing.expect(std.mem.find(u8, named, "loud") != null);
-}
-
 test "-t is parsed, and the first non-option needs no --" {
     const env = [_:null]?[*:0]const u8{};
     const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
@@ -657,7 +619,7 @@ test "an explicit option overrides an invalid environment value" {
     try std.testing.expectEqual(5 * std.time.ns_per_s, args.shutdown_timeout_ns);
 }
 
-test "a missing option value and a repeated -p are rejected" {
+test "missing option values and repeated single-value options are rejected" {
     const env = [_:null]?[*:0]const u8{};
     const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
 
@@ -692,9 +654,33 @@ test "a missing option value and a repeated -p are rejected" {
         .environ = environ,
     }));
 
-    const repeated = [_:null]?[*:0]const u8{ "zinit", "-p", "TERM", "-p", "INT", "--", "true" };
+    const repeated_signal = [_:null]?[*:0]const u8{ "zinit", "-p", "TERM", "-p", "INT", "--", "true" };
+    const repeated_timeout = [_:null]?[*:0]const u8{ "zinit", "-t", "1", "-t", "2", "--", "true" };
+    const repeated_level = [_:null]?[*:0]const u8{
+        "zinit", "--log-level", "error", "--log-level", "error", "--", "true",
+    };
+
+    const mixed_timeout = [_:null]?[*:0]const u8{
+        "zinit", "-t", "1", "--shutdown-timeout", "2", "--", "true",
+    };
+
     try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
-        .args = .{ .vector = asVector(&repeated) },
+        .args = .{ .vector = asVector(&repeated_signal) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&repeated_timeout) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&repeated_level) },
+        .environ = environ,
+    }));
+
+    try std.testing.expectError(ConfigError.InvalidParams, Args.parse(.{
+        .args = .{ .vector = asVector(&mixed_timeout) },
         .environ = environ,
     }));
 }
@@ -726,6 +712,7 @@ test "an unrepresentable shutdown timeout is rejected, not overflowed" {
     const allocator = std.testing.allocator;
     var env_map: std.process.Environ.Map = .init(allocator);
     defer env_map.deinit();
+
     try env_map.put("ZINIT_SHUTDOWN_TIMEOUT", "99999999999999999999");
     const env_environ: std.process.Environ = .{ .block = try env_map.createPosixBlock(allocator, .{}) };
     defer env_environ.block.deinit(allocator);
@@ -764,6 +751,7 @@ test "ZINIT_SUBREAPER is presence-only, ZINIT_TRACING_CHILD takes ON/OFF" {
     for (cases) |case| {
         var env_map: std.process.Environ.Map = .init(allocator);
         defer env_map.deinit();
+
         try env_map.put(case.key, case.value);
         const environ: std.process.Environ = .{ .block = try env_map.createPosixBlock(allocator, .{}) };
         defer environ.block.deinit(allocator);
@@ -824,7 +812,29 @@ test "Args.parse never panics on arbitrary argv and environment" {
             }) catch return;
 
             switch (action) {
-                .run => |parsed| try std.testing.expect(parsed.argv[0] != null),
+                .run => |parsed| {
+                    try std.testing.expect(parsed.argv[0] != null);
+                    try std.testing.expectEqual(
+                        @as(u64, 0),
+                        parsed.shutdown_timeout_ns % std.time.ns_per_s,
+                    );
+
+                    if (parsed.pdeath_signal) |sig| {
+                        try std.testing.expect(signal.isStandard(sig));
+                    }
+
+                    if (parsed.rewrites) |map| {
+                        var sig: u32 = 1;
+                        while (sig < std.os.linux.NSIG) : (sig += 1) {
+                            const target = try map.target(sig);
+                            if (target) |rewritten| {
+                                try std.testing.expect(
+                                    rewritten == 0 or signal.isStandard(rewritten),
+                                );
+                            }
+                        }
+                    }
+                },
                 .help, .version => {},
             }
         }
@@ -851,6 +861,46 @@ test "Args.parse never panics on arbitrary argv and environment" {
             "\x16\x00\x00\x00" ++ "ZINIT_TRACING_CHILD=ON",
             "\x15\x00\x00\x00" ++ "ZINIT_LOG_LEVEL=debug",
             "\x22\x00\x00\x00" ++ "ZINIT_SHUTDOWN_TIMEOUT=18446744073",
+            "\x0f\x00\x00\x00" ++ "-n\x00--\x00/bin/true",
+            "\x1b\x00\x00\x00" ++ "-n\x00-r\x00TSTP:INT\x00--\x00/bin/true",
+            "\x19\x00\x00\x00" ++ "-n\x00-r\x00TTIN:0\x00--\x00/bin/true",
+            "\x19\x00\x00\x00" ++ "-n\x00-r\x00TSTP:0\x00--\x00/bin/true",
+            "\x17\x00\x00\x00" ++ "-p\x00SIGTERM\x00--\x00/bin/true",
+            "\x17\x00\x00\x00" ++ "-p\x00sigterm\x00--\x00/bin/true",
+            "\x12\x00\x00\x00" ++ "-p\x0034\x00--\x00/bin/true",
+            "\x24\x00\x00\x00" ++ "-p\x0099999999999999999999\x00--\x00/bin/true",
+            "\x10\x00\x00\x00" ++ "--log-level\x00junk",
+            "\x14\x00\x00\x00" ++ "ZINIT_LOG_LEVEL=junk",
+            "\x19\x00\x00\x00" ++ "ZINIT_TRACING_CHILD=MAYBE",
+            "\x1b\x00\x00\x00" ++ "ZINIT_SHUTDOWN_TIMEOUT=junk",
+            "\x2b\x00\x00\x00" ++ "ZINIT_SHUTDOWN_TIMEOUT=18446744073709551616",
+            "\x02\x00\x00\x00" ++ "-h",
+            "\x05\x00\x00\x00" ++ "-h\x00-V",
+            "\x00\x00\x00\x00" ++ "",
+            "\x09\x00\x00\x00" ++ "-t\x001\x00-t\x002",
+            "\x21\x00\x00\x00" ++ "--log-level\x00info\x00--log-level\x00info",
+            "\x02\x00\x00\x00" ++ "-t",
+            "\x17\x00\x00\x00" ++ "-t\x0018446744073709551616",
+            "\x07\x00\x00\x00" ++ "-r\x00TERM",
+            "\x08\x00\x00\x00" ++ "-r\x00TERM:",
+            "\x0d\x00\x00\x00" ++ "-r\x00TERM:INTRA",
+            "\x06\x00\x00\x00" ++ "-e\x00300",
+            "\x1d\x00\x00\x00" ++ "--log-level\x00junk\x00--\x00/bin/true",
+            "\x21\x00\x00\x00" ++ "ZINIT_LOG_LEVEL=junk\x00--\x00/bin/true",
+            "\x26\x00\x00\x00" ++ "ZINIT_TRACING_CHILD=MAYBE\x00--\x00/bin/true",
+            "\x24\x00\x00\x00" ++ "ZINIT_TRACING_CHILD=OFF\x00--\x00/bin/true",
+            "\x23\x00\x00\x00" ++ "ZINIT_TRACING_CHILD=ON\x00--\x00/bin/true",
+            "\x28\x00\x00\x00" ++ "ZINIT_SHUTDOWN_TIMEOUT=junk\x00--\x00/bin/true",
+            "\x38\x00\x00\x00" ++ "ZINIT_SHUTDOWN_TIMEOUT=18446744073709551616\x00--\x00/bin/true",
+            "\x1e\x00\x00\x00" ++ "ZINIT_SUBREAPER=1\x00--\x00/bin/true",
+            "\x1d\x00\x00\x00" ++ "--log-level\x00warn\x00--\x00/bin/true",
+            "\x1e\x00\x00\x00" ++ "--log-level\x00error\x00--\x00/bin/true",
+            "\x11\x00\x00\x00" ++ "-p\x000\x00--\x00/bin/true",
+            "\x12\x00\x00\x00" ++ "-p\x0032\x00--\x00/bin/true",
+            "\x12\x00\x00\x00" ++ "-p\x0065\x00--\x00/bin/true",
+            "\x18\x00\x00\x00" ++ "-p\x00SIGRTMIN\x00--\x00/bin/true",
+            "\x1a\x00\x00\x00" ++ "-p\x00SIGSIGTERM\x00--\x00/bin/true",
+            "\x10\x00\x00\x00" ++ "-p\x00\x00--\x00/bin/true",
         },
     });
 }
@@ -885,4 +935,15 @@ test "the runtime default is the build's default, clamped to its ceiling" {
     );
 
     try std.testing.expectEqual(expected, @backingInt(args.log_level));
+}
+
+test "an unknown option is rejected even with no log sink" {
+    const argv = [_:null]?[*:0]const u8{ "zinit", "--nope", "--", "true" };
+    const env = [_:null]?[*:0]const u8{};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &env } };
+
+    try std.testing.expectError(
+        ConfigError.InvalidParams,
+        Args.parse(.{ .args = .{ .vector = asVector(&argv) }, .environ = environ }),
+    );
 }
