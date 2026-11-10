@@ -160,7 +160,7 @@ pub const State = struct {
 
     pub fn init(policy: Policy, spawned: ProcessHandle) State {
         checks.check(spawned.pid > 0, "workload: spawned child pid must be positive");
-        checks.check(if (spawned.pidfd) |fd| fd > 0 else true, "workload: spawned pidfd must be a valid descriptor");
+        checks.check(if (spawned.pidfd) |fd| fd >= 0 else true, "workload: spawned pidfd must be a valid descriptor");
         return .{
             .child = spawned,
             .policy = policy,

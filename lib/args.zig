@@ -147,6 +147,10 @@ pub const Args = struct {
         return err;
     }
 
+    inline fn rejectDuplicate(is_set: bool, arg: []const u8) ConfigError!void {
+        if (is_set) return reject(ConfigError.InvalidParams, "duplicate option", arg);
+    }
+
     const Option = enum {
         help,
         version,
@@ -272,8 +276,7 @@ pub const Args = struct {
         i: *usize,
         arg: []const u8,
     ) ConfigError!void {
-        if (options.shutdown_timeout_s != null)
-            return reject(ConfigError.InvalidParams, "duplicate option", arg);
+        try rejectDuplicate(options.shutdown_timeout_s != null, arg);
 
         const v = try takeValue(vector, i, arg, ConfigError.InvalidParams);
         options.shutdown_timeout_s = str.parseDecimal(u64, v) catch
@@ -286,8 +289,7 @@ pub const Args = struct {
         i: *usize,
         arg: []const u8,
     ) ConfigError!void {
-        if (options.log_level != null)
-            return reject(ConfigError.InvalidParams, "duplicate option", arg);
+        try rejectDuplicate(options.log_level != null, arg);
 
         const v = try takeValue(vector, i, arg, ConfigError.InvalidParams);
         options.log_level = parseLogLevel(v) orelse
@@ -300,8 +302,7 @@ pub const Args = struct {
         i: *usize,
         arg: []const u8,
     ) ConfigError!void {
-        if (options.pdeath_signal != null)
-            return reject(ConfigError.InvalidParams, "duplicate option", arg);
+        try rejectDuplicate(options.pdeath_signal != null, arg);
 
         const v = try takeValue(vector, i, arg, ConfigError.InvalidParams);
         options.pdeath_signal = signal.parse(v) catch |e|

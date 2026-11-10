@@ -155,9 +155,8 @@ pub fn supervise(
                     return state.abortSupervision();
                 };
 
-                if (got != 0) {
+                if (got != 0)
                     if (state.handleSignalEvent(&source, batch[0..got])) |outcome| return outcome;
-                }
             }
         }
 

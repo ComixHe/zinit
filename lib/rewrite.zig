@@ -24,10 +24,6 @@ pub const Map = struct {
         return .{ .entries = @splat(unset) };
     }
 
-    pub fn reset(self: *Map) void {
-        self.entries = @splat(unset);
-    }
-
     /// `null` = no rewrite, `0` = drop, otherwise the validated target signal.
     pub fn target(self: *const Map, sig: u32) ConfigError!?u32 {
         if (sig >= self.entries.len) {
@@ -214,7 +210,7 @@ test "Map.reaches follows rewrite chains to a target" {
     try map.set(9, 15);
     try std.testing.expect(try map.reaches(2, 15));
     try std.testing.expect(try map.reaches(9, 1)); // loops -> defensive true
-    map.reset();
+    map = .init();
 
     try map.set(15, 0);
     try std.testing.expect(!try map.reaches(15, 2));

@@ -97,10 +97,7 @@ pub fn parse(text: []const u8) ConfigError!u32 {
     if (name_to_check.len == 0 or name_to_check.len > 15) return ConfigError.InvalidSignal;
 
     // The table covers 1..=max, so a hit is standard by construction.
-    const found = lookupStandardSignal(name_to_check) orelse return ConfigError.InvalidSignal;
-    checks.check(found > 0, "signal: name lookup returned a non-positive number");
-    checks.check(found < std.os.linux.NSIG, "signal: name lookup returned an out-of-range number");
-    return found;
+    return lookupStandardSignal(name_to_check) orelse return ConfigError.InvalidSignal;
 }
 
 // kcov-exclude-tests (everything below is test-only).

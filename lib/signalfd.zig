@@ -23,7 +23,7 @@ pub const Config = struct {
     /// On failure the process signal state may be partly changed: the caller must
     /// not continue to run the workload (main exits).
     pub fn install(comptime unblocked: []const signal.Sig) !Config {
-        checks.check(unblocked.len < std.os.linux.NSIG, "signalfd: unblocked set must be smaller than NSIG");
+        checks.comptimeCheck(unblocked.len < std.os.linux.NSIG, "signalfd: unblocked set must be smaller than NSIG");
         const set = comptime mask: {
             var result = std.os.linux.sigfillset();
             for (unblocked) |sig| std.os.linux.sigdelset(&result, sig);
@@ -79,18 +79,15 @@ pub const Config = struct {
         return if (errno == .SUCCESS) null else errno;
     }
 
-    const Step = enum { ttin, ttou, chld, mask };
+    const ActionStep = enum { ttin, ttou, chld };
+    const RestoreStep = enum { ttin, ttou, chld, mask };
 
     fn setActionOrLog(
-        comptime step: Step,
+        comptime step: ActionStep,
         sig: signal.Sig,
         action: *const std.os.linux.Sigaction,
         old: ?*std.os.linux.Sigaction,
     ) SysCallError!void {
-        if (step == .mask) {
-            @compileError("mask isn't an action step.");
-        }
-
         if (setAction(sig, action, old)) |errno| {
             @branchHint(.unlikely);
             log.err("unable to set signal action for {s}: {e}", .{ @tagName(step), errno });
@@ -99,7 +96,7 @@ pub const Config = struct {
     }
 
     const RestoreFailure = struct {
-        step: Step,
+        step: RestoreStep,
         errno: std.os.linux.E,
     };
 

@@ -72,7 +72,7 @@ fn pollChild(pid: std.os.linux.pid_t) Polled {
     const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
     if (rc == @as(usize, @intCast(pid))) return .{ .exited = WaitStatus.fromRaw(status) };
     return switch (io.syscallErrno(rc)) {
-        .SUCCESS => .running, // waitpid returned 0: state changed, nothing reaped.
+        .SUCCESS => .running, // waitpid returned 0: no child changed state.
         .CHILD => .gone,
         else => |e| .{ .failed = e },
     };
