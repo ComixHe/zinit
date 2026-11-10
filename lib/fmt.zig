@@ -6,6 +6,7 @@
 //! decimal, `{x}` unsigned lowercase hex, `{e}` Linux errno name or `errno N`.
 
 const std = @import("std");
+const fuzz_input = @import("fuzz_input.zig");
 const checks = @import("checks.zig");
 
 const Piece = union(enum) {
@@ -324,8 +325,8 @@ test "append primitives never overrun, and truncate only at the buffer end" {
 
     return std.testing.fuzz(Context{}, Context.testOne, .{
         .corpus = &.{
-            "\x08\x00\x00\x00" ++ "01234567",
-            "\x10\x00\x00\x00" ++ "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            fuzz_input.slice("01234567"),
+            fuzz_input.slice("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"),
         },
     });
 }

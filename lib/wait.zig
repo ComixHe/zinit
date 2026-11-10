@@ -5,6 +5,7 @@
 //! Decoding a `waitpid` status into the class and the code or signal to report.
 
 const std = @import("std");
+const fuzz_input = @import("fuzz_input.zig");
 const io = @import("io.zig");
 
 /// Which exit codes count as success; `-e` sets the bits.
@@ -163,4 +164,64 @@ test "WaitStatus.exitCode maps wait statuses to exit codes" {
     try std.testing.expectEqual(@as(u32, 9), (WaitStatus{ .raw = 9 }).signalNumber());
     // Neither exited nor signalled (a stopped status): the message admits to not knowing.
     try std.testing.expectEqual(WaitStatus.Class.unknown, (WaitStatus{ .raw = 0x1FF }).class());
+}
+
+test "WaitStatus keeps kind, class and exit code consistent for arbitrary statuses" {
+    const Context = struct {
+        fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {
+            const W = std.os.linux.W;
+
+            const raw: u32 = smith.value(u16);
+            const status = WaitStatus.fromRaw(@intCast(raw));
+            const kind = status.kind();
+
+            try std.testing.expectEqual(raw, status.raw);
+            try std.testing.expectEqual(@as(WaitStatus.Class, switch (kind) {
+                .exited => .exited,
+                .signaled => .signaled,
+                else => .unknown,
+            }), status.class());
+
+            switch (kind) {
+                .exited => {
+                    try std.testing.expect(W.IFEXITED(raw));
+                    try std.testing.expectEqual(W.EXITSTATUS(raw), status.exitCode());
+                },
+                .signaled => {
+                    try std.testing.expect(W.IFSIGNALED(raw));
+                    try std.testing.expectEqual(
+                        @as(u32, 128) + status.signalNumber(),
+                        status.exitCode(),
+                    );
+                },
+                .continued => {
+                    try std.testing.expectEqual(@as(u32, 0xffff), raw & 0xffff);
+                    try std.testing.expect(W.IFSTOPPED(raw));
+                    try std.testing.expectEqual(@as(u8, 0), status.exitCode());
+                },
+                .stopped => {
+                    try std.testing.expect(W.IFSTOPPED(raw));
+                    try std.testing.expectEqual(@as(u8, 0), status.exitCode());
+                },
+                .unknown => {
+                    try std.testing.expect(!W.IFEXITED(raw));
+                    try std.testing.expect(!W.IFSIGNALED(raw));
+                    try std.testing.expect(raw & 0xffff != 0xffff);
+                    try std.testing.expect(!W.IFSTOPPED(raw));
+                    try std.testing.expectEqual(@as(u8, 0), status.exitCode());
+                },
+            }
+        }
+    };
+
+    return std.testing.fuzz(Context{}, Context.testOne, .{
+        .corpus = &.{
+            fuzz_input.slice("\x00\x00"), // exit 0
+            fuzz_input.slice("\x00\x01"), // exit 1
+            fuzz_input.slice("\x0f\x00"), // signaled by SIGTERM
+            fuzz_input.slice("\xff\xff"), // continued marker
+            fuzz_input.slice("\x7f\x12"), // stopped
+            fuzz_input.slice("\x7f\x00"), // ambiguous low byte
+        },
+    });
 }

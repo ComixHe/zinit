@@ -5,6 +5,7 @@
 //! Text primitives: the byte search and decimal parser the argument and signal parsers share.
 
 const std = @import("std");
+const fuzz_input = @import("fuzz_input.zig");
 const checks = @import("checks.zig");
 
 /// Byte search without `std.mem`'s vectorized `findScalarPos`: every needle here is
@@ -114,8 +115,7 @@ test "parseDecimal agrees with std on arbitrary bytes, and never panics" {
     };
 
     return std.testing.fuzz(Context{}, Context.testOne, .{
-        // `Smith.in` starts with a four-byte little-endian slice length.
-        .corpus = &.{"\x15\x00\x00\x00" ++ "18446744073709551616x"},
+        .corpus = &.{fuzz_input.slice("18446744073709551616x")},
     });
 }
 

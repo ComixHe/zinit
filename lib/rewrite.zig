@@ -5,6 +5,7 @@
 //! The `-r` table: which forwarded signal becomes which, and why a rewrite is refused.
 
 const std = @import("std");
+const fuzz_input = @import("fuzz_input.zig");
 
 const errors = @import("errors.zig");
 const signal = @import("signal.zig");
@@ -254,13 +255,23 @@ test "Map stays acyclic and atomic over arbitrary rewrite sequences" {
         // The test runner feeds corpus entries as `Smith.in`; its first four
         // bytes are the little-endian payload length, not parser input.
         .corpus = &.{
-            "\x08\x00\x00\x00" ++ "TERM:INT",
-            "\x07\x00\x00\x00" ++ "INT:HUP",
-            "\x05\x00\x00\x00" ++ "HUP:0",
-            "\x06\x00\x00\x00" ++ "TERM:9",
-            "\x06\x00\x00\x00" ++ "9:TERM",
-            "\x16\x00\x00\x00" ++ "TERM:INT\x00INT:HUP\x00HUP:0",
-            "\x13\x00\x00\x00" ++ "USR1:USR2\x00USR2:TERM",
+            fuzz_input.slice("TERM:INT"),
+            fuzz_input.slice("INT:HUP"),
+            fuzz_input.slice("HUP:0"),
+            fuzz_input.slice("TERM:9"),
+            fuzz_input.slice("9:TERM"),
+            fuzz_input.slice("TERM:INT\x00INT:HUP\x00HUP:0"),
+            fuzz_input.slice("USR1:USR2\x00USR2:TERM"),
+            fuzz_input.slice(":"),
+            fuzz_input.slice("TERM:"),
+            fuzz_input.slice(":INT"),
+            fuzz_input.slice("TERM:INTRA"),
+            fuzz_input.slice("0:INT"),
+            fuzz_input.slice("TERM:INT\x00INT:TERM"),
+            fuzz_input.slice("INT:INT"),
+            fuzz_input.slice("term:int"),
+            fuzz_input.slice("TSTP:STOP:EXTRA"),
+            fuzz_input.slice("TERM:0\x00INT:HUP"),
         },
     });
 }
