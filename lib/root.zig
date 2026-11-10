@@ -27,4 +27,5 @@ test {
     // Collect internal modules' unit checks without exporting them to callers.
     _ = @import("workload.zig");
     _ = @import("child.zig");
+    _ = @import("exec_error.zig");
 }

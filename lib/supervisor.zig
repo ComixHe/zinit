@@ -5,8 +5,8 @@
 //! The parent process: setup, starting the workload, and the supervision loop.
 
 const std = @import("std");
-const checks = @import("checks.zig");
 const io = @import("io.zig");
+const checks = @import("checks.zig");
 const errors = @import("errors.zig");
 const log = @import("log.zig");
 const signalfd = @import("signalfd.zig");
@@ -31,25 +31,44 @@ pub fn spawn(
 ) errors.SysCallError!ProcessHandle {
     checks.check(spec.argv[0] != null, "supervisor: spawn needs a program name");
     const self_pid = std.os.linux.getpid();
+
+    var error_pipe: [2]std.os.linux.fd_t = undefined;
+    switch (io.syscallErrno(std.os.linux.pipe2(
+        &error_pipe,
+        .{ .CLOEXEC = true, .NONBLOCK = true },
+    ))) {
+        .SUCCESS => {},
+        else => |e| {
+            @branchHint(.cold);
+            log.err("unable to create the exec error pipe: {e}", .{e});
+            return error.SysCallError;
+        },
+    }
+    errdefer {
+        io.closeQuietly(error_pipe[0]);
+        io.closeQuietly(error_pipe[1]);
+    }
+
     const flags: u32 = @backingInt(Sig.CHLD) | std.os.linux.CLONE.PIDFD;
     var pidfd: std.os.linux.fd_t = -1;
     const rc = std.os.linux.syscall5(.clone, flags, 0, @intFromPtr(&pidfd), 0, 0);
 
     const pid = switch (io.syscallErrno(rc)) {
         .SUCCESS => rc,
-        .INVAL, .NOSYS => blk: {
+        .INVAL, .NOSYS => |errno| blk: {
+            log.debug("clone(CLONE_PIDFD) unavailable ({e}); falling back to fork", .{errno});
             const forked = std.os.linux.fork();
             switch (io.syscallErrno(forked)) {
                 .SUCCESS => break :blk forked,
                 else => |e| {
-                    @branchHint(.unlikely);
+                    @branchHint(.cold);
                     log.err("unable to fork: {e}", .{e});
                     return error.SysCallError;
                 },
             }
         },
         else => |e| {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             log.err("unable to clone: {e}", .{e});
             return error.SysCallError;
         },
@@ -57,6 +76,7 @@ pub fn spawn(
 
     if (pid != 0) {
         const child_pid: std.os.linux.pid_t = @intCast(pid);
+        io.closeQuietly(error_pipe[1]);
         if (!spec.new_session) {
             _ = std.os.linux.setpgid(child_pid, child_pid);
         }
@@ -65,10 +85,12 @@ pub fn spawn(
         return .{
             .pid = child_pid,
             .pidfd = if (pidfd >= 0) pidfd else null,
+            .exec_error_fd = error_pipe[0],
         };
     }
 
-    std.os.linux.exit(child.run(spec, signal_config, self_pid));
+    io.closeQuietly(error_pipe[0]);
+    std.os.linux.exit(child.run(spec, signal_config, self_pid, error_pipe[1]));
 }
 
 pub fn setupSubreaper(subreaper: bool) errors.SysCallError!void {
@@ -77,7 +99,7 @@ pub fn setupSubreaper(subreaper: bool) errors.SysCallError!void {
         switch (io.syscallErrno(std.os.linux.prctl(option, 1, 0, 0, 0))) {
             .SUCCESS => {},
             else => |e| {
-                @branchHint(.unlikely);
+                @branchHint(.cold);
                 log.err("unable to enable child subreaper mode: {e}", .{e});
                 return error.SysCallError;
             },
@@ -103,7 +125,7 @@ pub fn supervise(
     defer spawned.close();
 
     var source = signalfd.Source.open(signal_config) catch {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         // Nothing can be forwarded or reaped without the source, and nothing this
         // early may outlive us: the group first (it exists by now), then the child for
         // the case where it has none yet.
@@ -129,7 +151,7 @@ pub fn supervise(
 
             if (timeout_ms) |timeout| {
                 const got = source.waitBatch(&batch, timeout) catch {
-                    @branchHint(.unlikely);
+                    @branchHint(.cold);
                     return state.abortSupervision();
                 };
 

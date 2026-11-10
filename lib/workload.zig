@@ -17,6 +17,7 @@ const wait = @import("wait.zig");
 const signal = @import("signal.zig");
 const rewrite = @import("rewrite.zig");
 const signalfd = @import("signalfd.zig");
+const exec_error = @import("exec_error.zig");
 
 const Sig = signal.Sig;
 const ExitCodeSet = wait.ExitCodeSet;
@@ -41,9 +42,7 @@ comptime {
     checks.comptimeCheck(signal_batch <= signal_quota, "workload: signal batch exceeds quota");
 }
 
-/// The last event observed for the main child in one drain round. A single value,
-/// updated in kernel order, so "stop, continue, stop" ends stopped and an exit
-/// supersedes everything: a later stop can never resurrect a dead child.
+/// The last event observed for the main child in one drain round.
 const MainObservation = union(enum) {
     unchanged,
     stopped,
@@ -73,34 +72,60 @@ pub const Outcome = union(enum) {
     failed,
 };
 
-/// The running workload's identity, handed from `spawn` to the state machine.
+/// The running workload's identity, handed from spawn to the state machine.
 /// pid is unconditional (it tells the child apart and, without a pidfd, is what is
 /// signalled). pidfd is an extra mechanism, null before Linux 5.2. Neither can be
 /// recycled while the child, or any group member, holds its `struct pid`.
 pub const ProcessHandle = struct {
     pid: std.os.linux.pid_t,
     pidfd: ?std.os.linux.fd_t,
+    /// Read end of the exec-error pipe. The child writes one formatted line
+    /// when `execve` fails, a successful exec closes its write end through
+    /// CLOEXEC.
+    exec_error_fd: ?std.os.linux.fd_t = null,
 
-    /// Closes the pidfd, if any, and clears it: a second close is then a no-op
-    /// instead of closing a descriptor number the kernel has since reused. The pid
-    /// stays for logging, it is only a number again once the child has been reaped.
+    /// Closes the pidfd and exec-error pipe, if any, and clears them: a second
+    /// close is then a no-op instead of closing a descriptor number the kernel
+    /// has since reused. The pid stays for logging, it is only a number again
+    /// once the child has been reaped.
     pub fn close(self: *ProcessHandle) void {
         if (self.pidfd) |fd| {
             io.closeQuietly(fd);
             self.pidfd = null;
         }
+
+        if (self.exec_error_fd) |fd| {
+            io.closeQuietly(fd);
+            self.exec_error_fd = null;
+        }
     }
 
+    /// Transfers ownership of the child handle to the caller, leaving this instance empty.
     pub fn take(self: *ProcessHandle) ProcessHandle {
         const taken = self.*;
         self.pidfd = null;
+        self.exec_error_fd = null;
         return taken;
+    }
+
+    /// Reports an exec failure the child could not log itself. Call after the
+    /// child is reaped: at that point the pipe holds either the child's line or
+    /// nothing (exec succeeded, or the child died before writing). The record
+    /// length is bounded, so the read is bounded too.
+    pub fn drainExecFailure(self: *ProcessHandle) void {
+        const fd = self.exec_error_fd orelse return;
+        self.exec_error_fd = null;
+
+        var buf: [exec_error.max_message]u8 = undefined;
+        const n = std.os.linux.read(fd, &buf, buf.len);
+        io.closeQuietly(fd);
+
+        if (io.syscallErrno(n) != .SUCCESS or n == 0) return;
+        log.err("{s}", .{buf[0..n]});
     }
 };
 
-/// The 6.9 process-group scope flag, `unknown` until the first attempt. It lives in
-/// the supervision state, not in the module: a test or a future second instance must
-/// not inherit another run's capability guess.
+/// The 6.9 process-group scope flag
 /// https://github.com/torvalds/linux/blob/c339f4010dea8b0d754f84ace70cd1b089878ef8/include/uapi/linux/pidfd.h#L22
 const PIDFD_SIGNAL_PROCESS_GROUP: u32 = 1 << 2;
 
@@ -111,8 +136,9 @@ pub const State = struct {
     group_number_only: bool = false,
     /// Once the main child is reaped it can receive nothing, and its number is free again.
     child_reaped: bool = false,
-    /// Set when a reap round stopped at the quota, the next round must not wait
-    /// for a SIGCHLD the kernel may already have coalesced.
+    /// Set when a batch carries SIGCHLD, or when a reap round stopped at the
+    /// quota: either way the next round must reap without waiting for a new
+    /// SIGCHLD the kernel may already have coalesced.
     reap_pending: bool = false,
     /// The main child's last reported stop state, carried across reap rounds so
     /// a quota boundary cannot separate a stop from a continue that cancels it.
@@ -126,9 +152,9 @@ pub const State = struct {
     pub const Wait = union(enum) {
         /// No shutdown is in progress: block until a signal arrives.
         infinite,
-        /// Milliseconds until the shutdown deadline; 0 means it has passed.
+        /// Milliseconds until the shutdown deadline, 0 means it has passed.
         remaining_ms: i32,
-        /// The monotonic clock could not be read; `onTimeout` resolves it.
+        /// The monotonic clock could not be read, `onTimeout` resolves it.
         clock_failed,
     };
 
@@ -404,7 +430,6 @@ pub const State = struct {
         source: *signalfd.Source,
         first: []const signal.Event,
     ) ?Outcome {
-        // The caller hands over at most one signalfd batch.
         checks.check(first.len <= signal_batch, "workload: signalfd batch larger than the accepted bound");
         var batch: [signal_batch]signal.Event = undefined;
         var events = first;
@@ -450,6 +475,11 @@ pub const State = struct {
             @branchHint(.unlikely);
             return self.abortSupervision();
         };
+
+        if (reap.main == .exited) {
+            @branchHint(.unlikely);
+            self.child.drainExecFailure();
+        }
 
         // Optimistic: even with no zombie left right now, the next
         // round must not wait on a SIGCHLD that may already be coalesced with
@@ -769,8 +799,32 @@ test "the main-event reducer follows order, and exit is terminal" {
     try std.testing.expect(shouldStopSelf(true, false));
 }
 
+test "take transfers the descriptors and clears the source" {
+    var handle = ProcessHandle{ .pid = 7, .pidfd = 3, .exec_error_fd = 4 };
+    const taken = handle.take();
+
+    try std.testing.expectEqual(@as(std.os.linux.pid_t, 7), taken.pid);
+    try std.testing.expectEqual(@as(?std.os.linux.fd_t, 3), taken.pidfd);
+    try std.testing.expectEqual(@as(?std.os.linux.fd_t, 4), taken.exec_error_fd);
+    try std.testing.expect(handle.pidfd == null and handle.exec_error_fd == null);
+}
+
 const integration_tests = struct {
     const supervisor = @import("supervisor.zig");
+
+    test "private integration: closing a process handle twice is a no-op" {
+        var fds: [2]std.os.linux.fd_t = undefined;
+        try std.testing.expectEqual(
+            std.os.linux.E.SUCCESS,
+            std.os.linux.errno(std.os.linux.pipe2(&fds, .{})),
+        );
+
+        var handle = ProcessHandle{ .pid = 1, .pidfd = fds[0], .exec_error_fd = fds[1] };
+        handle.close();
+        try std.testing.expect(handle.pidfd == null and handle.exec_error_fd == null);
+        handle.close();
+    }
+
     fn waitForWaitid(test_io: std.Io, pid: std.os.linux.pid_t, flags: u32) !void {
         const deadline = std.Io.Clock.now(.awake, test_io).toNanoseconds() + 5 * std.time.ns_per_s;
         while (true) {

@@ -13,31 +13,37 @@ const fmt = @import("fmt.zig");
 const str = @import("str.zig");
 const signal = @import("signal.zig");
 const signalfd = @import("signalfd.zig");
+const exec_error = @import("exec_error.zig");
 
 const Sig = signal.Sig;
 const SignalConfig = signalfd.Config;
 
-/// What the child needs to run
 pub const SpawnSpec = struct {
     argv: [*:null]const ?[*:0]const u8,
-    envs: [:null]const ?[*:0]const u8,
-    new_session: bool,
-    ctty: ?std.os.linux.fd_t,
-    pdeath_signal: ?u32,
-    tracing_child: bool,
+    envs: [:null]const ?[*:0]const u8 = &.{},
+    new_session: bool = false,
+    ctty: ?std.os.linux.fd_t = null,
+    pdeath_signal: ?u32 = null,
+    tracing_child: bool = false,
 };
 
-/// Report and hand back the code: this side has no panic machinery set up.
-fn reportFailure(code: u8, parts: []const []const u8, errno: std.os.linux.E) u8 {
+fn formatFailure(buf: []u8, parts: []const []const u8, errno: std.os.linux.E) []const u8 {
+    var out: usize = 0;
+    out = fmt.appendBytes(buf, out, "zinit child error: ");
+    for (parts) |p| out = fmt.appendBytes(buf, out, p);
+    out = fmt.appendErrno(buf, out, errno);
+    return buf[0..out];
+}
+
+/// Reports a failure and exits: this side has no panic machinery. Callers
+/// block the forwarded signals, so a broken stderr cannot turn the report into
+/// SIGPIPE's 141.
+fn reportFailure(parts: []const []const u8, errno: std.os.linux.E) noreturn {
     checks.checkLazy(signalIsBlocked, .{Sig.PIPE}, "child: the failure report must run with signals blocked");
 
-    var buf: [512]u8 = undefined;
-    var out: usize = 0;
-    out = fmt.appendBytes(&buf, out, "zinit child error: ");
-    for (parts) |p| out = fmt.appendBytes(&buf, out, p);
-    out = fmt.appendErrno(&buf, out, errno);
-    log.err("{s}", .{buf[0..out]});
-    return code;
+    var buf: [exec_error.max_message]u8 = undefined;
+    log.err("{s}", .{formatFailure(&buf, parts, errno)});
+    std.os.linux.exit(1);
 }
 
 fn execExitCode(errno: std.os.linux.E) u8 {
@@ -70,7 +76,10 @@ fn pathCandidate(
     buf: []u8,
 ) ?[*:0]const u8 {
     if (dir.len == 0) return file_z;
-    if (dir.len + 1 + file.len >= buf.len) return null;
+    if (dir.len + 1 + file.len >= buf.len) {
+        @branchHint(.unlikely);
+        return null;
+    }
 
     @memcpy(buf[0..dir.len], dir);
     buf[dir.len] = '/';
@@ -79,25 +88,50 @@ fn pathCandidate(
     return @ptrCast(buf.ptr);
 }
 
-fn reportExec(file: []const u8, errno: std.os.linux.E) u8 {
-    return reportFailure(execExitCode(errno), &.{ "unable to execve ", file, ": " }, errno);
+fn reportExec(exec_error_fd: std.os.linux.fd_t, file: []const u8, errno: std.os.linux.E) u8 {
+    var buf: [exec_error.max_message]u8 = undefined;
+    exec_error.write(exec_error_fd, formatFailure(&buf, &.{ "unable to execve ", file, ": " }, errno));
+    return execExitCode(errno);
 }
 
-fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) u8 {
-    const unblock_all = comptime std.os.linux.sigfillset();
-    switch (io.syscallErrno(std.os.linux.sigprocmask(Sig.UNBLOCK, &unblock_all, null))) {
-        .SUCCESS => {},
-        else => |e| return reportFailure(1, &.{
-            "unable to restore child signal state (unblock): ",
-        }, e),
-    }
+/// Runs one `execve` under the mask zinit inherited. `execve` preserves the
+/// mask, so the workload must not start with the supervisor's blocked one.
+/// Failure re-blocks everything before the search and report continue; a
+/// pending signal is delivered at the restore.
+noinline fn execWithRestoredMask(
+    signal_config: *const SignalConfig,
+    file: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) std.os.linux.E {
+    const restore = io.syscallErrno(std.os.linux.sigprocmask(
+        Sig.SETMASK,
+        &signal_config.previous_set,
+        null,
+    ));
+    if (restore != .SUCCESS) return restore;
 
+    const errno = io.syscallErrno(std.os.linux.execve(file, argv, envp));
+    const all = comptime std.os.linux.sigfillset();
+    _ = std.os.linux.sigprocmask(Sig.BLOCK, &all, null);
+    return errno;
+}
+
+fn execChild(
+    signal_config: *const SignalConfig,
+    exec_error_fd: std.os.linux.fd_t,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) u8 {
     var path_buf: [std.os.linux.PATH_MAX]u8 = undefined;
     const file = std.mem.span(argv[0].?);
 
     if (str.indexOfByte(file, '/') != null) {
-        const e = io.syscallErrno(std.os.linux.execve(argv[0].?, argv, envp));
-        return reportExec(file, e);
+        return reportExec(
+            exec_error_fd,
+            file,
+            execWithRestoredMask(signal_config, argv[0].?, argv, envp),
+        );
     }
 
     const path = str.getEnv(std.mem.span(envp), "PATH") orelse default_path;
@@ -110,20 +144,25 @@ fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const
         const dir = if (colon) |cc| rest[0..cc] else rest;
 
         if (pathCandidate(dir, file, argv[0].?, &path_buf)) |candidate| {
-            const e = io.syscallErrno(std.os.linux.execve(candidate, argv, envp));
+            const e = execWithRestoredMask(signal_config, candidate, argv, envp);
             switch (e) {
                 .SUCCESS => unreachable, // a successful exec replaces the process
                 .ACCES => {
-                    // Present but not executable: remember it, but keep searching.
+                    @branchHint(.unlikely);
                     denied_errno = e;
+                },
+                .NOEXEC => {
+                    @branchHint(.cold);
+                    return reportExec(exec_error_fd, file, e);
+                },
+                .NOENT, .NOTDIR, .NAMETOOLONG, .LOOP => {
+                    @branchHint(.unlikely);
                     last_errno = e;
                 },
-                // A candidate that exists and is executable but has an unusable
-                // format is a hard failure: trying another program with the same
-                // name would run something the caller did not ask for.
-                .NOEXEC => return reportExec(file, e),
-                .NOENT, .NOTDIR, .NAMETOOLONG, .LOOP => last_errno = e,
-                else => return reportExec(file, e),
+                else => {
+                    @branchHint(.cold);
+                    return reportExec(exec_error_fd, file, e);
+                },
             }
         }
 
@@ -132,7 +171,7 @@ fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const
     }
 
     const final_errno = denied_errno orelse last_errno;
-    return reportExec(file, final_errno);
+    return reportExec(exec_error_fd, file, final_errno);
 }
 
 fn waitForTracer(signal_config: *const SignalConfig) ?u8 {
@@ -160,8 +199,8 @@ fn waitForTracer(signal_config: *const SignalConfig) ?u8 {
             // see: https://man7.org/linux/man-pages/man2/rt_sigtimedwait.2.html#NOTES
             .INTR => continue,
             else => |e| {
-                @branchHint(.unlikely);
-                return reportFailure(1, &.{"failed to wait for USR1: "}, e);
+                @branchHint(.cold);
+                reportFailure(&.{"failed to wait for USR1: "}, e);
             },
         }
     }
@@ -189,21 +228,23 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
         const sid = std.os.linux.setsid();
         const err = io.syscallErrno(sid);
         if (err != .SUCCESS) {
-            @branchHint(.unlikely);
-            return reportFailure(1, &.{"unable to create session: "}, err);
+            @branchHint(.cold);
+            reportFailure(&.{"unable to create session: "}, err);
         }
     } else {
         const rc = std.os.linux.setpgid(0, 0);
         const err = io.syscallErrno(rc);
         if (err != .SUCCESS) {
-            @branchHint(.unlikely);
-            return reportFailure(1, &.{"unable to create process group: "}, err);
+            @branchHint(.cold);
+            reportFailure(&.{"unable to create process group: "}, err);
         }
     }
 
     const tty_fd = spec.ctty orelse return null;
 
     if (spec.new_session) {
+        // TIOCSCTTY makes this new session's process group the foreground group,
+        // so no tcsetpgrp is needed here.
         const rc = std.os.linux.ioctl(tty_fd, std.os.linux.T.IOCSCTTY, 0);
         switch (io.syscallErrno(rc)) {
             .SUCCESS => {},
@@ -213,20 +254,16 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
             ),
             else => |e| log.warn("{s}: {e}", .{ "unable to acquire controlling tty", e }),
         }
-    }
-
-    // Only inherit the foreground when zinit itself owned it. A background
-    // `zinit -- ... < /dev/null &` must not steal the shell's terminal just because
-    // stdout/stderr still names the controlling tty. `-n` is the explicit case
-    // where a new session acquires the tty and takes it over.
-    if (spec.new_session or parentIsForeground(tty_fd)) {
-        // The child's group has to be foreground or a program reading the terminal is
-        // stopped by SIGTTIN; this must run while SIGTTOU is still ignored.
+    } else if (parentIsForeground(tty_fd)) {
+        // Only take the foreground when zinit owned it: a background zinit must
+        // not steal the shell's terminal just because stdio still names it.
+        // The child's group has to be foreground or a program reading the
+        // terminal is stopped by SIGTTIN, this must run while SIGTTOU is still
+        // ignored.
         checks.checkLazy(signalIsIgnored, .{Sig.TTOU}, "child: SIGTTOU must stay ignored while taking the terminal");
         const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
         switch (io.syscallErrno(std.os.linux.tcsetpgrp(tty_fd, &pgrp))) {
             .SUCCESS, .NOTTY, .NXIO => {},
-            // Anything but the no-terminal cases leaves the child in the background.
             else => |e| log.warn("{s}: {e}", .{ "unable to set foreground process group", e }),
         }
     }
@@ -234,33 +271,45 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
     return null;
 }
 
-/// Runs in the forked child and never returns to the parent's code path: it
-/// either execs the workload or exits with the failure code.
-pub fn run(spec: SpawnSpec, signal_config: *const SignalConfig, parent: std.os.linux.pid_t) u8 {
+pub fn run(
+    spec: SpawnSpec,
+    signal_config: *const SignalConfig,
+    parent: std.os.linux.pid_t,
+    exec_error_fd: std.os.linux.fd_t,
+) u8 {
     checks.check(spec.argv[0] != null, "child: spawn spec has no program name");
     checks.check(parent > 0, "child: parent pid must be positive in the child");
     if (spec.ctty) |fd| checks.check(fd >= 0, "child: controlling terminal descriptor is negative");
     if (setupTerminal(spec)) |code| return code;
 
-    if (signal_config.restoreChild()) |failure| return reportFailure(1, &.{
-        "unable to restore child signal state (", @tagName(failure.step), "): ",
-    }, failure.errno);
+    if (signal_config.restoreChild()) |failure| {
+        @branchHint(.cold);
+        reportFailure(&.{
+            "unable to restore child signal state (", @tagName(failure.step), "): ",
+        }, failure.errno);
+    }
 
     if (spec.pdeath_signal) |sig| {
         const option = @backingInt(std.os.linux.PR.SET_PDEATHSIG);
         const rc = std.os.linux.prctl(option, sig, 0, 0, 0);
         switch (io.syscallErrno(rc)) {
             .SUCCESS => {
-                // PDEATHSIG only trigger for a death after it is set. If the parent is
-                // already gone, nobody will ever tell us, so die the way it promised,
-                // the signal is still blocked here and lands before `execve`.
+                // PDEATHSIG only triggers for a death after it is set. If the parent is
+                // already gone, nobody will ever tell us, so send it ourselves. It is
+                // still blocked here and is delivered when the first exec attempt
+                // restores the caller's mask; if that mask blocks it, the workload
+                // inherits it pending instead.
                 if (std.os.linux.getppid() != parent) {
+                    @branchHint(.unlikely);
                     _ = std.os.linux.kill(std.os.linux.getpid(), @fromBackingInt(@intCast(sig)));
                 }
             },
-            else => |e| return reportFailure(1, &.{
-                "unable to set parent death signal: ",
-            }, e),
+            else => |e| {
+                @branchHint(.cold);
+                reportFailure(&.{
+                    "unable to set parent death signal: ",
+                }, e);
+            },
         }
     }
 
@@ -268,12 +317,25 @@ pub fn run(spec: SpawnSpec, signal_config: *const SignalConfig, parent: std.os.l
         if (waitForTracer(signal_config)) |code| return code;
     }
 
-    return execChild(spec.argv, spec.envs);
+    return execChild(signal_config, exec_error_fd, spec.argv, spec.envs);
 }
 
 // kcov-exclude-tests (everything below is test-only).
 // Real fork/exec/PATH checks live in tests/integration/process.zig; this is the
 // pure mapping that stays in the unit target.
+test "pathCandidate keeps a bare name for an empty entry and skips an overlong path" {
+    var buf: [16]u8 = undefined;
+
+    const bare = pathCandidate("", "prog", "prog", &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("prog", std.mem.span(bare));
+
+    const joined = pathCandidate("d", "prog", "prog", &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("d/prog", std.mem.span(joined));
+
+    // dir + '/' + file + NUL no longer fits: skipped, never truncated.
+    try std.testing.expect(pathCandidate("123456789012345", "prog", "prog", &buf) == null);
+}
+
 test "execExitCode maps an errno to an exit code" {
     try std.testing.expectEqual(@as(u8, 127), execExitCode(.NOENT));
     try std.testing.expectEqual(@as(u8, 127), execExitCode(.NOTDIR));
