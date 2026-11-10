@@ -6,6 +6,7 @@
 //! happens if exec fails.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 const io = @import("io.zig");
 const log = @import("log.zig");
 const fmt = @import("fmt.zig");
@@ -28,6 +29,8 @@ pub const SpawnSpec = struct {
 
 /// Report and hand back the code: this side has no panic machinery set up.
 fn reportFailure(code: u8, parts: []const []const u8, errno: std.os.linux.E) u8 {
+    checks.checkLazy(signalIsBlocked, .{Sig.PIPE}, "child: the failure report must run with signals blocked");
+
     var buf: [512]u8 = undefined;
     var out: usize = 0;
     out = fmt.appendBytes(&buf, out, "zinit child error: ");
@@ -49,6 +52,12 @@ fn signalIsIgnored(sig: Sig) bool {
     var act: std.os.linux.Sigaction = undefined;
     if (io.syscallErrno(std.os.linux.sigaction(sig, null, &act)) != .SUCCESS) return false;
     return act.handler.handler == Sig.IGN;
+}
+
+fn signalIsBlocked(sig: Sig) bool {
+    var current: std.os.linux.sigset_t = undefined;
+    if (io.syscallErrno(std.os.linux.sigprocmask(Sig.BLOCK, null, &current)) != .SUCCESS) return false;
+    return std.os.linux.sigismember(&current, sig);
 }
 
 /// Default search path used when `PATH` is unset (mirrors execvp).
@@ -127,7 +136,7 @@ fn execChild(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const
 }
 
 fn waitForTracer(signal_config: *const SignalConfig) ?u8 {
-    std.debug.assert(std.os.linux.sigismember(&signal_config.current_set, Sig.USR1));
+    checks.check(std.os.linux.sigismember(&signal_config.current_set, Sig.USR1), "child: SIGUSR1 must be blocked while waiting for the tracer");
 
     const usr1 = comptime blk: {
         var set = std.os.linux.sigemptyset();
@@ -213,7 +222,7 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
     if (spec.new_session or parentIsForeground(tty_fd)) {
         // The child's group has to be foreground or a program reading the terminal is
         // stopped by SIGTTIN; this must run while SIGTTOU is still ignored.
-        std.debug.assert(signalIsIgnored(Sig.TTOU));
+        checks.checkLazy(signalIsIgnored, .{Sig.TTOU}, "child: SIGTTOU must stay ignored while taking the terminal");
         const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
         switch (io.syscallErrno(std.os.linux.tcsetpgrp(tty_fd, &pgrp))) {
             .SUCCESS, .NOTTY, .NXIO => {},
@@ -228,6 +237,9 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
 /// Runs in the forked child and never returns to the parent's code path: it
 /// either execs the workload or exits with the failure code.
 pub fn run(spec: SpawnSpec, signal_config: *const SignalConfig, parent: std.os.linux.pid_t) u8 {
+    checks.check(spec.argv[0] != null, "child: spawn spec has no program name");
+    checks.check(parent > 0, "child: parent pid must be positive in the child");
+    if (spec.ctty) |fd| checks.check(fd >= 0, "child: controlling terminal descriptor is negative");
     if (setupTerminal(spec)) |code| return code;
 
     if (signal_config.restoreChild()) |failure| return reportFailure(1, &.{

@@ -5,6 +5,7 @@
 //! Minimal logger: no allocation, no `std.log`, one mutable global for sink and level.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 const builtin = @import("builtin");
 const tty = @import("tty.zig");
 const fmt = @import("fmt.zig");
@@ -94,7 +95,7 @@ pub fn deinit() void {
 fn UnsignedPositiveType(comptime T: type) type {
     const info = @typeInfo(T);
     comptime {
-        std.debug.assert(info == .int);
+        checks.comptimeCheck(info == .int, "log: expected an integer type");
     }
 
     if (info.int.signedness == .unsigned) return T;
@@ -106,7 +107,8 @@ fn UnsignedPositiveType(comptime T: type) type {
 fn decimalLen(comptime T: type) usize {
     comptime {
         const info = @typeInfo(T);
-        std.debug.assert(info == .int and info.int.signedness == .unsigned);
+        checks.comptimeCheck(info == .int, "log: expected an integer type");
+        checks.comptimeCheck(info.int.signedness == .unsigned, "log: expected an unsigned type");
     }
 
     const max_val = std.math.maxInt(T);

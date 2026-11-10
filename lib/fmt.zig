@@ -39,7 +39,7 @@ fn parse(format: []const u8, argument_count: usize) []const Piece {
         @compileError("format placeholders and arguments differ in: " ++ format);
     }
 
-    std.debug.assert(n <= pieces.len);
+    checks.comptimeCheck(n <= pieces.len, "fmt: parsed pieces exceed the template scratch");
     return pieces[0..n];
 }
 

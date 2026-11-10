@@ -38,7 +38,7 @@ const signal_batch: usize = signalfd.Source.batch_max;
 const Payload = struct { value: u64 };
 
 comptime {
-    std.debug.assert(signal_batch <= signal_quota);
+    checks.comptimeCheck(signal_batch <= signal_quota, "workload: signal batch exceeds quota");
 }
 
 /// The last event observed for the main child in one drain round. A single value,
@@ -174,6 +174,7 @@ pub const State = struct {
         payload: ?Payload,
         flags: u32,
     ) usize {
+        checks.check(fd >= 0, "workload: pidfd send needs a valid descriptor");
         if (payload) |p| {
             var info = signal.queueInfo(@intCast(@backingInt(target)), p.value);
             const rc = std.os.linux.pidfd_send_signal(fd, target, &info, flags);
@@ -195,6 +196,9 @@ pub const State = struct {
     }
 
     fn signalChild(self: *const State, sig: u32, payload: ?Payload) bool {
+        checks.check(self.child.pid > 0, "workload: signalling a workload with no live child pid");
+        checks.check(sig > 0, "workload: signal number must be positive");
+        checks.check(sig < std.os.linux.NSIG, "workload: signal number out of range");
         if (self.child_reaped) {
             log.debug("not signalling {d}: the child's exit was already reported", .{sig});
             return false;
@@ -247,6 +251,8 @@ pub const State = struct {
     }
 
     fn signalProcessGroup(self: *State, sig: u32, payload: ?Payload) bool {
+        checks.check(sig > 0, "workload: group signal number must be positive");
+        checks.check(sig < std.os.linux.NSIG, "workload: group signal number out of range");
         const sent = if (self.group_number_only) blk: {
             if (payload != null) log.debug(
                 "dropping queued value for signal {d}: numeric group send cannot carry it",
@@ -291,6 +297,8 @@ pub const State = struct {
     }
 
     fn signalGroupByNumber(self: *const State, sig: u32) bool {
+        checks.check(sig > 0, "workload: numeric group signal number must be positive");
+        checks.check(sig < std.os.linux.NSIG, "workload: numeric group signal number out of range");
         const flags = std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT;
         var info: std.os.linux.siginfo_t = undefined;
         switch (io.syscallErrno(std.os.linux.waitid(.PGID, self.child.pid, &info, flags, null))) {
@@ -338,7 +346,8 @@ pub const State = struct {
     fn forwardSignal(self: *State, event: signal.Event) void {
         const signo = event.signo;
 
-        checks.check(signo > 0 and signo < std.os.linux.NSIG, "workload: signalfd delivered an out-of-range signal");
+        checks.check(signo > 0, "workload: signalfd delivered a non-positive signal");
+        checks.check(signo < std.os.linux.NSIG, "workload: signalfd delivered an out-of-range signal");
 
         const from_kernel = event.code == signal.SI.KERNEL;
 
@@ -431,6 +440,7 @@ pub const State = struct {
 
     // One call per reap round; outlined, the signal loop keeps a smaller frame.
     noinline fn reapAndReport(self: *State) ?Outcome {
+        checks.check(self.child.pid > 0, "workload: reap round without a live child pid");
         const reap = drain(
             self.child.pid,
             self.policy.expected_exit,
@@ -484,6 +494,7 @@ pub const State = struct {
     }
 
     fn beginShutdown(self: *State, exit_code: u8) void {
+        checks.check(self.shutdown == null, "workload: shutdown began twice");
         const now = monotonicNs() catch {
             @branchHint(.unlikely);
             self.shutdown = ShutdownState.init(.{
@@ -591,6 +602,7 @@ fn drain(
     main_reaped: *bool,
     quota: usize,
 ) errors.SysCallError!DrainResult {
+    checks.check(child_pid > 0, "workload: drain needs a positive child pid");
     checks.check(quota > 0, "workload: reap quota must be positive");
 
     var result: DrainResult = .{ .no_children = false };
@@ -605,6 +617,7 @@ fn drain(
         switch (io.syscallErrno(rc)) {
             .SUCCESS => {
                 reaped += 1;
+                checks.check(reaped <= quota, "workload: reaped more children than the quota allows");
                 const pid: std.os.linux.pid_t = @intCast(rc);
                 const wait_status = WaitStatus.fromRaw(status);
                 const is_main = !main_reaped.* and pid == child_pid;

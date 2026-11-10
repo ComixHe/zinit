@@ -5,6 +5,7 @@
 //! Raw descriptor helpers: straight to the syscalls, and the bottom of the stack.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 const builtin = @import("builtin");
 
 pub const Context = struct {
@@ -28,6 +29,7 @@ noinline fn sharedSyscallErrno(rc: usize) std.os.linux.E {
 
 /// Returns the errno that stopped the write, or null when every byte was written.
 pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
+    checks.check(fd >= 0, "io: writeAll needs a valid descriptor");
     var offset: usize = 0;
     while (offset < bytes.len) {
         const rc = std.os.linux.write(fd, bytes.ptr + offset, bytes.len - offset);

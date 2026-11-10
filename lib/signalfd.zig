@@ -23,6 +23,7 @@ pub const Config = struct {
     /// On failure the process signal state may be partly changed: the caller must
     /// not continue to run the workload (main exits).
     pub fn install(comptime unblocked: []const signal.Sig) !Config {
+        checks.check(unblocked.len < std.os.linux.NSIG, "signalfd: unblocked set must be smaller than NSIG");
         const set = comptime mask: {
             var result = std.os.linux.sigfillset();
             for (unblocked) |sig| std.os.linux.sigdelset(&result, sig);
@@ -160,6 +161,7 @@ pub const Source = struct {
 
     pub fn waitBatch(self: *Source, out: []signal.Event, timeout_ms: i32) SysCallError!usize {
         checks.check(out.len > 0, "signalfd: waitBatch needs room for at least one event");
+        checks.check(timeout_ms >= -1, "signalfd: timeout must be -1 or non-negative");
         checks.check(out.len <= batch_max, "signalfd: batch buffer exceeds the per-read bound");
 
         if (timeout_ms != 0) {
@@ -197,6 +199,7 @@ pub const Source = struct {
     }
 
     fn readBatch(self: *Source, out: []signal.Event) SysCallError!usize {
+        checks.check(self.fd >= 0, "signalfd: readBatch on a closed source");
         var raw: [batch_max]std.os.linux.signalfd_siginfo = undefined;
         const bytes = std.mem.sliceAsBytes(raw[0..out.len]);
         const rc = std.os.linux.read(self.fd, bytes.ptr, bytes.len);
@@ -216,6 +219,8 @@ pub const Source = struct {
         checks.check(rc % @sizeOf(std.os.linux.signalfd_siginfo) == 0, "signalfd: kernel returned a partial siginfo record");
         checks.check(got <= out.len, "signalfd: kernel reported more events than the buffer holds");
         for (raw[0..got], out[0..got]) |raw_info, *event| {
+            checks.check(raw_info.signo > 0, "signalfd: kernel delivered a non-positive signal number");
+            checks.check(raw_info.signo < std.os.linux.NSIG, "signalfd: kernel delivered an out-of-range signal number");
             event.* = .{
                 .signo = raw_info.signo,
                 .code = raw_info.code,

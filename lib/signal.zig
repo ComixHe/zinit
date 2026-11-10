@@ -5,6 +5,7 @@
 //! Signal identity: the standard names and numbers, and what the command line accepts.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 const ConfigError = @import("errors.zig").ConfigError;
 const str = @import("str.zig");
 
@@ -30,6 +31,9 @@ pub const Event = struct {
 };
 
 pub fn queueInfo(signo: u32, value: u64) std.os.linux.siginfo_t {
+    checks.check(signo > 0, "signal: queueInfo needs a positive signal number");
+    checks.check(signo < std.os.linux.NSIG, "signal: queueInfo signal number out of range");
+
     var info = std.mem.zeroes(std.os.linux.siginfo_t);
     info.signo = @fromBackingInt(@intCast(signo));
     info.code = SI.QUEUE;
@@ -93,7 +97,10 @@ pub fn parse(text: []const u8) ConfigError!u32 {
     if (name_to_check.len == 0 or name_to_check.len > 15) return ConfigError.InvalidSignal;
 
     // The table covers 1..=max, so a hit is standard by construction.
-    return lookupStandardSignal(name_to_check) orelse ConfigError.InvalidSignal;
+    const found = lookupStandardSignal(name_to_check) orelse return ConfigError.InvalidSignal;
+    checks.check(found > 0, "signal: name lookup returned a non-positive number");
+    checks.check(found < std.os.linux.NSIG, "signal: name lookup returned an out-of-range number");
+    return found;
 }
 
 // kcov-exclude-tests (everything below is test-only).

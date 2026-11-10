@@ -29,6 +29,10 @@ pub fn parseDecimal(comptime T: type, text: []const u8) error{ InvalidCharacter,
     if (text.len == 0) return error.InvalidCharacter;
 
     const Wide = @Int(.unsigned, @max(info.int.bits, 8));
+    comptime {
+        checks.comptimeCheck(@bitSizeOf(Wide) >= @bitSizeOf(T), "str: Wide must hold T");
+        checks.comptimeCheck(@bitSizeOf(Wide) >= 8, "str: Wide must hold a digit");
+    }
     const max: Wide = std.math.maxInt(T);
     var value: Wide = 0;
 

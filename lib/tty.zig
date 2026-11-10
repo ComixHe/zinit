@@ -7,12 +7,14 @@
 //! before the child starts a new session.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 const io = @import("io.zig");
 
 const log = @import("log.zig");
 
 /// Whether a terminal is attached to `fd`.
 pub fn isTty(fd: std.os.linux.fd_t) bool {
+    checks.check(fd >= 0, "tty: isTty needs a valid descriptor");
     var termios: std.os.linux.termios = undefined;
     return io.syscallErrno(std.os.linux.tcgetattr(fd, &termios)) == .SUCCESS;
 }
@@ -20,6 +22,7 @@ pub fn isTty(fd: std.os.linux.fd_t) bool {
 /// Whether `fd` is this session's controlling terminal, regardless of whether
 /// zinit's process group is in the foreground. `tcgetpgrp` also rejects non-tty fds.
 pub fn isControlTerminal(fd: std.os.linux.fd_t) bool {
+    checks.check(fd >= 0, "tty: isControlTerminal needs a valid descriptor");
     var pgrp: std.os.linux.pid_t = undefined;
     return io.syscallErrno(std.os.linux.tcgetpgrp(fd, &pgrp)) == .SUCCESS;
 }
@@ -29,6 +32,7 @@ pub fn isControlTerminal(fd: std.os.linux.fd_t) bool {
 /// leader, the pair actually goes to the foreground group, which need not be the
 /// leader, so a later kernel HUP/CONT can be mistaken for it.
 pub fn detachFromControlTerminal(fd: std.os.linux.fd_t) bool {
+    checks.check(fd >= 0, "tty: detachFromControlTerminal needs a valid descriptor");
     const rc = std.os.linux.ioctl(fd, std.os.linux.T.IOCNOTTY, 0);
     switch (io.syscallErrno(rc)) {
         .SUCCESS => {},

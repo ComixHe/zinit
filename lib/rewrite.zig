@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const fuzz_input = @import("fuzz_input.zig");
+const checks = @import("checks.zig");
 
 const errors = @import("errors.zig");
 const signal = @import("signal.zig");
@@ -50,6 +51,8 @@ pub const Map = struct {
     /// Inlined so `target` and the error union are resolved against the one
     /// caller instead of through a call boundary.
     pub inline fn apply(rewrites: *const Map, signo: u32) ConfigError!u32 {
+        checks.check(signo > 0, "rewrite: apply needs a positive signal number");
+        checks.check(signo < std.os.linux.NSIG, "rewrite: apply signal number out of range");
         return if (try rewrites.target(signo)) |rewritten| rewritten else signo;
     }
 
@@ -92,6 +95,7 @@ pub const Map = struct {
         }
 
         self.set(old_sig, new_sig) catch unreachable;
+        checks.check((self.target(old_sig) catch unreachable) == new_sig, "rewrite: stored target does not read back");
     }
 
     /// Not a plain reachability query: an existing cycle also counts, so `parse`

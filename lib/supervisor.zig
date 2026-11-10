@@ -5,6 +5,7 @@
 //! The parent process: setup, starting the workload, and the supervision loop.
 
 const std = @import("std");
+const checks = @import("checks.zig");
 const io = @import("io.zig");
 const errors = @import("errors.zig");
 const log = @import("log.zig");
@@ -28,6 +29,7 @@ pub fn spawn(
     spec: SpawnSpec,
     signal_config: *const SignalConfig,
 ) errors.SysCallError!ProcessHandle {
+    checks.check(spec.argv[0] != null, "supervisor: spawn needs a program name");
     const self_pid = std.os.linux.getpid();
     const flags: u32 = @backingInt(Sig.CHLD) | std.os.linux.CLONE.PIDFD;
     var pidfd: std.os.linux.fd_t = -1;
@@ -97,6 +99,7 @@ pub fn supervise(
     signal_config: *const SignalConfig,
     spawned: *ProcessHandle,
 ) Outcome {
+    checks.check(spawned.pid > 0, "supervisor: supervise needs a spawned child");
     defer spawned.close();
 
     var source = signalfd.Source.open(signal_config) catch {
