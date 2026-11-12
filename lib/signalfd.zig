@@ -5,6 +5,8 @@
 //! The parent-side signal setup the child inherits
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_config = @import("config");
 const io = @import("io.zig");
 const checks = @import("checks.zig");
 const log = @import("log.zig");
@@ -13,7 +15,7 @@ const SysCallError = @import("errors.zig").SysCallError;
 
 pub const Config = struct {
     current_set: std.os.linux.sigset_t,
-    /// The mask as it was before `install`, so the parent side can be put back.
+    /// The mask as it was before `install`
     previous_set: std.os.linux.sigset_t,
     ttin_action: std.os.linux.Sigaction,
     ttou_action: std.os.linux.Sigaction,
@@ -21,9 +23,16 @@ pub const Config = struct {
 
     /// Installs the process-wide mask and dispositions the supervisor relies on.
     /// On failure the process signal state may be partly changed: the caller must
-    /// not continue to run the workload (main exits).
-    pub fn install(comptime unblocked: []const signal.Sig) !Config {
+    /// not continue to run the workload.
+    pub fn install(comptime unblocked: []const signal.Sig) SysCallError!Config {
         checks.comptimeCheck(unblocked.len < std.os.linux.NSIG, "signalfd: unblocked set must be smaller than NSIG");
+        comptime {
+            for (unblocked) |sig| {
+                checks.comptimeCheck(sig != .KILL, "signalfd: KILL cannot be handled");
+                checks.comptimeCheck(sig != .STOP, "signalfd: STOP cannot be handled");
+            }
+        }
+
         const set = comptime mask: {
             var result = std.os.linux.sigfillset();
             for (unblocked) |sig| std.os.linux.sigdelset(&result, sig);
@@ -131,6 +140,15 @@ pub const Config = struct {
     }
 };
 
+fn decodeRecord(raw: *const std.os.linux.signalfd_siginfo) signal.Event {
+    return .{
+        .signo = raw.signo,
+        .code = raw.code,
+        .value = raw.ptr,
+        .sender = @intCast(raw.pid),
+    };
+}
+
 /// Where the supervisor gets delivered signals from.
 pub const Source = struct {
     fd: std.os.linux.fd_t,
@@ -152,8 +170,9 @@ pub const Source = struct {
     }
 
     pub fn close(self: *Source) void {
+        if (self.fd < 0) return;
         io.closeQuietly(self.fd);
-        self.* = undefined;
+        self.fd = -1;
     }
 
     pub fn waitBatch(self: *Source, out: []signal.Event, timeout_ms: i32) SysCallError!usize {
@@ -177,13 +196,17 @@ pub const Source = struct {
                     return error.SysCallError;
                 },
             }
-            if (pfd[0].revents == 0) return 0; // timeout
+            if (pfd[0].revents == 0) {
+                @branchHint(.unlikely);
+                return 0; // timeout
+            }
 
             const poll_errors = std.os.linux.POLL.ERR |
                 std.os.linux.POLL.HUP |
                 std.os.linux.POLL.NVAL;
 
             if (pfd[0].revents & poll_errors != 0) {
+                @branchHint(.cold);
                 const revents: u64 = @intCast(pfd[0].revents);
                 log.err("poll error on signalfd: revents=0x{x}", .{revents});
                 return error.SysCallError;
@@ -212,20 +235,149 @@ pub const Source = struct {
         }
 
         const got = rc / @sizeOf(std.os.linux.signalfd_siginfo);
-        // The kernel writes whole records and never more than the buffer holds.
         checks.check(rc % @sizeOf(std.os.linux.signalfd_siginfo) == 0, "signalfd: kernel returned a partial siginfo record");
         checks.check(got <= out.len, "signalfd: kernel reported more events than the buffer holds");
-        for (raw[0..got], out[0..got]) |raw_info, *event| {
+        for (raw[0..got], out[0..got]) |*raw_info, *event| {
             checks.check(raw_info.signo > 0, "signalfd: kernel delivered a non-positive signal number");
             checks.check(raw_info.signo < std.os.linux.NSIG, "signalfd: kernel delivered an out-of-range signal number");
-            event.* = .{
-                .signo = raw_info.signo,
-                .code = raw_info.code,
-                .value = raw_info.ptr,
-                .sender = @intCast(raw_info.pid),
-            };
+            event.* = decodeRecord(raw_info);
         }
 
         return got;
+    }
+};
+
+// kcov-exclude-tests (everything below is test-only).
+test "decodeRecord maps a kernel record onto a signal event" {
+    var raw = std.mem.zeroes(std.os.linux.signalfd_siginfo);
+    raw.signo = 10;
+    raw.code = signal.SI.QUEUE;
+    raw.ptr = 0x1234_5678_9abc_def0;
+    raw.pid = 4321;
+
+    const event = decodeRecord(&raw);
+    try std.testing.expectEqual(@as(u32, 10), event.signo);
+    try std.testing.expectEqual(signal.SI.QUEUE, event.code);
+    try std.testing.expectEqual(@as(u64, 0x1234_5678_9abc_def0), event.value);
+    try std.testing.expectEqual(@as(std.os.linux.pid_t, 4321), event.sender);
+}
+
+comptime {
+    if (builtin.is_test and build_config.include_private_integration_tests) _ = private_tests;
+}
+
+const private_tests = struct {
+    test "private integration: waitBatch decodes queued records and their values" {
+        const first: u32 = std.os.linux.sigrtmin() + 1;
+        const second: u32 = std.os.linux.sigrtmin() + 2;
+
+        var set: std.os.linux.sigset_t = std.posix.sigemptyset();
+        std.posix.sigaddset(&set, @fromBackingInt(@intCast(first)));
+        std.posix.sigaddset(&set, @fromBackingInt(@intCast(second)));
+
+        var previous: std.os.linux.sigset_t = undefined;
+        std.posix.sigprocmask(std.os.linux.SIG.BLOCK, &set, &previous);
+        defer std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &previous, null);
+        defer drainPending(&set);
+
+        const raw = std.os.linux.signalfd(
+            -1,
+            &set,
+            std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC,
+        );
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(raw));
+        var source: Source = .{ .fd = @intCast(raw) };
+        defer source.close();
+
+        try queueRealtime(first, 0xaaaa);
+        try queueRealtime(second, 0xbbbb);
+
+        var one: [1]signal.Event = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try source.waitBatch(&one, 0));
+        try std.testing.expectEqual(first, one[0].signo);
+        try std.testing.expectEqual(signal.SI.QUEUE, one[0].code);
+        try std.testing.expectEqual(@as(u64, 0xaaaa), one[0].value);
+
+        try std.testing.expectEqual(@as(usize, 1), try source.waitBatch(&one, 0));
+        try std.testing.expectEqual(second, one[0].signo);
+        try std.testing.expectEqual(@as(u64, 0xbbbb), one[0].value);
+
+        try std.testing.expectEqual(@as(usize, 0), try source.waitBatch(&one, 0));
+
+        try queueRealtime(first, 0x1111);
+        try queueRealtime(second, 0x2222);
+
+        var both: [2]signal.Event = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try source.waitBatch(&both, 0));
+        try std.testing.expectEqual(first, both[0].signo);
+        try std.testing.expectEqual(@as(u64, 0x1111), both[0].value);
+        try std.testing.expectEqual(second, both[1].signo);
+        try std.testing.expectEqual(@as(u64, 0x2222), both[1].value);
+
+        try std.testing.expectEqual(@as(usize, 0), try source.waitBatch(&both, 0));
+    }
+
+    test "private integration: waitBatch caps one read at the batch size" {
+        const rt = std.os.linux.sigrtmin() + 4;
+        var set = std.posix.sigemptyset();
+        std.posix.sigaddset(&set, @fromBackingInt(@intCast(rt)));
+
+        var previous: std.os.linux.sigset_t = undefined;
+        std.posix.sigprocmask(std.os.linux.SIG.BLOCK, &set, &previous);
+        defer std.posix.sigprocmask(std.os.linux.SIG.SETMASK, &previous, null);
+        defer drainPending(&set);
+
+        const raw = std.os.linux.signalfd(
+            -1,
+            &set,
+            std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC,
+        );
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(raw));
+        var source: Source = .{ .fd = @intCast(raw) };
+        defer source.close();
+
+        var i: u64 = 0;
+        while (i < 10) : (i += 1) try queueRealtime(rt, 0x100 + i);
+
+        var first: [Source.batch_max]signal.Event = undefined;
+        try std.testing.expectEqual(@as(usize, Source.batch_max), try source.waitBatch(&first, 0));
+        for (first, 0..) |event, index| {
+            try std.testing.expectEqual(rt, event.signo);
+            try std.testing.expectEqual(@as(u64, 0x100 + index), event.value);
+        }
+
+        var rest: [2]signal.Event = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try source.waitBatch(&rest, 0));
+        try std.testing.expectEqual(@as(u64, 0x108), rest[0].value);
+        try std.testing.expectEqual(@as(u64, 0x109), rest[1].value);
+
+        var none: [1]signal.Event = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try source.waitBatch(&none, 0));
+    }
+
+    fn queueRealtime(signo: u32, value: u64) !void {
+        const info = signal.queueInfo(signo, value);
+        const rc = std.os.linux.syscall3(
+            .rt_sigqueueinfo,
+            @intCast(std.os.linux.getpid()),
+            signo,
+            @intFromPtr(&info),
+        );
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+    }
+
+    fn drainPending(set: *const std.os.linux.sigset_t) void {
+        const zero = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+        var info: std.os.linux.siginfo_t = undefined;
+        while (true) {
+            const rc = std.os.linux.syscall4(
+                .rt_sigtimedwait,
+                @intFromPtr(set),
+                @intFromPtr(&info),
+                @intFromPtr(&zero),
+                std.os.linux.NSIG / 8,
+            );
+            if (std.os.linux.errno(rc) != .SUCCESS) break;
+        }
     }
 };
