@@ -58,12 +58,12 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
 
     const unblocked_sigs = [_]Sig{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP };
     const signal_config = lib.signalfd.Config.install(&unblocked_sigs) catch {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         return 1;
     };
 
     supervisor.setupSubreaper(args.subreaper) catch {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         return 1;
     };
 
@@ -101,7 +101,7 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
     lib.crash.setPhase(.spawn);
 
     var spawned = supervisor.spawn(spec, &signal_config) catch {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         return 1;
     };
 
@@ -124,7 +124,7 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
 
 fn dispatch(init: std.process.Init.Minimal, ctx: lib.io.Context) ParsedBehavior {
     const action = Args.parse(init) catch |e| {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         if (e == lib.errors.ZinitError.MissingCommand) Args.printHelp(ctx.err);
         return .{ .exit = 1 };
     };

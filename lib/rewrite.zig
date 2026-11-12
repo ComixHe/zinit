@@ -63,30 +63,30 @@ pub const Map = struct {
             old_sig == @backingInt(signal.Sig.STOP) or
             old_sig == @backingInt(signal.Sig.CHLD))
         {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             return ConfigError.InvalidRewrite;
         }
 
         const rest = value[sep + 1 ..];
         if (str.indexOfByte(rest, ':') != null) {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             return ConfigError.InvalidRewrite;
         }
 
         const new_sig = try parseTarget(rest);
 
         if (old_sig == new_sig) {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             return ConfigError.DuplicateSignal;
         }
 
         if (new_sig != 0 and (self.reaches(new_sig, old_sig) catch unreachable)) {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             return ConfigError.CycleRewrite;
         }
 
         if ((self.target(old_sig) catch unreachable) != null) {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             return ConfigError.DuplicateSignal;
         }
 

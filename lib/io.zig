@@ -35,7 +35,11 @@ pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
         const rc = std.os.linux.write(fd, bytes.ptr + offset, bytes.len - offset);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
-                if (rc == 0) return null;
+                if (rc == 0) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
+
                 offset += rc;
             },
             .INTR => {},
