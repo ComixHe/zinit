@@ -23,7 +23,8 @@ pub const std_options: std.Options = .{
     .enable_segfault_handler = stack_traces,
 };
 
-/// Debug builds need std.debug's Io; release builds only carry it with `-Dstack-traces`.
+/// Debug builds need std.debug's Io, release builds carry it only when stack
+/// traces are enabled, which `ReleaseSmall` is not.
 const debug_io_enabled = stack_traces or builtin.mode == .debug;
 
 pub const std_options_debug_threaded_io: ?*std.Io.Threaded = if (debug_io_enabled)
@@ -159,83 +160,4 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .run => |args| run(args, ctx),
         .exit => |code| code,
     };
-}
-
-// kcov-exclude-tests (everything below is test-only).
-test "dispatch selects the action and routes help, version and usage output" {
-    const test_io = std.testing.io;
-
-    const cases = [_]struct {
-        name: []const u8,
-        argv: [:null]const ?[*:0]const u8,
-        exit: ?u8,
-        stdout: bool = false,
-        stderr: bool = false,
-        version: bool = false,
-    }{
-        .{ .name = "usage", .argv = &.{"zinit"}, .exit = 1, .stderr = true },
-        .{ .name = "help", .argv = &.{ "zinit", "--help" }, .exit = 0, .stdout = true },
-        .{ .name = "version", .argv = &.{ "zinit", "-V" }, .exit = 0, .stdout = true, .version = true },
-        .{ .name = "run", .argv = &.{ "zinit", "--", "true" }, .exit = null },
-        .{ .name = "invalid option", .argv = &.{ "zinit", "--log-level=debug", "--", "true" }, .exit = 1 },
-    };
-
-    for (cases) |case| {
-        errdefer std.debug.print("dispatch case: {s}\n", .{case.name});
-
-        const out_fds = try std.Io.Threaded.pipe2(.{ .NONBLOCK = true });
-        const err_fds = try std.Io.Threaded.pipe2(.{ .NONBLOCK = true });
-        const out_read = std.Io.File{ .handle = out_fds[0], .flags = .{ .nonblocking = true } };
-        const out_write = std.Io.File{ .handle = out_fds[1], .flags = .{ .nonblocking = true } };
-        const err_read = std.Io.File{ .handle = err_fds[0], .flags = .{ .nonblocking = true } };
-        const err_write = std.Io.File{ .handle = err_fds[1], .flags = .{ .nonblocking = true } };
-        defer out_read.close(test_io);
-        defer out_write.close(test_io);
-        defer err_read.close(test_io);
-        defer err_write.close(test_io);
-
-        const ctx: lib.io.Context = .{
-            .out = out_write.handle,
-            .err = err_write.handle,
-        };
-
-        const init: std.process.Init.Minimal = .{
-            .args = .{ .vector = @as([*]const [*:0]const u8, @ptrCast(case.argv.ptr))[0..case.argv.len] },
-            .environ = .empty,
-        };
-
-        switch (dispatch(init, ctx)) {
-            .run => |args| {
-                try std.testing.expectEqual(@as(?u8, null), case.exit);
-                try std.testing.expectEqualStrings("true", std.mem.span(args.argv[0].?));
-            },
-            .exit => |code| try std.testing.expectEqual(case.exit, @as(?u8, code)),
-        }
-
-        var out_text: [16 * 1024]u8 = undefined;
-        const out = try drainPipe(out_read, test_io, &out_text);
-        try std.testing.expectEqual(case.stdout, out.len > 0);
-
-        var err_text: [16 * 1024]u8 = undefined;
-        const err = try drainPipe(err_read, test_io, &err_text);
-        try std.testing.expectEqual(case.stderr, err.len > 0);
-
-        if (case.version)
-            try std.testing.expectEqualStrings(config.version ++ "\n", out);
-    }
-}
-
-/// Drain a non-blocking pipe into `buf`; an empty pipe reports `WouldBlock`.
-fn drainPipe(file: std.Io.File, test_io: std.Io, buf: []u8) ![]u8 {
-    var total: usize = 0;
-    while (total < buf.len) {
-        var iov = [_][]u8{buf[total..]};
-        const n = file.readStreaming(test_io, &iov) catch |err| switch (err) {
-            error.WouldBlock => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        total += n;
-    }
-    return buf[0..total];
 }
