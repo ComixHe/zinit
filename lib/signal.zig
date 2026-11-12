@@ -86,7 +86,8 @@ pub fn parse(text: []const u8) ConfigError!u32 {
 
     if (text[0] >= '0' and text[0] <= '9') {
         const sig_num = str.parseDecimal(u32, text) catch return ConfigError.InvalidSignal;
-        return if (isStandard(sig_num)) sig_num else ConfigError.InvalidSignal;
+        if (!isStandard(sig_num)) return ConfigError.InvalidSignal;
+        return sig_num;
     }
 
     const name_to_check = if (std.ascii.startsWithIgnoreCase(text, "SIG"))
