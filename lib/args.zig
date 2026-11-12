@@ -102,30 +102,28 @@ pub const Args = struct {
         version: bool = false,
     };
 
-    // Verbatim help output: breaking a line here would change what --help prints.
     const help_text =
         \\zinit - A tiny init for linux containers.
         \\
         \\Usage: zinit [options] <ARG>...
         \\
         \\Options:
-        \\  -h, --help                                                   Display this help and exit
-        \\  -V, --version                                                Output version information and exit
-        \\      --log-level <LEVEL> (Env: ZINIT_LOG_LEVEL)               Set log level: error, warn, info, or debug (default {s})
-        \\  -p, --signal <SIGNAL>                                        The triggered signal when parent process dies
-        \\  -s, --subreaper (Env: ZINIT_SUBREAPER)                       Enable child subreaper mode explicitly
-        \\  -n, --new-session                                            Enable new session mode explicitly
-        \\  -g, --forward-group                                          Forward signals to the whole process group
+        \\  -h, --help  Display this help and exit
+        \\  -V, --version  Output version information and exit
+        \\  --log-level <LEVEL> (Env: ZINIT_LOG_LEVEL)  Set log level: error, warn, info, or debug (default {s})
+        \\  -p, --signal <SIGNAL>  The triggered signal when parent process dies
+        \\  -s, --subreaper (Env: ZINIT_SUBREAPER)  Enable child subreaper mode
+        \\  -n, --new-session  Enable new session mode
+        \\  -g, --forward-group  Forward signals to the whole process group
         \\  -t, --shutdown-timeout <SECS> (Env: ZINIT_SHUTDOWN_TIMEOUT)  Descendant cleanup grace after exit (default 5)
-        \\  -r, --rewrite <OLD:NEW>...                                   Rewrite a forwarded signal before sending to the child
-        \\                                                               (repeatable; use "0" as NEW to drop the signal)
-        \\  -e, --expect-exit <CODE>...                                  Map child exit codes to 0 (repeatable)
+        \\  -r, --rewrite <OLD:NEW>...  Rewrite a forwarded signal before sending to the child
+        \\  (repeatable; use "0" as NEW to drop the signal)
+        \\  -e, --expect-exit <CODE>...  Map child exit codes to 0 (repeatable)
         \\
         \\Environment variables:
-        \\
         \\  ZINIT_TRACING_CHILD: If set, zinit will wait for SIGUSR1 to continue executing child process
         \\
-        \\Full help or any issues, please visit https://github.com/ComixHe/zinit
+        \\Homepage: https://github.com/ComixHe/zinit
         \\
     ;
 
@@ -245,7 +243,7 @@ pub const Args = struct {
 
             const option = lookup(arg) orelse {
                 if (arg.len > 0 and arg[0] == '-') {
-                    @branchHint(.unlikely);
+                    @branchHint(.cold);
                     return reject(ConfigError.InvalidParams, "unknown option", arg);
                 }
 
@@ -337,7 +335,7 @@ pub const Args = struct {
     /// Merges the environment, validates the combination and builds the action.
     fn resolve(init: std.process.Init.Minimal, options: Scanned) ConfigError!Action {
         if (options.help and options.version) {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             log.err("cannot combine: -h/--help and -V/--version", .{});
             return ConfigError.InvalidParams;
         }
@@ -347,7 +345,7 @@ pub const Args = struct {
         if (options.version) return .version;
 
         const start = options.child_start orelse {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             log.err("no command to run", .{});
             return ConfigError.MissingCommand;
         };
@@ -359,13 +357,13 @@ pub const Args = struct {
             init.environ.block.slice,
             options.shutdown_timeout_s,
         ) orelse {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             log.err("invalid ZINIT_SHUTDOWN_TIMEOUT value: expected seconds", .{});
             return ConfigError.InvalidParams;
         };
 
         if (shutdown_timeout_s_final > std.math.maxInt(u64) / std.time.ns_per_s) {
-            @branchHint(.unlikely);
+            @branchHint(.cold);
             log.err("shutdown timeout is too large", .{});
             return ConfigError.InvalidParams;
         }
