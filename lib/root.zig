@@ -20,6 +20,7 @@ pub const signalfd = @import("signalfd.zig");
 pub const wait = @import("wait.zig");
 pub const args = @import("args.zig");
 pub const supervisor = @import("supervisor.zig");
+pub const crash = @import("crash.zig");
 
 // kcov-exclude-tests (everything below is test-only).
 test {

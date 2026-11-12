@@ -13,6 +13,7 @@ const errors = @import("errors.zig");
 const log = @import("log.zig");
 const io = @import("io.zig");
 const checks = @import("checks.zig");
+const crash = @import("crash.zig");
 const wait = @import("wait.zig");
 const signal = @import("signal.zig");
 const rewrite = @import("rewrite.zig");
@@ -525,6 +526,7 @@ pub const State = struct {
 
     fn beginShutdown(self: *State, exit_code: u8) void {
         checks.check(self.shutdown == null, "workload: shutdown began twice");
+        crash.setPhase(.shutdown);
         const now = monotonicNs() catch {
             @branchHint(.unlikely);
             self.shutdown = ShutdownState.init(.{

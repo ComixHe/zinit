@@ -40,6 +40,7 @@ fn addConfig(b: *std.Build, config: Config, include_private_integration_tests: b
     options.addOption([]const u8, "version", config.manifest.version);
     options.addOption(bool, "tracing_child", config.tracing_child);
     options.addOption(bool, "stack_traces", config.stack_traces);
+    options.addOption(bool, "pie", config.pie);
     options.addOption(std.log.Level, "max_log_level", config.max_log_level);
     options.addOption(std.log.Level, "default_log_level", config.default_log_level);
     options.addOption(bool, "include_private_integration_tests", include_private_integration_tests);

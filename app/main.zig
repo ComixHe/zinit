@@ -45,8 +45,7 @@ fn minimalPanic(msg: []const u8, _: ?*std.lang.StackTrace, _: ?usize) noreturn {
         .{ .base = "\n", .len = 1 },
     };
 
-    _ = std.os.linux.writev(std.os.linux.STDERR_FILENO, &iov, 3);
-    std.os.linux.exit(1);
+    lib.crash.writeAndExit(&iov);
 }
 
 const ParsedBehavior = union(enum) {
@@ -99,6 +98,8 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
         break :blk lib.tty.isControlTerminal(fd) and lib.tty.detachFromControlTerminal(fd);
     };
 
+    lib.crash.setPhase(.spawn);
+
     var spawned = supervisor.spawn(spec, &signal_config) catch {
         @branchHint(.unlikely);
         return 1;
@@ -112,6 +113,8 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
         .ignore_initial_hup_cont = detached,
         .ctty = tty_fd,
     };
+
+    lib.crash.setPhase(.supervise);
 
     return switch (supervisor.supervise(policy, &signal_config, &spawned)) {
         .exited => |code| code,
@@ -147,6 +150,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
 
     log.init(ctx.err) catch unreachable;
+
+    // Without std.debug's crash reporter, install the minimal one so a fault
+    // still names the program counter; the address is symbolized offline.
+    if (comptime !stack_traces) lib.crash.install(config.pie);
 
     return switch (dispatch(init, ctx)) {
         .run => |args| run(args, ctx),
