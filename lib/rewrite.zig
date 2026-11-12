@@ -117,7 +117,7 @@ pub const Map = struct {
         return false;
     }
 
-    fn parseTarget(text: []const u8) !u32 {
+    fn parseTarget(text: []const u8) ConfigError!u32 {
         if (str.eql(text, "0")) return 0;
         return signal.parse(text);
     }
@@ -248,12 +248,12 @@ test "Map stays acyclic and atomic over arbitrary rewrite sequences" {
                     try expectSameTargets(before, map);
                 }
             }
+
+            try expectApplyMatchesTargets(map);
         }
     };
 
     return std.testing.fuzz(Context{}, Context.testOne, .{
-        // The test runner feeds corpus entries as `Smith.in`; its first four
-        // bytes are the little-endian payload length, not parser input.
         .corpus = &.{
             fuzz_input.slice("TERM:INT"),
             fuzz_input.slice("INT:HUP"),
@@ -291,6 +291,15 @@ fn expectAcyclic(map: Map) !void {
             seen.set(next);
             current = next;
         }
+    }
+}
+
+/// `apply` must be exactly `target` with an identity fallback, for every signal.
+fn expectApplyMatchesTargets(map: Map) !void {
+    var sig: u32 = 1;
+    while (sig < std.os.linux.NSIG) : (sig += 1) {
+        const target = try map.target(sig);
+        try std.testing.expectEqual(target orelse sig, try Map.apply(&map, sig));
     }
 }
 
