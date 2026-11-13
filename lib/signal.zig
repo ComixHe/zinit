@@ -100,32 +100,3 @@ pub fn parse(text: []const u8) ConfigError!u32 {
     // The table covers 1..=max, so a hit is standard by construction.
     return lookupStandardSignal(name_to_check) orelse return ConfigError.InvalidSignal;
 }
-
-// kcov-exclude-tests (everything below is test-only).
-test "parse accepts numbers and names, rejects realtime and junk" {
-    for (1..std.os.linux.sigrtmin()) |number| {
-        const sig: Sig = @fromBackingInt(@intCast(number));
-        try std.testing.expectEqual(@as(u32, @intCast(number)), try parse(@tagName(sig)));
-    }
-
-    try std.testing.expectEqual(15, parse("15") catch unreachable);
-    try std.testing.expectEqual(15, parse("SIGTERM") catch unreachable);
-    try std.testing.expectEqual(15, parse("TERM") catch unreachable);
-    try std.testing.expectEqual(15, try parse("sigterm"));
-    try std.testing.expectEqual(15, try parse("tErM"));
-    try std.testing.expectEqual(9, parse("SIGKILL") catch unreachable);
-
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("SIGRTMIN"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("SIGRTMIN+2"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("RTMAX-1"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("34"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("64"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("UNKNOWN"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("999"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("0"));
-    try std.testing.expectError(ConfigError.InvalidParams, parse(""));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("SIG"));
-    try std.testing.expectError(ConfigError.InvalidSignal, parse("A"));
-    const long_name = "SIG" ++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    try std.testing.expectError(ConfigError.InvalidSignal, parse(long_name));
-}

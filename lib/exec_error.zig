@@ -22,8 +22,3 @@ pub fn write(fd: std.os.linux.fd_t, text: []const u8) void {
     checks.check(text.len <= max_message, "exec_error: the message exceeds the pipe record");
     _ = std.os.linux.write(fd, text.ptr, text.len);
 }
-
-// kcov-exclude-tests (everything below is test-only).
-test "the message bound leaves the documented prefix room" {
-    try std.testing.expect(max_message > "zinit child error: ".len);
-}

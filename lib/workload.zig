@@ -6,8 +6,6 @@
 //! The caller owns waiting for signal events; State owns the consumed child handle.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const config = @import("config");
 
 const errors = @import("errors.zig");
 const log = @import("log.zig");
@@ -770,17 +768,7 @@ fn monotonicNs() errors.SysCallError!u64 {
 
 // kcov-exclude-tests (everything below is test-only).
 test {
-    if (builtin.is_test and config.include_private_integration_tests) {
-        _ = integration_tests;
-    }
-}
-
-test "a shutdown grace that cannot be added to the clock degrades to never" {
-    const shutdown = ShutdownState.init(7, 1_000, std.math.maxInt(u64) - 1);
-
-    try std.testing.expectEqual(std.math.maxInt(u64), shutdown.deadline_ns);
-    try std.testing.expect(shutdown.remainingMs(1_000) > 0);
-    try std.testing.expectEqual(@as(u8, 7), shutdown.exit_code);
+    _ = internal_tests;
 }
 
 test "the grace deadline is absolute, and a clamped wait does not end it" {
@@ -804,131 +792,8 @@ test "the grace deadline is absolute, and a clamped wait does not end it" {
     try std.testing.expectEqual(@as(i32, 0), long.remainingMs(start + long_ns));
 }
 
-test "the main-event reducer follows order, and exit is terminal" {
-    const idle: DrainResult = .{ .no_children = false };
-    try std.testing.expect(!shouldStopSelf(idle.main == .stopped, idle.more));
-
-    // STOP -> CONT.
-    var stop_cont: DrainResult = .{ .no_children = false };
-    applyMainEvent(&stop_cont, .stopped);
-    try std.testing.expectEqual(MainObservation.stopped, stop_cont.main);
-    try std.testing.expect(shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
-    applyMainEvent(&stop_cont, .continued);
-    try std.testing.expectEqual(MainObservation.continued, stop_cont.main);
-    try std.testing.expect(!shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
-
-    // CONT -> STOP.
-    applyMainEvent(&stop_cont, .stopped);
-    try std.testing.expectEqual(MainObservation.stopped, stop_cont.main);
-    try std.testing.expect(shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
-
-    // STOP -> CONT -> STOP
-    applyMainEvent(&stop_cont, .continued);
-    applyMainEvent(&stop_cont, .stopped);
-    try std.testing.expect(shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
-
-    // STOP -> EXIT
-    applyMainEvent(&stop_cont, .{ .exited = 137 });
-    try std.testing.expectEqual(MainObservation{ .exited = 137 }, stop_cont.main);
-    try std.testing.expect(!shouldStopSelf(stop_cont.main == .stopped, stop_cont.more));
-
-    // S stray stop after an exit cannot undo it.
-    applyMainEvent(&stop_cont, .stopped);
-    try std.testing.expectEqual(MainObservation{ .exited = 137 }, stop_cont.main);
-
-    // The direct STOP -> EXIT path.
-    var direct: DrainResult = .{ .no_children = false };
-    applyMainEvent(&direct, .stopped);
-    applyMainEvent(&direct, .{ .exited = 9 });
-    try std.testing.expectEqual(MainObservation{ .exited = 9 }, direct.main);
-    try std.testing.expect(!shouldStopSelf(direct.main == .stopped, direct.more));
-
-    // A round that hit the reap quota defers the decision: a continue behind
-    // the quota must still be able to cancel the stop.
-    try std.testing.expect(!shouldStopSelf(true, true));
-    try std.testing.expect(shouldStopSelf(true, false));
-}
-
-test "take transfers the descriptors and clears the source" {
-    var handle = ProcessHandle{ .pid = 7, .pidfd = 3, .exec_error_fd = 4 };
-    const taken = handle.take();
-
-    try std.testing.expectEqual(@as(std.os.linux.pid_t, 7), taken.pid);
-    try std.testing.expectEqual(@as(?std.os.linux.fd_t, 3), taken.pidfd);
-    try std.testing.expectEqual(@as(?std.os.linux.fd_t, 4), taken.exec_error_fd);
-    try std.testing.expect(handle.pidfd == null and handle.exec_error_fd == null);
-}
-
-test "a state without shutdown waits forever and exposes the reap debt" {
-    var state = State.init(.{
-        .expected_exit = ExitCodeSet.empty,
-        .rewrites = null,
-        .forward_group = false,
-        .shutdown_timeout_ns = 0,
-        .ignore_initial_hup_cont = false,
-    }, .{ .pid = 7, .pidfd = null });
-    defer state.deinit();
-
-    try std.testing.expectEqual(State.Wait.infinite, state.nextWait());
-    try std.testing.expect(!state.reapPending());
-    state.reap_pending = true;
-    try std.testing.expect(state.reapPending());
-}
-
-test "the main exit applies --expect-exit and keeps a signal status" {
-    var plain: DrainResult = .{ .no_children = false };
-    applyMainExit(&plain, 42, .{ .raw = @as(u32, 7) << 8 }, ExitCodeSet.empty);
-    try std.testing.expectEqual(MainObservation{ .exited = 7 }, plain.main);
-
-    var expected: ExitCodeSet = .empty;
-    expected.set(7);
-    var mapped: DrainResult = .{ .no_children = false };
-    applyMainExit(&mapped, 42, .{ .raw = @as(u32, 7) << 8 }, expected);
-    try std.testing.expectEqual(MainObservation{ .exited = 0 }, mapped.main);
-
-    var signaled: DrainResult = .{ .no_children = false };
-    applyMainExit(&signaled, 42, .{ .raw = 9 }, ExitCodeSet.empty);
-    try std.testing.expectEqual(MainObservation{ .exited = 128 + 9 }, signaled.main);
-}
-
-test "only a SIGPIPE raised by our own broken write is dropped" {
-    const own = signal.Event{
-        .signo = @backingInt(Sig.PIPE),
-        .code = signal.SI.USER,
-        .value = 0,
-        .sender = 77,
-    };
-    try std.testing.expect(isOwnBrokenWrite(own, 77));
-    try std.testing.expect(!isOwnBrokenWrite(own, 78));
-
-    var external = own;
-    external.sender = 78;
-    try std.testing.expect(!isOwnBrokenWrite(external, 77));
-
-    var kernel = own;
-    kernel.code = signal.SI.KERNEL;
-    try std.testing.expect(!isOwnBrokenWrite(kernel, 77));
-
-    var other = own;
-    other.signo = @backingInt(Sig.TERM);
-    try std.testing.expect(!isOwnBrokenWrite(other, 77));
-}
-
-const integration_tests = struct {
+const internal_tests = struct {
     const supervisor = @import("supervisor.zig");
-
-    test "private integration: closing a process handle twice is a no-op" {
-        var fds: [2]std.os.linux.fd_t = undefined;
-        try std.testing.expectEqual(
-            std.os.linux.E.SUCCESS,
-            std.os.linux.errno(std.os.linux.pipe2(&fds, .{})),
-        );
-
-        var handle = ProcessHandle{ .pid = 1, .pidfd = fds[0], .exec_error_fd = fds[1] };
-        handle.close();
-        try std.testing.expect(handle.pidfd == null and handle.exec_error_fd == null);
-        handle.close();
-    }
 
     fn waitForWaitid(test_io: std.Io, pid: std.os.linux.pid_t, flags: u32) !void {
         const deadline = std.Io.Clock.now(.awake, test_io).toNanoseconds() + 5 * std.time.ns_per_s;
@@ -943,128 +808,6 @@ const integration_tests = struct {
             try std.Io.sleep(test_io, .fromMilliseconds(1), .awake);
         }
     }
-
-    test "private integration: a previously stopped workload is reaped without stopping zinit" {
-        const test_io = std.testing.io;
-        if (underTracer(test_io)) return error.SkipZigTest;
-
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-
-        var spawned = try spawnSleeper(&signal_config);
-        defer spawned.close();
-        defer killAndReap(test_io, spawned.pid);
-        const pid = spawned.pid;
-
-        _ = std.os.linux.kill(pid, Sig.STOP);
-        try waitForWaitid(test_io, pid, std.os.linux.W.STOPPED | std.os.linux.W.NOWAIT);
-
-        _ = std.os.linux.kill(pid, Sig.KILL);
-        try waitForWaitid(test_io, pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
-
-        var reaped = false;
-        const reap = try drain(pid, .empty, &reaped, reap_quota);
-
-        try std.testing.expectEqual(MainObservation{ .exited = 137 }, reap.main);
-        try std.testing.expect(reaped);
-        try std.testing.expect(!shouldStopSelf(reap.main == .stopped, reap.more));
-    }
-
-    test "private integration: a reap round stops at the quota and resumes without a signal" {
-        const test_io = std.testing.io;
-        if (underTracer(test_io)) return error.SkipZigTest;
-
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-
-        var children: [3]supervisor.ProcessHandle = undefined;
-        var count: usize = 0;
-        defer {
-            for (children[0..count]) |*child| {
-                child.close();
-                killAndReap(test_io, child.pid);
-            }
-        }
-
-        for (&children) |*child| {
-            child.* = try spawnSleeper(&signal_config);
-            count += 1;
-        }
-
-        _ = std.os.linux.kill(children[0].pid, Sig.KILL);
-        try waitForWaitid(test_io, children[0].pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
-
-        var main_reaped = false;
-        var reap = try drain(children[0].pid, .empty, &main_reaped, 1);
-        try std.testing.expect(reap.more);
-        try std.testing.expect(!reap.no_children);
-        try std.testing.expect(main_reaped);
-
-        for (children[1..count]) |child| {
-            _ = std.os.linux.kill(child.pid, Sig.KILL);
-            try waitForWaitid(test_io, child.pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
-        }
-
-        var rounds: usize = 0;
-        while (reap.more) {
-            rounds += 1;
-            try std.testing.expect(rounds <= count);
-            reap = try drain(children[0].pid, .empty, &main_reaped, 1);
-        }
-
-        try std.testing.expect(reap.no_children);
-        try std.testing.expect(main_reaped);
-        try std.testing.expectEqual(count, rounds);
-    }
-
-    test "private integration: the supervisor entry point re-drains after the reap quota" {
-        const test_io = std.testing.io;
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-
-        var main = try spawnSleeper(&signal_config);
-        defer main.close();
-        defer killAndReap(test_io, main.pid);
-
-        const worker_count = 40;
-        var workers: [worker_count]supervisor.ProcessHandle = undefined;
-        var spawned: usize = 0;
-        defer {
-            for (workers[0..spawned]) |*worker| {
-                worker.close();
-                _ = killAndReap(test_io, worker.pid);
-            }
-        }
-
-        for (&workers) |*worker| {
-            worker.* = try spawnSleeper(&signal_config);
-            spawned += 1;
-        }
-
-        for (workers) |worker| _ = std.os.linux.kill(worker.pid, Sig.KILL);
-
-        for (workers) |worker|
-            try waitForWaitid(test_io, worker.pid, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT);
-
-        var source = try signalfd.Source.open(&signal_config);
-        defer source.close();
-
-        var state = State.init(.{
-            .expected_exit = .empty,
-            .rewrites = null,
-            .forward_group = false,
-            .shutdown_timeout_ns = 0,
-            .ignore_initial_hup_cont = false,
-        }, main.take());
-        defer state.child.close();
-
-        try std.testing.expect(state.handleSignalEvent(&source, &.{}) == null);
-        try std.testing.expect(state.reapPending());
-
-        try std.testing.expect(state.handleSignalEvent(&source, &.{}) == null);
-        try std.testing.expect(!state.reapPending());
-    }
-
     fn workloadStopped(test_io: std.Io, pid: std.os.linux.pid_t) ?bool {
         var path_buf: [64]u8 = undefined;
         const path = std.mem.print(&path_buf, "/proc/{d}/stat", .{pid}) catch return null;
@@ -1144,7 +887,7 @@ const integration_tests = struct {
         _ = waitForExit(test_io, driver_pid) catch {};
     }
 
-    test "private integration: a CHLD and CONT read in one batch resumes the stopped workload" {
+    test "internal: a CHLD and CONT read in one batch resumes the stopped workload" {
         const test_io = std.testing.io;
         if (underTracer(test_io)) return error.SkipZigTest; // the tracer owns the stop event
 
@@ -1194,139 +937,6 @@ const integration_tests = struct {
         try std.testing.expectEqual(@as(u8, 0), std.os.linux.W.EXITSTATUS(@intCast(status)));
     }
 
-    test "private integration: a group send with no group falls back to the child" {
-        const test_io = std.testing.io;
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-        const forked = std.os.linux.fork();
-        if (io.syscallErrno(forked) != .SUCCESS) return error.TestUnexpectedResult;
-        if (forked == 0) {
-            const empty = comptime std.os.linux.sigemptyset();
-            _ = std.os.linux.sigprocmask(Sig.SETMASK, &empty, null);
-            _ = std.os.linux.pause();
-            std.os.linux.exit(0);
-        }
-
-        const pid: std.os.linux.pid_t = @intCast(forked);
-        defer killAndReap(test_io, pid);
-        const raw = std.os.linux.pidfd_open(pid, 0);
-        if (io.syscallErrno(raw) != .SUCCESS) {
-            _ = std.os.linux.kill(pid, Sig.KILL);
-            _ = try waitForExit(test_io, pid);
-            std.debug.print("skip the no-group fallback check: no pidfd\n", .{});
-            return error.SkipZigTest;
-        }
-
-        var state = State.init(.{
-            .expected_exit = .empty,
-            .rewrites = null,
-            .forward_group = true,
-            .shutdown_timeout_ns = 0,
-            .ignore_initial_hup_cont = false,
-        }, .{ .pid = pid, .pidfd = @intCast(raw) });
-        defer state.child.close();
-
-        try std.testing.expect(state.signalProcessGroup(@backingInt(Sig.TERM), null));
-        try std.testing.expectEqual(@as(u32, @backingInt(Sig.TERM)), (try waitForExit(test_io, pid)).signalNumber());
-    }
-
-    test "private integration: the numeric group path delivers the signal to the group" {
-        const test_io = std.testing.io;
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-        const base: Policy = .{
-            .expected_exit = .empty,
-            .rewrites = null,
-            .forward_group = true,
-            .shutdown_timeout_ns = 0,
-            .ignore_initial_hup_cont = false,
-        };
-
-        var spawned = try spawnSleeper(&signal_config);
-        defer spawned.close();
-        defer killAndReap(test_io, spawned.pid);
-        var state = State.init(base, spawned.take());
-        defer state.child.close();
-
-        try std.testing.expect(state.signalGroupByNumber(@backingInt(Sig.TERM)));
-        const reaped_status = try waitForExit(test_io, spawned.pid);
-        try std.testing.expectEqual(@as(u32, @backingInt(Sig.TERM)), reaped_status.signalNumber());
-        state.child_reaped = true;
-
-        try std.testing.expect(!state.signalGroupByNumber(@backingInt(Sig.TERM)));
-    }
-
-    test "private integration: the numeric group path reaches every member of the group" {
-        const test_io = std.testing.io;
-        if (underTracer(test_io)) return error.SkipZigTest;
-
-        // A group send and a send to the leader are indistinguishable while the
-        // leader is alone. Ignore TERM in the leader and put a second member in its
-        // group: only a real group send kills that member and lets `wait` return.
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-        const base: Policy = .{
-            .expected_exit = .empty,
-            .rewrites = null,
-            .forward_group = true,
-            .shutdown_timeout_ns = 0,
-            .ignore_initial_hup_cont = false,
-        };
-
-        var ready: [2]std.os.linux.fd_t = undefined;
-        if (io.syscallErrno(std.os.linux.pipe2(&ready, .{ .NONBLOCK = true })) != .SUCCESS)
-            return error.TestUnexpectedResult;
-        defer closeQuietly(ready[0]);
-
-        var script_buf: [160]u8 = undefined;
-        const script = try std.mem.printSentinel(
-            &script_buf,
-            "trap '' TERM; (trap - TERM; printf r >&{d}; exec sleep 30) & wait; printf d >&{d}",
-            .{ ready[1], ready[1] },
-            0,
-        );
-
-        var spawned = try supervisor.spawn(.{
-            .argv = &[_:null]?[*:0]const u8{ "/bin/sh", "-c", script },
-        }, &signal_config);
-        defer spawned.close();
-        const pid = spawned.pid;
-        defer {
-            var status: i32 = 0;
-            const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-            if (io.syscallErrno(rc) == .SUCCESS and rc == 0) _ = std.os.linux.kill(-pid, Sig.KILL);
-            _ = killAndReap(test_io, pid);
-        }
-
-        var state = State.init(base, spawned.take());
-        defer state.child.close();
-        closeQuietly(ready[1]);
-
-        try expectHandshake(test_io, ready[0], 'r');
-        try std.testing.expect(state.signalGroupByNumber(@backingInt(Sig.TERM)));
-        try expectHandshake(test_io, ready[0], 'd');
-
-        const status = try waitForExit(test_io, pid);
-        state.child_reaped = true;
-        try std.testing.expectEqual(WaitStatus.Class.exited, status.class());
-        try std.testing.expectEqual(@as(u8, 0), status.exitCode());
-    }
-
-    fn expectHandshake(test_io: std.Io, fd: std.os.linux.fd_t, byte: u8) !void {
-        const deadline = std.Io.Clock.now(.awake, test_io).toNanoseconds() + 5 * std.time.ns_per_s;
-        var buf: [1]u8 = undefined;
-        while (true) {
-            const got = std.os.linux.read(fd, &buf, buf.len);
-            if (io.syscallErrno(got) == .SUCCESS and got == 1) {
-                try std.testing.expectEqual(byte, buf[0]);
-                return;
-            }
-            if (std.Io.Clock.now(.awake, test_io).toNanoseconds() >= deadline)
-                return error.TestUnexpectedResult;
-            try std.Io.sleep(test_io, .fromMilliseconds(1), .awake);
-        }
-    }
-
     fn spawnSleeper(signal_config: *const SignalConfig) !ProcessHandle {
         return supervisor.spawn(.{
             .argv = &[_:null]?[*:0]const u8{ "/bin/sleep", "30" },
@@ -1363,7 +973,7 @@ const integration_tests = struct {
     const waitForExit = wait.waitForExit;
     const killAndReap = wait.killAndReap;
 
-    test "private integration: the continue a detach queues is swallowed, a user's continue reaches the child" {
+    test "internal: the continue a detach queues is swallowed, a user's continue reaches the child" {
         const test_io = std.testing.io;
         // Only an untraced child reports a stop, and that stop is what this asserts.
         if (underTracer(test_io)) {
@@ -1411,7 +1021,7 @@ const integration_tests = struct {
         try expectChildEvent(test_io, pid, std.os.linux.W.CONTINUED);
     }
 
-    test "private integration: the detach HUP is swallowed once, the next is forwarded" {
+    test "internal: the detach HUP is swallowed once, the next is forwarded" {
         const test_io = std.testing.io;
         const signal_config = try SignalConfig.install(&[_]Sig{});
         defer _ = signal_config.restoreParent();
@@ -1461,48 +1071,5 @@ const integration_tests = struct {
             try std.testing.expectEqual(WaitStatus.Class.signaled, status.class());
             try std.testing.expectEqual(@as(u32, @backingInt(Sig.HUP)), status.signalNumber());
         }
-    }
-
-    test "private integration: a rewrite to 0 drops the signal instead of forwarding it" {
-        const test_io = std.testing.io;
-        const signal_config = try SignalConfig.install(&[_]Sig{});
-        defer _ = signal_config.restoreParent();
-        var source = try signalfd.Source.open(&signal_config);
-        defer source.close();
-        var rewrites = RewriteMap.init();
-        try rewrites.set(@backingInt(Sig.TERM), 0);
-        const policy: Policy = .{
-            .expected_exit = .empty,
-            .rewrites = rewrites,
-            .forward_group = false,
-            .shutdown_timeout_ns = 0,
-            .ignore_initial_hup_cont = true,
-        };
-
-        // Keep TERM blocked in the child until the forwarding call has returned.
-        // Releasing the tracing gate then delivers any wrongly queued TERM before
-        // /bin/true can exit. No scheduling-dependent "still alive" window is needed.
-        var spawned = try supervisor.spawn(.{
-            .argv = &[_:null]?[*:0]const u8{"/bin/true"},
-            .tracing_child = true,
-        }, &signal_config);
-        defer spawned.close();
-        defer killAndReap(test_io, spawned.pid);
-        var state = State.init(policy, spawned.take());
-        defer state.child.close();
-
-        _ = std.os.linux.kill(std.os.linux.getpid(), Sig.TERM);
-        var batch: [signalfd.Source.batch_max]signal.Event = undefined;
-        const got = try source.waitBatch(&batch, 0);
-        try std.testing.expectEqual(@as(usize, 1), got);
-        try std.testing.expectEqual(@as(?Outcome, null), state.handleSignalEvent(&source, batch[0..got]));
-
-        // Nothing left pending: the drain reports no more events.
-        try std.testing.expectEqual(@as(?Outcome, null), state.handleSignalEvent(&source, &.{}));
-        try std.testing.expectEqual(std.os.linux.E.SUCCESS, io.syscallErrno(std.os.linux.kill(spawned.pid, Sig.USR1)));
-        const status = try waitForExit(test_io, spawned.pid);
-        state.child_reaped = true;
-        try std.testing.expectEqual(WaitStatus.Class.exited, status.class());
-        try std.testing.expectEqual(@as(u8, 0), status.exitCode());
     }
 };

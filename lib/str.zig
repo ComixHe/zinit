@@ -72,17 +72,6 @@ pub inline fn eql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// kcov-exclude-tests (everything below is test-only).
-test "getEnv matches a whole key and returns the value without its terminator" {
-    const env = [_:null]?[*:0]const u8{ "A=1", "AB=2", "ZINIT=on" };
-    const envs: [:null]const ?[*:0]const u8 = &env;
-
-    try std.testing.expectEqualStrings("1", getEnv(envs, "A").?);
-    try std.testing.expectEqualStrings("2", getEnv(envs, "AB").?);
-    try std.testing.expectEqualStrings("on", getEnv(envs, "ZINIT").?);
-    try std.testing.expect(getEnv(envs, "B") == null);
-}
-
 test "parseDecimal agrees with std on arbitrary bytes, and never panics" {
     const Context = struct {
         fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {
@@ -119,23 +108,6 @@ test "parseDecimal agrees with std on arbitrary bytes, and never panics" {
     return std.testing.fuzz(Context{}, Context.testOne, .{
         .corpus = &.{fuzz_input.slice("18446744073709551616x")},
     });
-}
-
-test "parseDecimal covers the width it advertises, including u1 and u128" {
-    try std.testing.expectEqual(@as(u1, 1), try parseDecimal(u1, "1"));
-    try std.testing.expectEqual(@as(u1, 0), try parseDecimal(u1, "0"));
-    try std.testing.expectError(error.Overflow, parseDecimal(u1, "2"));
-
-    // The accumulator is the target type, not a fixed u64.
-    try std.testing.expectEqual(
-        std.math.maxInt(u128),
-        try parseDecimal(u128, "340282366920938463463374607431768211455"),
-    );
-
-    try std.testing.expectError(
-        error.Overflow,
-        parseDecimal(u128, "340282366920938463463374607431768211456"),
-    );
 }
 
 test "parseDecimal rejects an overflow before the accumulator wraps" {

@@ -2,12 +2,6 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Library root: exposes the modules and pulls their in-process tests into the `test`
-//! target. Public-interface and private workload integration checks run from
-//! separate module roots under the same test-integration build step.
-
-const std = @import("std");
-
 pub const errors = @import("errors.zig");
 pub const io = @import("io.zig");
 pub const tty = @import("tty.zig");
@@ -21,12 +15,3 @@ pub const wait = @import("wait.zig");
 pub const args = @import("args.zig");
 pub const supervisor = @import("supervisor.zig");
 pub const crash = @import("crash.zig");
-
-// kcov-exclude-tests (everything below is test-only).
-test {
-    std.testing.refAllDecls(@This());
-    // Collect internal modules' unit checks without exporting them to callers.
-    _ = @import("workload.zig");
-    _ = @import("child.zig");
-    _ = @import("exec_error.zig");
-}

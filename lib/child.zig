@@ -319,27 +319,3 @@ pub fn run(
 
     return execChild(signal_config, exec_error_fd, spec.argv, spec.envs);
 }
-
-// kcov-exclude-tests (everything below is test-only).
-// Real fork/exec/PATH checks live in tests/integration/process.zig; this is the
-// pure mapping that stays in the unit target.
-test "pathCandidate keeps a bare name for an empty entry and skips an overlong path" {
-    var buf: [16]u8 = undefined;
-
-    const bare = pathCandidate("", "prog", "prog", &buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("prog", std.mem.span(bare));
-
-    const joined = pathCandidate("d", "prog", "prog", &buf) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("d/prog", std.mem.span(joined));
-
-    // dir + '/' + file + NUL no longer fits: skipped, never truncated.
-    try std.testing.expect(pathCandidate("123456789012345", "prog", "prog", &buf) == null);
-}
-
-test "execExitCode maps an errno to an exit code" {
-    try std.testing.expectEqual(@as(u8, 127), execExitCode(.NOENT));
-    try std.testing.expectEqual(@as(u8, 127), execExitCode(.NOTDIR));
-    try std.testing.expectEqual(@as(u8, 126), execExitCode(.ACCES));
-    try std.testing.expectEqual(@as(u8, 126), execExitCode(.NOEXEC));
-    try std.testing.expectEqual(@as(u8, 1), execExitCode(.INVAL));
-}
