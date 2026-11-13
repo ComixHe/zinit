@@ -35,6 +35,23 @@ const State = struct {
     color: bool = false,
 };
 
+fn classifySink(fd: std.os.linux.fd_t) SinkKind {
+    var socket_type: i32 = 0;
+    var socket_len: std.os.linux.socklen_t = @sizeOf(i32);
+    if (io.syscallErrno(std.os.linux.getsockopt(
+        fd,
+        std.os.linux.SOL.SOCKET,
+        std.os.linux.SO.TYPE,
+        std.mem.asBytes(&socket_type).ptr,
+        &socket_len,
+    )) == .SUCCESS) return .socket;
+
+    if (io.syscallErrno(std.os.linux.lseek(fd, 0, std.os.linux.SEEK.CUR)) == .SUCCESS)
+        return .stream;
+
+    return .nonblocking;
+}
+
 pub fn init(sink_fd: std.os.linux.fd_t) error{ InvalidSink, AlreadyInitialized }!void {
     if (sink_fd < 0) {
         @branchHint(.unlikely);
@@ -46,24 +63,7 @@ pub fn init(sink_fd: std.os.linux.fd_t) error{ InvalidSink, AlreadyInitialized }
         return error.AlreadyInitialized;
     }
 
-    var metadata: std.os.linux.Statx = undefined;
-    if (io.syscallErrno(std.os.linux.statx(
-        sink_fd,
-        "",
-        std.os.linux.AT.EMPTY_PATH | std.os.linux.AT.STATX_DONT_SYNC,
-        .{ .TYPE = true },
-        &metadata,
-    )) != .SUCCESS or !metadata.mask.TYPE) {
-        @branchHint(.unlikely);
-        return;
-    }
-
-    const kind: SinkKind = switch (metadata.mode & std.os.linux.S.IFMT) {
-        std.os.linux.S.IFIFO, std.os.linux.S.IFCHR => .nonblocking,
-        std.os.linux.S.IFSOCK => .socket,
-        std.os.linux.S.IFREG => .stream,
-        else => return,
-    };
+    const kind = classifySink(sink_fd);
 
     var fd = sink_fd;
     var owned = false;
