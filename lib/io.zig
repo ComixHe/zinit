@@ -27,9 +27,15 @@ noinline fn sharedSyscallErrno(rc: usize) std.os.linux.E {
     return std.os.linux.errno(rc);
 }
 
-/// Null means every byte was written. A zero-progress write of a nonempty
-/// remainder is an I/O failure, even when the filesystem returned no errno.
-pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
+pub const WriteResult = union(enum) {
+    complete,
+    incomplete: struct {
+        errno: std.os.linux.E,
+        written: usize,
+    },
+};
+
+pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) WriteResult {
     checks.check(fd >= 0, "io: writeAll needs a valid descriptor");
 
     var offset: usize = 0;
@@ -39,19 +45,17 @@ pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
             .SUCCESS => {
                 if (rc == 0) {
                     @branchHint(.unlikely);
-                    return .IO;
+                    return .{ .incomplete = .{ .errno = .IO, .written = offset } };
                 }
 
                 checks.check(rc <= bytes.len - offset, "io: write reported more bytes than requested");
                 offset += rc;
             },
-            // report errno to caller, even though EINTR
-            // let caller decides what's going on.
-            else => |errno| return errno,
+            else => |errno| return .{ .incomplete = .{ .errno = errno, .written = offset } },
         }
     }
 
-    return null;
+    return .complete;
 }
 
 pub fn closeQuietly(fd: std.os.linux.fd_t) void {

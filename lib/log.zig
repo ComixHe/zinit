@@ -158,7 +158,22 @@ const WriteResult = enum {
 
 fn writeBestEffort(kind: SinkKind, fd: std.os.linux.fd_t, bytes: []const u8) WriteResult {
     if (kind == .stream) {
-        if (io.writeAll(fd, bytes) != null) return .failed;
+        var offset: usize = 0;
+        var quota: i8 = 3;
+        while (offset < bytes.len) {
+            switch (io.writeAll(fd, bytes[offset..])) {
+                .complete => return .complete,
+                .incomplete => |result| {
+                    offset += result.written;
+                    if (result.errno == .INTR and quota > 0) {
+                        quota -= 1;
+                        continue;
+                    }
+
+                    return if (offset == 0) .dropped else .failed;
+                },
+            }
+        }
         return .complete;
     }
 
