@@ -147,24 +147,31 @@ fn decodeRecord(raw: *const std.os.linux.signalfd_siginfo) signal.Event {
     };
 }
 
-/// Where the supervisor gets delivered signals from.
+/// Where the supervisor gets delivered signals from. Keep Config's mask
+/// installed while using this source, with no returning unblocked handlers.
 pub const Source = struct {
     fd: std.os.linux.fd_t,
 
     /// Realtime signals queue, so one read can carry a backlog.
     pub const batch_max = 8;
 
+    comptime {
+        checks.comptimeCheck(batch_max > 0, "signalfd: the batch must make progress");
+    }
+
     pub fn open(config: *const Config) SysCallError!Source {
         const flags = std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC;
         const fd = std.os.linux.signalfd(-1, &config.current_set, flags);
-        return switch (io.syscallErrno(fd)) {
-            .SUCCESS => .{ .fd = @intCast(fd) },
+        switch (io.syscallErrno(fd)) {
+            .SUCCESS => {},
             else => |e| {
                 @branchHint(.unlikely);
                 log.err("unable to create signalfd: {e}", .{e});
                 return error.SysCallError;
             },
-        };
+        }
+
+        return .{ .fd = @intCast(fd) };
     }
 
     pub fn close(self: *Source) void {
@@ -174,6 +181,7 @@ pub const Source = struct {
     }
 
     pub fn waitBatch(self: *Source, out: []signal.Event, timeout_ms: i32) SysCallError!usize {
+        checks.check(self.fd >= 0, "signalfd: waitBatch on a closed source");
         checks.check(out.len > 0, "signalfd: waitBatch needs room for at least one event");
         checks.check(timeout_ms >= -1, "signalfd: timeout must be -1 or non-negative");
         checks.check(out.len <= batch_max, "signalfd: batch buffer exceeds the per-read bound");

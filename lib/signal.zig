@@ -62,7 +62,8 @@ const standard_names = blk: {
         offsets[number] = @intCast(text.len);
     }
 
-    break :blk .{ .text = text, .offsets = offsets };
+    const Table = struct { text: []const u8, offsets: [standard_signal_max + 1]u8 };
+    break :blk Table{ .text = text, .offsets = offsets };
 };
 
 /// Case-insensitive against the uppercase table
