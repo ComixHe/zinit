@@ -133,11 +133,24 @@ pub const Args = struct {
             break :blk std.fmt.comptimePrint(help_text, .{logLevelText(log.default_level)});
         };
 
-        _ = writeAll(fd, text);
+        output(fd, text);
     }
 
     pub fn printVersion(fd: std.os.linux.fd_t) void {
-        _ = writeAll(fd, config.version ++ "\n");
+        output(fd, config.version ++ "\n");
+    }
+
+    fn output(fd: std.os.linux.fd_t, text: []const u8) void {
+        var offset: usize = 0;
+        while (offset < text.len) {
+            switch (writeAll(fd, text[offset..])) {
+                .complete => return,
+                .incomplete => |result| {
+                    offset += result.written;
+                    if (result.errno != .INTR) return;
+                },
+            }
+        }
     }
 
     fn reject(err: ConfigError, problem: []const u8, token: []const u8) ConfigError {
