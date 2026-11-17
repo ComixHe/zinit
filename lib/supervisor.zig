@@ -78,7 +78,15 @@ pub fn spawn(
         const child_pid: std.os.linux.pid_t = @intCast(pid);
         io.closeQuietly(error_pipe[1]);
         if (!spec.new_session) {
+            // Both sides establish the group to close the fork/exec race.
+            // The child reports setup errors EACCES/ESRCH here can simply
+            // mean it already execed/exited, just give it a try.
             _ = std.os.linux.setpgid(child_pid, child_pid);
+        }
+
+        switch (io.syscallErrno(std.os.linux.chdir("/"))) {
+            .SUCCESS => {},
+            else => |e| log.warn("unable to release inherited cwd: {e}", .{e}),
         }
 
         log.debug("spawned child {d} ({s})", .{ pid, if (pidfd >= 0) "pidfd" else "fork" });
