@@ -30,15 +30,20 @@ pub const Event = struct {
     sender: std.os.linux.pid_t = 0,
 };
 
-pub fn queueInfo(signo: u32, value: u64) std.os.linux.siginfo_t {
+pub const Sender = struct {
+    pid: std.os.linux.pid_t,
+    uid: u32,
+};
+
+pub fn queueInfo(signo: u32, value: u64, sender: Sender) std.os.linux.siginfo_t {
     checks.check(signo > 0, "signal: queueInfo needs a positive signal number");
     checks.check(signo < std.os.linux.NSIG, "signal: queueInfo signal number out of range");
 
     var info = std.mem.zeroes(std.os.linux.siginfo_t);
     info.signo = @fromBackingInt(@intCast(signo));
     info.code = SI.QUEUE;
-    info.fields.common.first.piduid.pid = @intCast(std.os.linux.getpid());
-    info.fields.common.first.piduid.uid = @intCast(std.os.linux.getuid());
+    info.fields.common.first.piduid.pid = sender.pid;
+    info.fields.common.first.piduid.uid = sender.uid;
 
     if (value == 0) {
         info.fields.common.second.value.int = 0;

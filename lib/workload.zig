@@ -100,10 +100,11 @@ pub const ProcessHandle = struct {
     }
 
     /// Transfers ownership of the child handle to the caller, leaving this instance empty.
-    pub fn take(self: *ProcessHandle) ProcessHandle {
+    fn take(self: *ProcessHandle) ProcessHandle {
+        checks.check(self.pid > 0, "workload: cannot transfer an empty child handle");
         const taken = self.*;
-        self.pidfd = null;
-        self.exec_error_fd = null;
+        self.* = .{ .pid = 0, .pidfd = null };
+        checks.check(self.exec_error_fd == null, "workload: transferred exec pipe still owned");
         return taken;
     }
 
@@ -111,7 +112,7 @@ pub const ProcessHandle = struct {
     /// child is reaped: at that point the pipe holds either the child's line or
     /// nothing (exec succeeded, or the child died before writing). The record
     /// length is bounded, so the read is bounded too.
-    pub fn drainExecFailure(self: *ProcessHandle) void {
+    fn drainExecFailure(self: *ProcessHandle) void {
         const fd = self.exec_error_fd orelse return;
         self.exec_error_fd = null;
 
@@ -133,6 +134,11 @@ pub const State = struct {
     /// Set after the kernel rejects the pidfd group scope, all later group sends
     /// use the numeric fallback. The default is the pidfd-capable path.
     group_number_only: bool = false,
+    /// Cache an unavailable child pidfd send separately from group scope.
+    child_number_only: bool = false,
+    /// Initialized on the first queued send, after fork. The supervising parent
+    /// never changes its process identity or credentials during this state.
+    queued_sender: ?signal.Sender = null,
     /// Once the main child is reaped it can receive nothing, and its number is free again.
     child_reaped: bool = false,
     /// Set when a batch carries SIGCHLD, or when a reap round stopped at the
@@ -163,32 +169,51 @@ pub const State = struct {
         clock_failed,
     };
 
-    pub fn init(policy: Policy, spawned: ProcessHandle) State {
+    /// Consumes the handle in place.
+    pub fn init(policy: Policy, spawned: *ProcessHandle) State {
         checks.check(spawned.pid > 0, "workload: spawned child pid must be positive");
         checks.check(if (spawned.pidfd) |fd| fd >= 0 else true, "workload: spawned pidfd must be a valid descriptor");
-        return .{
-            .child = spawned,
+        checks.check(if (spawned.exec_error_fd) |fd| fd >= 0 else true, "workload: exec pipe must be a valid descriptor");
+
+        const state: State = .{
+            .child = spawned.take(),
             .policy = policy,
             .ignore_cont = policy.ignore_initial_hup_cont,
             .ignore_hup = policy.ignore_initial_hup_cont,
         };
+
+        checks.check(spawned.pid == 0, "workload: source handle still has a child identity");
+        checks.check(spawned.pidfd == null, "workload: transferred pidfd still owned by source");
+        return state;
     }
 
     pub fn deinit(self: *State) void {
         self.child.close();
     }
 
+    inline fn checkInvariants(self: *const State) void {
+        if (self.shutdown != null)
+            checks.check(self.child_reaped, "workload: descendant grace requires the main child to be reaped");
+        if (self.child_reaped) {
+            checks.check(!self.main_stopped, "workload: a reaped main child cannot remain stopped");
+            checks.check(self.child.exec_error_fd == null, "workload: the main child's exec report must be drained before continuing");
+        }
+    }
+
     pub fn nextWait(self: *const State) Wait {
+        self.checkInvariants();
         const shutdown = if (self.shutdown) |*s| s else return .infinite;
         const now = monotonicNs() catch return .clock_failed;
         return .{ .remaining_ms = shutdown.remainingMs(now) };
     }
 
     pub fn reapPending(self: *const State) bool {
+        self.checkInvariants();
         return self.reap_pending;
     }
 
     pub fn onTimeout(self: *State) ?Outcome {
+        self.checkInvariants();
         const shutdown = if (self.shutdown) |*s| s else return null;
         const now = monotonicNs() catch {
             @branchHint(.cold);
@@ -197,6 +222,17 @@ pub const State = struct {
 
         if (shutdown.remainingMs(now) != 0) return null;
         return .{ .exited = self.onShutdownTimeout(shutdown) };
+    }
+
+    fn queuedInfo(self: *State, target: Sig, value: u64) std.os.linux.siginfo_t {
+        if (self.queued_sender == null) {
+            self.queued_sender = .{
+                .pid = std.os.linux.getpid(),
+                .uid = std.os.linux.getuid(),
+            };
+        }
+
+        return signal.queueInfo(@intCast(@backingInt(target)), value, self.queued_sender.?);
     }
 
     fn sendPidfd(
@@ -209,7 +245,7 @@ pub const State = struct {
         checks.check(fd >= 0, "workload: pidfd send needs a valid descriptor");
         if (payload) |p| {
             @branchHint(.unlikely);
-            var info = signal.queueInfo(@intCast(@backingInt(target)), p.value);
+            var info = self.queuedInfo(target, p.value);
             const rc = std.os.linux.pidfd_send_signal(fd, target, &info, flags);
             return switch (io.syscallErrno(rc)) {
                 .INVAL, .PERM => |errno| blk: {
@@ -248,16 +284,16 @@ pub const State = struct {
         }
 
         const target: Sig = @fromBackingInt(@intCast(sig));
+        if (self.child_number_only)
+            return self.reportChildSend(self.sendChildByNumber(target, payload), sig);
         const fd = self.child.pidfd orelse
             return self.reportChildSend(self.sendChildByNumber(target, payload), sig);
 
         const rc = self.sendPidfd(fd, target, payload, 0);
         if (io.syscallErrno(rc) == .NOSYS) {
             @branchHint(.unlikely);
-            if (!self.noted_numeric) {
-                self.noted_numeric = true;
-                log.debug("pidfd_send_signal unavailable, using numeric PIDs for signals", .{});
-            }
+            self.child_number_only = true;
+            log.debug("pidfd_send_signal unavailable, using numeric PIDs for signals", .{});
 
             return self.reportChildSend(self.sendChildByNumber(target, payload), sig);
         }
@@ -268,7 +304,7 @@ pub const State = struct {
     fn sendChildByNumber(self: *State, target: Sig, payload: ?Payload) usize {
         if (payload) |p| {
             @branchHint(.unlikely);
-            var info = signal.queueInfo(@intCast(@backingInt(target)), p.value);
+            var info = self.queuedInfo(target, p.value);
             const rc = std.os.linux.syscall3(
                 .rt_sigqueueinfo,
                 @intCast(self.child.pid),
@@ -855,7 +891,7 @@ const internal_tests = struct {
             .shutdown_timeout_ns = 0,
             .ignore_initial_hup_cont = false,
         };
-        var state = State.init(policy, spawned.take());
+        var state = State.init(policy, &spawned);
         defer state.child.close();
 
         var source = signalfd.Source.open(&signal_config) catch return 3;
@@ -997,7 +1033,7 @@ const internal_tests = struct {
         _ = std.os.linux.kill(pid, Sig.STOP);
         try expectChildEvent(test_io, pid, std.os.linux.W.UNTRACED);
 
-        var state = State.init(base, spawned.take());
+        var state = State.init(base, &spawned);
         defer state.child.close();
 
         var cont: signal.Event = .{ .signo = @backingInt(Sig.CONT), .code = signal.SI.KERNEL, .value = 0 };
@@ -1037,7 +1073,7 @@ const internal_tests = struct {
             const pid = spawned.pid;
             defer killAndReap(test_io, pid);
 
-            var state = State.init(base, spawned.take());
+            var state = State.init(base, &spawned);
             defer state.child.close();
 
             state.forwardSignal(hup);
@@ -1055,7 +1091,7 @@ const internal_tests = struct {
             const pid = spawned.pid;
             defer killAndReap(test_io, pid);
 
-            var state = State.init(base, spawned.take());
+            var state = State.init(base, &spawned);
             defer state.child.close();
 
             state.forwardSignal(hup);

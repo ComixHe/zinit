@@ -121,9 +121,8 @@ pub fn setupSubreaper(subreaper: bool) errors.SysCallError!void {
     }
 }
 
-/// Runs the supervision loop. Consumes `spawned`: the handle is closed on return and
-/// its pidfd cleared, so the caller must not close it again or use the pidfd after
-/// this returns.
+/// Runs the supervision loop. Consumes `spawned`, its descriptors are closed
+/// on return.
 pub fn supervise(
     policy: Policy,
     signal_config: *const SignalConfig,
@@ -143,7 +142,7 @@ pub fn supervise(
     };
     defer source.close();
 
-    var state = workload.State.init(policy, spawned.take());
+    var state = workload.State.init(policy, spawned);
     defer state.deinit();
 
     var batch: [signalfd.Source.batch_max]signal.Event = undefined;
