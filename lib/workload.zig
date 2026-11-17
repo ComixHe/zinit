@@ -38,6 +38,7 @@ const signal_batch: usize = signalfd.Source.batch_max;
 const Payload = struct { value: u64 };
 
 comptime {
+    checks.comptimeCheck(reap_quota > 0, "workload: reap quota must make progress");
     checks.comptimeCheck(signal_batch <= signal_quota, "workload: signal batch exceeds quota");
 }
 
@@ -141,9 +142,8 @@ pub const State = struct {
     queued_sender: ?signal.Sender = null,
     /// Once the main child is reaped it can receive nothing, and its number is free again.
     child_reaped: bool = false,
-    /// Set when a batch carries SIGCHLD, or when a reap round stopped at the
-    /// quota: either way the next round must reap without waiting for a new
-    /// SIGCHLD the kernel may already have coalesced.
+    /// Set by CHLD and retained when reaping hits its quota.
+    /// The next round must not block on a notification already coalesced.
     reap_pending: bool = false,
     /// The main child's last reported stop state, carried across reap rounds so
     /// a quota boundary cannot separate a stop from a continue that cancels it.
@@ -152,11 +152,10 @@ pub const State = struct {
     shutdown: ?ShutdownState = null,
     ignore_hup: bool = false,
     ignore_cont: bool = false,
-    /// Capability-only fallbacks are noted at debug once per run, lossy
-    /// fallbacks warn once.
+    /// A degraded path is reported at most once per run. Later
+    /// occurrences drop to debug so a signal storm cannot flood the log.
     warned_payload: bool = false,
-    warned_group_child: bool = false,
-    noted_numeric: bool = false,
+    warned_group: bool = false,
     noted_group: bool = false,
 
     /// What the supervisor should wait for next.
@@ -165,8 +164,8 @@ pub const State = struct {
         infinite,
         /// Milliseconds until the shutdown deadline, 0 means it has passed.
         remaining_ms: i32,
-        /// The monotonic clock could not be read, `onTimeout` resolves it.
-        clock_failed,
+        /// Clock failure: carry the main exit code into immediate cleanup.
+        clock_failed: u8,
     };
 
     /// Consumes the handle in place.
@@ -203,7 +202,7 @@ pub const State = struct {
     pub fn nextWait(self: *const State) Wait {
         self.checkInvariants();
         const shutdown = if (self.shutdown) |*s| s else return .infinite;
-        const now = monotonicNs() catch return .clock_failed;
+        const now = monotonicNs() catch return .{ .clock_failed = shutdown.exit_code };
         return .{ .remaining_ms = shutdown.remainingMs(now) };
     }
 
@@ -217,7 +216,7 @@ pub const State = struct {
         const shutdown = if (self.shutdown) |*s| s else return null;
         const now = monotonicNs() catch {
             @branchHint(.cold);
-            return .{ .exited = self.onClockFailure(shutdown) };
+            return .{ .exited = self.onClockFailure(shutdown.exit_code) };
         };
 
         if (shutdown.remainingMs(now) != 0) return null;
@@ -356,12 +355,18 @@ pub const State = struct {
             break :blk self.signalGroupByNumber(sig);
         } else self.signalGroupByPidfd(sig, payload);
 
-        if (!sent and !self.warned_group_child) {
-            self.warned_group_child = true;
-            log.warn("process-group send failed; signalling only the main child", .{});
+        if (sent) return true;
+
+        // We don't fallback to signal main child,
+        // because this silence altered the public contract.
+        if (!self.warned_group) {
+            self.warned_group = true;
+            log.warn("unable to signal the workload's process group with {d}", .{sig});
+        } else {
+            log.debug("unable to signal the workload's process group with {d}", .{sig});
         }
 
-        return sent or self.signalChild(sig, payload);
+        return false;
     }
 
     fn signalGroupByPidfd(self: *State, sig: u32, payload: ?Payload) bool {
@@ -415,15 +420,25 @@ pub const State = struct {
     fn signalGroupByNumber(self: *State, sig: u32) bool {
         checks.check(sig > 0, "workload: numeric group signal number must be positive");
         checks.check(sig < std.os.linux.NSIG, "workload: numeric group signal number out of range");
-        const flags = std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT;
-        var info: std.os.linux.siginfo_t = undefined;
-        switch (io.syscallErrno(std.os.linux.waitid(.PGID, self.child.pid, &info, flags, null))) {
-            .SUCCESS => {},
-            else => {
-                @branchHint(.unlikely);
-                log.debug("not signalling {d}: no child of ours is left in that group", .{sig});
-                return false;
-            },
+
+        // Until the child is reaped, the kernel cannot give its process-group
+        // id to another group, so the numeric send is safe. After the reap the
+        // id may be reused, so check that the group still holds our child.
+        if (self.child_reaped) {
+            const flags = std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT;
+            var info: std.os.linux.siginfo_t = undefined;
+            switch (io.syscallErrno(std.os.linux.waitid(.PGID, self.child.pid, &info, flags, null))) {
+                .SUCCESS => {},
+                .CHILD => {
+                    log.debug("not signalling {d}: no child of ours is left in that group", .{sig});
+                    return false;
+                },
+                else => |e| {
+                    @branchHint(.unlikely);
+                    log.warn("unable to verify child process group for signal {d}: {e}", .{ sig, e });
+                    return false;
+                },
+            }
         }
 
         const pgid: usize = @intCast(self.child.pid);
@@ -471,12 +486,14 @@ pub const State = struct {
         if (from_kernel and self.ignore_hup and signo == @backingInt(Sig.HUP)) {
             @branchHint(.unlikely);
             self.ignore_hup = false;
+            log.debug("ignoring the workload's initial signal {d}", .{signo});
             return;
         }
 
         if (from_kernel and self.ignore_cont and signo == @backingInt(Sig.CONT)) {
             @branchHint(.unlikely);
             self.ignore_cont = false;
+            log.debug("ignoring the workload's initial signal {d}", .{signo});
             return;
         }
 
@@ -521,26 +538,28 @@ pub const State = struct {
         first: []const signal.Event,
     ) ?Outcome {
         checks.check(first.len <= signal_batch, "workload: signalfd batch larger than the accepted bound");
+        if (first.len == 0) return self.reapAndReport();
+
         var batch: [signal_batch]signal.Event = undefined;
         var events = first;
         var budget: usize = signal_quota;
 
         while (true) {
-            budget -= @min(budget, events.len);
+            checks.check(events.len <= budget, "workload: signal batch exceeds the remaining budget");
+            budget -= events.len;
 
             for (events) |event| {
-                if (event.signo != @backingInt(Sig.CHLD)) {
-                    if (isOwnBrokenWrite(event, std.os.linux.getpid())) {
-                        @branchHint(.unlikely);
-                        continue;
-                    }
-
-                    log.debug("receive signal: {d}", .{event.signo});
-                    self.forwardSignal(event);
-                } else {
-                    @branchHint(.unlikely);
+                if (event.signo == @backingInt(Sig.CHLD)) {
                     self.reap_pending = true;
+                    continue;
                 }
+
+                if (isOwnBrokenWrite(event)) {
+                    @branchHint(.unlikely);
+                    continue;
+                }
+
+                self.forwardSignal(event);
             }
 
             if (budget == 0 or events.len < batch.len) break;
@@ -553,11 +572,11 @@ pub const State = struct {
             events = batch[0..got];
         }
 
-        if (first.len == 0 or self.reap_pending) {
-            @branchHint(.unlikely);
-            return self.reapAndReport();
-        }
-
+        // A short nonblocking read drained the pending queue: an unseen CHLD
+        // cannot hide behind those events. A later CHLD wakes the next wait.
+        // At the quota boundary lower-numbered signals may still hide CHLD,
+        // so force a reap there even without an observed notification.
+        if (self.reap_pending or budget == 0) return self.reapAndReport();
         return null;
     }
 
@@ -573,11 +592,6 @@ pub const State = struct {
             @branchHint(.cold);
             return self.abortSupervision();
         };
-
-        if (reap.main == .exited) {
-            @branchHint(.unlikely);
-            self.child.drainExecFailure();
-        }
 
         // Optimistic: even with no zombie left right now, the next
         // round must not wait on a SIGCHLD that may already be coalesced with
@@ -600,18 +614,20 @@ pub const State = struct {
 
         switch (reap.main) {
             .exited => |code| {
+                self.child.drainExecFailure();
+                self.checkInvariants();
                 if (reap.no_children) return .{ .exited = code };
-                if (self.shutdown == null) {
-                    self.beginShutdown(code);
-                    return null;
-                }
+                // drain marks the main child reaped before reporting its exit,
+                // so this transition occurs once. beginShutdown checks that.
+                return self.beginShutdown(code);
             },
-            else => if (self.shutdown != null and reap.no_children) {
-                return .{ .exited = self.shutdown.?.exit_code };
-            },
+            else => {},
         }
 
-        return null;
+        self.checkInvariants();
+        if (!reap.no_children) return null;
+        const shutdown = self.shutdown orelse return null;
+        return .{ .exited = shutdown.exit_code };
     }
 
     pub fn abortSupervision(self: *State) Outcome {
@@ -621,21 +637,32 @@ pub const State = struct {
         return .failed;
     }
 
-    fn beginShutdown(self: *State, exit_code: u8) void {
+    fn beginShutdown(self: *State, exit_code: u8) ?Outcome {
         checks.check(self.shutdown == null, "workload: shutdown began twice");
+        checks.check(self.child_reaped, "workload: grace cannot start before the main child's exit");
+        self.checkInvariants();
         crash.setPhase(.shutdown);
 
-        if (monotonicNs()) |now| {
-            self.shutdown = ShutdownState.init(exit_code, now, self.policy.shutdown_timeout_ns);
-            log.debug("child exited, {d}ms grace for descendants before SIGKILL", .{
-                self.policy.shutdown_timeout_ns / std.time.ns_per_ms,
-            });
-        } else |_| {
+        const now = monotonicNs() catch {
             @branchHint(.cold);
-            self.shutdown = ShutdownState.init(exit_code, 0, 0);
-        }
+            // Preserve TERM before KILL without inventing a successful clock
+            // reading or re-entering the event loop to retry the failed clock.
+            _ = self.signalProcessGroup(@backingInt(Sig.TERM), null);
+            return .{ .exited = self.onClockFailure(exit_code) };
+        };
+
+        self.shutdown = ShutdownState.init(.{
+            .exit_code = exit_code,
+            .now_ns = now,
+            .timeout_ns = self.policy.shutdown_timeout_ns,
+        });
+
+        log.debug("child exited, {d}ms grace for descendants before SIGKILL", .{
+            self.policy.shutdown_timeout_ns / std.time.ns_per_ms,
+        });
 
         _ = self.signalProcessGroup(@backingInt(Sig.TERM), null);
+        return null;
     }
 
     fn onShutdownTimeout(self: *State, sd: *ShutdownState) u8 {
@@ -643,9 +670,12 @@ pub const State = struct {
         return self.finishShutdown(sd.exit_code);
     }
 
-    fn onClockFailure(self: *State, sd: *ShutdownState) u8 {
+    pub fn onClockFailure(self: *State, exit_code: u8) u8 {
+        checks.check(self.child_reaped, "workload: clock failure cleanup requires the main child's exit");
+        if (self.shutdown) |shutdown|
+            checks.check(shutdown.exit_code == exit_code, "workload: clock failure changed the main exit code");
         log.err("cannot read the monotonic clock: sending SIGKILL without the grace period", .{});
-        return self.finishShutdown(sd.exit_code);
+        return self.finishShutdown(exit_code);
     }
 
     fn finishShutdown(self: *State, exit_code: u8) u8 {
@@ -661,8 +691,11 @@ const ShutdownState = struct {
     /// CLOCK_MONOTONIC deadline (ns) at which the process group gets SIGKILLed.
     deadline_ns: u64,
 
-    fn init(exit_code: u8, now_ns: u64, timeout_ns: u64) ShutdownState {
-        return .{ .exit_code = exit_code, .deadline_ns = now_ns +| timeout_ns };
+    fn init(options: struct { exit_code: u8, now_ns: u64, timeout_ns: u64 }) ShutdownState {
+        return .{
+            .exit_code = options.exit_code,
+            .deadline_ns = options.now_ns +| options.timeout_ns,
+        };
     }
 
     pub fn remainingMs(self: *const ShutdownState, now_ns: u64) i32 {
@@ -673,24 +706,14 @@ const ShutdownState = struct {
     }
 };
 
-fn applyMainEvent(result: *DrainResult, event: MainObservation) void {
-    switch (event) {
-        .unchanged => unreachable,
-        .exited => result.main = event,
-        .stopped, .continued => if (result.main != .exited) {
-            result.main = event;
-        },
-    }
-}
-
 /// A failed write to a broken log sink raises SIGPIPE for this process: the
 /// kernel reports it as `SI_USER` naming ourselves. It is not a signal for the
 /// workload, and logging about it would only raise another, so the caller drops
 /// it silently. An external SIGPIPE names its sender and is still forwarded.
-fn isOwnBrokenWrite(event: signal.Event, self_pid: std.os.linux.pid_t) bool {
+fn isOwnBrokenWrite(event: signal.Event) bool {
     return event.signo == @backingInt(Sig.PIPE) and
         event.code == signal.SI.USER and
-        event.sender == self_pid;
+        event.sender == std.os.linux.getpid();
 }
 
 fn shouldStopSelf(main_stopped: bool, more: bool) bool {
@@ -723,28 +746,29 @@ fn drain(
                 const wait_status = WaitStatus.fromRaw(status);
                 const is_main = !main_reaped.* and pid == child_pid;
 
-                switch (wait_status.kind()) {
-                    .continued => if (is_main) {
-                        @branchHint(.unlikely);
-                        applyMainEvent(&result, .continued);
-                        continue;
-                    },
-                    .stopped => if (is_main) {
-                        @branchHint(.unlikely);
-                        applyMainEvent(&result, .stopped);
-                        continue;
-                    },
-                    else => {},
+                if (!is_main) {
+                    if (wait_status.class() != .unknown)
+                        log.processExited(pid, wait_status, .orphaned);
+                    continue;
                 }
 
-                if (is_main) {
-                    main_reaped.* = true;
-                    applyMainExit(&result, pid, wait_status, expected_exit);
-                } else if (wait_status.class() != .unknown) {
-                    log.processExited(pid, wait_status, .orphaned);
+                switch (wait_status.kind()) {
+                    .continued => {
+                        @branchHint(.unlikely);
+                        result.main = .continued;
+                    },
+                    .stopped => {
+                        @branchHint(.unlikely);
+                        result.main = .stopped;
+                    },
+                    else => {
+                        main_reaped.* = true;
+                        applyMainExit(&result, pid, wait_status, expected_exit);
+                    },
                 }
             },
             .CHILD => {
+                checks.check(main_reaped.*, "workload: the kernel cannot have no children before reporting the main child's exit");
                 result.no_children = true;
                 return result;
             },
@@ -777,7 +801,7 @@ fn applyMainExit(
         break :blk 0;
     } else code;
 
-    applyMainEvent(result, .{ .exited = final_code });
+    result.main = .{ .exited = final_code };
 }
 
 fn monotonicNs() errors.SysCallError!u64 {
@@ -798,7 +822,7 @@ fn monotonicNs() errors.SysCallError!u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-// kcov-exclude-tests (everything below is test-only).
+// Everything below is test-only.
 test {
     _ = internal_tests;
 }
@@ -808,17 +832,17 @@ test "the grace deadline is absolute, and a clamped wait does not end it" {
     const start: u64 = 10 * std.time.ns_per_s;
 
     // Half a millisecond is still a millisecond of waiting.
-    const immediate = ShutdownState.init(0, start, 1);
+    const immediate = ShutdownState.init(.{ .exit_code = 0, .now_ns = start, .timeout_ns = 1 });
     try std.testing.expectEqual(@as(i32, 1), immediate.remainingMs(start));
 
     // Already due, and exactly due, both mean "no time left".
-    const done = ShutdownState.init(0, start, 5 * ms);
+    const done = ShutdownState.init(.{ .exit_code = 0, .now_ns = start, .timeout_ns = 5 * ms });
     try std.testing.expectEqual(@as(i32, 0), done.remainingMs(start + 5 * ms));
     try std.testing.expectEqual(@as(i32, 0), done.remainingMs(start + 6 * ms));
 
     // Longer than one poll can express: the first wait is clamped, the deadline is not.
     const long_ns = (@as(u64, std.math.maxInt(i32)) + 1_000) * ms;
-    const long = ShutdownState.init(0, start, long_ns);
+    const long = ShutdownState.init(.{ .exit_code = 0, .now_ns = start, .timeout_ns = long_ns });
     try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), long.remainingMs(start));
     try std.testing.expectEqual(@as(i32, 1_000), long.remainingMs(start + @as(u64, std.math.maxInt(i32)) * ms));
     try std.testing.expectEqual(@as(i32, 0), long.remainingMs(start + long_ns));
