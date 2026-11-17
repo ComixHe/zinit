@@ -444,15 +444,11 @@ pub const State = struct {
             return;
         }
 
-        // The assert above keeps `signo` inside the table. The fallback stays for
-        // ReleaseSmall, where asserts are compiled out: a wrong number would only
-        // mean the signal is forwarded unrewritten.
-        const rewritten = if (self.policy.rewrites) |m|
-            m.apply(signo) catch null
+        const signal_to_send = if (self.policy.rewrites) |*m|
+            m.apply(signo)
         else
-            null;
+            signo;
 
-        const signal_to_send = rewritten orelse signo;
         if (signal_to_send == 0) {
             @branchHint(.unlikely);
             log.debug("dropping signal {d}", .{signo});

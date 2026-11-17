@@ -45,8 +45,8 @@ fn applySessionRewrites(session_rewrites: *?rewrite.Map) void {
 
     const to_stop = [_]u32{ @backingInt(Sig.TSTP), @backingInt(Sig.TTOU), @backingInt(Sig.TTIN) };
     for (to_stop) |from| {
-        if ((map.target(from) catch unreachable) == null)
-            map.set(from, @backingInt(Sig.STOP)) catch unreachable;
+        if (map.target(from) == null)
+            map.set(from, @backingInt(Sig.STOP));
     }
 }
 
@@ -468,7 +468,7 @@ test "Args.parse never panics on arbitrary argv and environment" {
                     if (parsed.rewrites) |map| {
                         var sig: u32 = 1;
                         while (sig < std.os.linux.NSIG) : (sig += 1) {
-                            const target = try map.target(sig);
+                            const target = map.target(sig);
                             if (target) |rewritten| {
                                 try std.testing.expect(
                                     rewritten == 0 or signal.isStandard(rewritten),

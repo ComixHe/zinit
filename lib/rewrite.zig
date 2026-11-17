@@ -24,32 +24,28 @@ pub const Map = struct {
         return .{ .entries = @splat(unset) };
     }
 
-    /// `null` = no rewrite, `0` = drop, otherwise the validated target signal.
-    pub fn target(self: *const Map, sig: u32) ConfigError!?u32 {
-        if (sig >= self.entries.len) {
-            @branchHint(.unlikely);
-            return ConfigError.InvalidSignal;
-        }
+    /// Queries a validated signal index: `null` = no rewrite, `0` = drop.
+    pub fn target(self: *const Map, sig: u32) ?u32 {
+        checks.check(sig < self.entries.len, "rewrite: target index must be a validated signal");
 
         const stored = self.entries[sig];
         return if (stored == unset) null else stored;
     }
 
-    pub fn set(self: *Map, old_sig: u32, new_sig: u32) ConfigError!void {
-        if (old_sig >= self.entries.len or new_sig >= self.entries.len) {
-            @branchHint(.unlikely);
-            return ConfigError.InvalidSignal;
-        }
+    /// Stores validated indices, a zero target drops the signal.
+    pub fn set(self: *Map, old_sig: u32, new_sig: u32) void {
+        checks.check(old_sig < self.entries.len, "rewrite: source index must be a validated signal");
+        checks.check(new_sig < self.entries.len, "rewrite: target index must be a validated signal");
 
         self.entries[old_sig] = new_sig;
     }
 
-    /// Inlined so `target` and the error union are resolved against the one
-    /// caller instead of through a call boundary.
-    pub inline fn apply(rewrites: *const Map, signo: u32) ConfigError!u32 {
+    /// Applies a kernel-validated signal. Invalid CLI signals are rejected
+    /// by `parse` before a map can reach the forwarding loop.
+    pub inline fn apply(rewrites: *const Map, signo: u32) u32 {
         checks.check(signo > 0, "rewrite: apply needs a positive signal number");
         checks.check(signo < std.os.linux.NSIG, "rewrite: apply signal number out of range");
-        return if (try rewrites.target(signo)) |rewritten| rewritten else signo;
+        return rewrites.target(signo) orelse signo;
     }
 
     pub fn parse(self: *Map, value: []const u8) ConfigError!void {
@@ -80,31 +76,28 @@ pub const Map = struct {
             return ConfigError.DuplicateSignal;
         }
 
-        if (new_sig != 0 and (self.reaches(new_sig, old_sig) catch unreachable)) {
+        if (new_sig != 0 and self.reaches(new_sig, old_sig)) {
             @branchHint(.cold);
             return ConfigError.CycleRewrite;
         }
 
-        if ((self.target(old_sig) catch unreachable) != null) {
+        if (self.target(old_sig) != null) {
             @branchHint(.cold);
             return ConfigError.DuplicateSignal;
         }
 
-        self.set(old_sig, new_sig) catch unreachable;
-        checks.check((self.target(old_sig) catch unreachable) == new_sig, "rewrite: stored target does not read back");
+        self.set(old_sig, new_sig);
+        checks.check(self.target(old_sig) == new_sig, "rewrite: stored target does not read back");
     }
 
     /// Not a plain reachability query: an existing cycle also counts, so `parse`
     /// refuses closing a loop it did not create.
-    fn reaches(self: *const Map, from: u32, to: u32) ConfigError!bool {
-        if (from == 0 or from >= self.entries.len) {
-            @branchHint(.unlikely);
-            return ConfigError.InvalidParams;
-        }
+    fn reaches(self: *const Map, from: u32, to: u32) bool {
+        checks.check(from > 0 and from < self.entries.len, "rewrite: reachability source must be a validated signal");
 
         var current = from;
         var steps: usize = 0;
-        while (self.target(current) catch unreachable) |next_node| {
+        while (self.target(current)) |next_node| {
             if (next_node == to) return true;
             if (next_node == 0) return false;
 
@@ -174,12 +167,12 @@ test "Map stays acyclic and atomic over arbitrary rewrite sequences" {
 fn expectAcyclic(map: Map) !void {
     var start: u32 = 1;
     while (start < std.os.linux.NSIG) : (start += 1) {
-        if (try map.target(start) == null) continue;
+        if (map.target(start) == null) continue;
 
         var seen: std.bit_set.Static(std.os.linux.NSIG) = .empty;
         seen.set(start);
         var current = start;
-        while (try map.target(current)) |next| {
+        while (map.target(current)) |next| {
             if (next == 0) break;
             if (!signal.isStandard(next)) return error.RewriteTargetOutOfDomain;
             if (seen.isSet(next)) return error.RewriteCycle;
@@ -193,8 +186,8 @@ fn expectAcyclic(map: Map) !void {
 fn expectApplyMatchesTargets(map: Map) !void {
     var sig: u32 = 1;
     while (sig < std.os.linux.NSIG) : (sig += 1) {
-        const target = try map.target(sig);
-        try std.testing.expectEqual(target orelse sig, try Map.apply(&map, sig));
+        const target = map.target(sig);
+        try std.testing.expectEqual(target orelse sig, Map.apply(&map, sig));
     }
 }
 
