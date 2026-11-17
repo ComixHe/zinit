@@ -7,7 +7,6 @@
 const std = @import("std");
 const checks = @import("checks.zig");
 const builtin = @import("builtin");
-const tty = @import("tty.zig");
 const fmt = @import("fmt.zig");
 const io = @import("io.zig");
 const wait = @import("wait.zig");
@@ -29,6 +28,7 @@ const SinkKind = enum {
 
 const State = struct {
     sink: std.os.linux.fd_t = -1,
+    /// Only a separately opened nonblocking sink is owned. Stderr is borrowed.
     owned: bool = false,
     kind: SinkKind = .stream,
     level: std.log.Level = if (builtin.is_test) .warn else default_level,
@@ -83,7 +83,7 @@ pub fn init(sink_fd: std.os.linux.fd_t) error{ InvalidSink, AlreadyInitialized }
         .owned = owned,
         .kind = kind,
         .level = state.level,
-        .color = tty.isTty(fd),
+        .color = io.isTty(fd),
     };
 }
 
@@ -147,27 +147,67 @@ fn openNonBlocking(path: [:0]const u8) ?std.os.linux.fd_t {
     return @intCast(raw);
 }
 
-fn writeSink(kind: SinkKind, fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
-    if (kind == .stream) return io.writeAll(fd, bytes);
+const WriteResult = enum {
+    complete,
+    /// No bytes accepted: another event may use the same sink later.
+    dropped,
+    /// The sink failed or may contain a partial line. Disable it before the
+    /// next event so the next prefix cannot be appended to an unfinished line.
+    failed,
+};
 
-    while (true) {
-        const rc = if (kind == .socket)
-            std.os.linux.sendto(
-                fd,
-                bytes.ptr,
-                bytes.len,
-                std.os.linux.MSG.DONTWAIT | std.os.linux.MSG.NOSIGNAL,
-                null,
-                0,
-            )
-        else
-            std.os.linux.write(fd, bytes.ptr, bytes.len);
+fn writeBestEffort(kind: SinkKind, fd: std.os.linux.fd_t, bytes: []const u8) WriteResult {
+    if (kind == .stream) {
+        if (io.writeAll(fd, bytes) != null) return .failed;
+        return .complete;
+    }
 
-        switch (io.syscallErrno(rc)) {
-            .INTR => continue,
-            .SUCCESS, .AGAIN => return null,
-            else => |errno| return errno,
-        }
+    const rc = if (kind == .socket)
+        std.os.linux.sendto(
+            fd,
+            bytes.ptr,
+            bytes.len,
+            std.os.linux.MSG.DONTWAIT | std.os.linux.MSG.NOSIGNAL,
+            null,
+            0,
+        )
+    else
+        std.os.linux.write(fd, bytes.ptr, bytes.len);
+
+    return switch (io.syscallErrno(rc)) {
+        .SUCCESS => blk: {
+            checks.check(rc <= bytes.len, "log: sink accepted more bytes than requested");
+            break :blk if (rc == bytes.len) .complete else .failed;
+        },
+        .INTR, .AGAIN => .dropped,
+        else => .failed,
+    };
+}
+
+/// Async-signal-safe, diagnostic-only attempt on the already prepared sink.
+/// Pipe/FIFO sinks have an independent nonblocking open description, socket
+/// sends use per-call flags. A disabled sink is left disabled. The caller must
+/// block SIGPIPE before entering, and must not use the formatter or normal logs.
+pub fn writeFatal(iov: []const std.posix.iovec_const) void {
+    if (state.sink < 0) return;
+    if (state.kind == .socket) {
+        const message: std.os.linux.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = iov.ptr,
+            .iovlen = iov.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        _ = std.os.linux.sendmsg(
+            state.sink,
+            &message,
+            std.os.linux.MSG.DONTWAIT | std.os.linux.MSG.NOSIGNAL,
+        );
+    } else {
+        // No retry, including EINTR/EAGAIN: exit takes priority over diagnostics.
+        _ = std.os.linux.writev(state.sink, iov.ptr, iov.len);
     }
 }
 
@@ -183,8 +223,12 @@ fn aboveCeiling(comptime level: std.log.Level) bool {
     return @backingInt(level) > @backingInt(config.max_log_level);
 }
 
-fn emit(level: std.log.Level, msg: []const u8) void {
-    if (state.sink < 0) return; // disabled logging if sink is closed or not available.
+inline fn emit(level: std.log.Level, message: fmt.Message) void {
+    emitParts(level, message.text, message.values);
+}
+
+fn emitParts(level: std.log.Level, text: []const u8, values: @FieldType(fmt.Message, "values")) void {
+    if (state.sink < 0) return;
 
     const prefix: []const u8 = if (state.color) switch (level) {
         .err => "\x1b[31m[zinit] ERROR:\x1b[0m ",
@@ -200,11 +244,15 @@ fn emit(level: std.log.Level, msg: []const u8) void {
 
     var buf: [512]u8 = undefined;
 
-    const text = fmt.bufPrint(buf[0 .. buf.len - 1], "{s}{s}", .{ prefix, msg });
-    buf[text.len] = '\n';
+    const at = fmt.appendBytes(buf[0 .. buf.len - 1], 0, prefix);
+    const remaining = buf[at .. buf.len - 1];
+    const message: fmt.Message = .{ .text = text, .values = values };
+    const length = at + message.render(remaining).len;
+    buf[length] = '\n';
 
-    if (writeSink(state.kind, state.sink, buf[0 .. text.len + 1])) |errno| {
-        if (errno == .PIPE or errno == .IO or errno == .CONNRESET) deinit();
+    switch (writeBestEffort(state.kind, state.sink, buf[0 .. length + 1])) {
+        .complete, .dropped => {},
+        .failed => deinit(),
     }
 }
 
@@ -216,18 +264,21 @@ fn write(comptime level: std.log.Level, comptime format: []const u8, args: anyty
     // A literal needs no formatting buffer, and a single `{s}` is already the
     // text `emit` wants. Both are common enough to be worth the direct path.
     if (comptime @typeInfo(@TypeOf(args)).@"struct".field_names.len == 0) {
-        emit(level, format);
+        emit(level, .literal(format));
         return;
     }
 
     if (comptime std.mem.eql(u8, format, "{s}")) {
-        emit(level, args[0]);
+        emit(level, .literal(args[0]));
         return;
     }
 
-    var buf: [512]u8 = undefined;
-    const msg = fmt.bufPrint(&buf, format, args);
-    emit(level, msg);
+    emitFormatted(level, format, args);
+}
+
+fn emitFormatted(level: std.log.Level, comptime format: []const u8, args: anytype) void {
+    const prepared = fmt.prepare(format, args);
+    emit(level, prepared.message());
 }
 
 pub fn err(comptime format: []const u8, args: anytype) void {
@@ -243,28 +294,6 @@ pub fn debug(comptime format: []const u8, args: anytype) void {
 }
 
 pub const Role = enum { main, orphaned };
-
-const ExitReport = struct {
-    role: Role,
-    pid: std.os.linux.pid_t,
-    outcome: union(enum) {
-        exited: u8,
-        signaled: u32,
-        unknown,
-    },
-};
-
-fn exitReport(pid: std.os.linux.pid_t, status: WaitStatus, role: Role) ExitReport {
-    return .{
-        .role = role,
-        .pid = pid,
-        .outcome = switch (status.class()) {
-            .exited => .{ .exited = status.exitCode() },
-            .signaled => .{ .signaled = status.signalNumber() },
-            .unknown => .unknown,
-        },
-    };
-}
 
 fn exitLevel(status: WaitStatus, role: Role) std.log.Level {
     if (role == .main) return .info;
@@ -282,34 +311,24 @@ pub fn processExited(pid: std.os.linux.pid_t, status: WaitStatus, role: Role) vo
     if (dropped(level)) return;
 
     var buf: [128]u8 = undefined;
-    emit(level, formatExited(&buf, exitReport(pid, status, role)));
-}
-
-fn formatExited(buf: []u8, report: ExitReport) []const u8 {
-    const what: []const u8 = switch (report.role) {
+    var at: usize = 0;
+    const what: []const u8 = switch (role) {
         .main => "child process",
         .orphaned => "orphaned process",
     };
 
-    var at: usize = 0;
-    at = fmt.appendBytes(buf, at, what);
-    at = fmt.appendBytes(buf, at, " ");
-    at = fmt.appendInt(buf, at, @intCast(report.pid), .dec);
-    at = fmt.appendBytes(buf, at, " exited with ");
-
-    switch (report.outcome) {
-        .exited => |code| {
-            at = fmt.appendBytes(buf, at, "code ");
-            at = fmt.appendInt(buf, at, code, .dec);
-            at = fmt.appendBytes(buf, at, ".");
-        },
-        .signaled => |sig| {
-            at = fmt.appendBytes(buf, at, "signal ");
-            at = fmt.appendInt(buf, at, sig, .dec);
-            at = fmt.appendBytes(buf, at, ".");
-        },
-        .unknown => at = fmt.appendBytes(buf, at, "unknown status"),
+    at = fmt.appendBytes(&buf, at, what);
+    at = fmt.appendBytes(&buf, at, " ");
+    at = fmt.appendInt(&buf, at, @intCast(pid), .dec);
+    at = fmt.appendBytes(&buf, at, " exited with ");
+    const class = status.class();
+    if (class == .unknown) {
+        at = fmt.appendBytes(&buf, at, "unknown status");
+    } else {
+        at = fmt.appendBytes(&buf, at, if (class == .exited) "code " else "signal ");
+        const value = if (class == .exited) status.exitCode() else status.signalNumber();
+        at = fmt.appendInt(&buf, at, value, .dec);
+        at = fmt.appendBytes(&buf, at, ".");
     }
-
-    return buf[0..at];
+    emit(level, .literal(buf[0..at]));
 }

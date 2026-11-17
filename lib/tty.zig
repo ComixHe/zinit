@@ -12,13 +12,6 @@ const io = @import("io.zig");
 
 const log = @import("log.zig");
 
-/// Whether a terminal is attached to `fd`.
-pub fn isTty(fd: std.os.linux.fd_t) bool {
-    checks.check(fd >= 0, "tty: isTty needs a valid descriptor");
-    var termios: std.os.linux.termios = undefined;
-    return io.syscallErrno(std.os.linux.tcgetattr(fd, &termios)) == .SUCCESS;
-}
-
 /// Whether `fd` is this session's controlling terminal, regardless of whether
 /// zinit's process group is in the foreground. `tcgetpgrp` also rejects non-tty fds.
 pub fn isControlTerminal(fd: std.os.linux.fd_t) bool {
@@ -33,6 +26,18 @@ pub fn isControlTerminal(fd: std.os.linux.fd_t) bool {
 /// leader, so a later kernel HUP/CONT can be mistaken for it.
 pub fn detachFromControlTerminal(fd: std.os.linux.fd_t) bool {
     checks.check(fd >= 0, "tty: detachFromControlTerminal needs a valid descriptor");
+    // Verify before detaching: after IOCNOTTY succeeds a session leader may
+    // already have HUP/CONT pending.
+    const sid = std.os.linux.getsid(0);
+    switch (io.syscallErrno(sid)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.warn("unable to verify terminal session: {e}", .{e});
+            return false;
+        },
+    }
+
+    const was_leader = sid == std.os.linux.getpid();
     const rc = std.os.linux.ioctl(fd, std.os.linux.T.IOCNOTTY, 0);
     switch (io.syscallErrno(rc)) {
         .SUCCESS => {},
@@ -47,7 +52,7 @@ pub fn detachFromControlTerminal(fd: std.os.linux.fd_t) bool {
         },
     }
 
-    if (std.os.linux.getsid(0) != std.os.linux.getpid()) {
+    if (!was_leader) {
         log.debug("detached from controlling terminal, but was not session leader", .{});
         return false;
     }

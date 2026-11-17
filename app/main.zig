@@ -57,6 +57,8 @@ const ParsedBehavior = union(enum) {
 fn run(args: Args, ctx: lib.io.Context) u8 {
     log.setRuntimeLevel(args.log_level);
 
+    // These signals terminate or are ignored; installed crash handlers never
+    // return. Source relies on this mask to rule out EINTR during supervision.
     const unblocked_sigs = [_]Sig{ .ABRT, .BUS, .FPE, .ILL, .SEGV, .SYS, .TRAP };
     const signal_config = lib.signalfd.Config.install(&unblocked_sigs) catch {
         @branchHint(.cold);
@@ -77,7 +79,7 @@ fn run(args: Args, ctx: lib.io.Context) u8 {
             break;
         }
 
-        if (args.new_session and tty_fd == null and lib.tty.isTty(fd))
+        if (args.new_session and tty_fd == null and lib.io.isTty(fd))
             tty_fd = fd;
     }
 

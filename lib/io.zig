@@ -27,9 +27,11 @@ noinline fn sharedSyscallErrno(rc: usize) std.os.linux.E {
     return std.os.linux.errno(rc);
 }
 
-/// Returns the errno that stopped the write, or null when every byte was written.
+/// Null means every byte was written. A zero-progress write of a nonempty
+/// remainder is an I/O failure, even when the filesystem returned no errno.
 pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
     checks.check(fd >= 0, "io: writeAll needs a valid descriptor");
+
     var offset: usize = 0;
     while (offset < bytes.len) {
         const rc = std.os.linux.write(fd, bytes.ptr + offset, bytes.len - offset);
@@ -37,12 +39,14 @@ pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
             .SUCCESS => {
                 if (rc == 0) {
                     @branchHint(.unlikely);
-                    return null;
+                    return .IO;
                 }
 
+                checks.check(rc <= bytes.len - offset, "io: write reported more bytes than requested");
                 offset += rc;
             },
-            .INTR => {},
+            // report errno to caller, even though EINTR
+            // let caller decides what's going on.
             else => |errno| return errno,
         }
     }
@@ -51,6 +55,13 @@ pub fn writeAll(fd: std.os.linux.fd_t, bytes: []const u8) ?std.os.linux.E {
 }
 
 pub fn closeQuietly(fd: std.os.linux.fd_t) void {
-    // nothing a caller could do about a failing close.
+    // Linux releases the descriptor even when close reports EINTR/EIO.
+    // So we no need to retry (even shouldn't for data race)
     _ = std.os.linux.close(fd);
+}
+
+pub fn isTty(fd: std.os.linux.fd_t) bool {
+    checks.check(fd >= 0, "tty: isTty needs a valid descriptor");
+    var termios: std.os.linux.termios = undefined;
+    return syscallErrno(std.os.linux.tcgetattr(fd, &termios)) == .SUCCESS;
 }
