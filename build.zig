@@ -140,13 +140,8 @@ fn addHostTool(b: *std.Build, name: []const u8, path: []const u8) *std.Build.Ste
 
 fn boundTestRun(b: *std.Build, run: *std.Build.Step.Run, limit: []const u8) *std.Build.Step.Run {
     run.argv.insertSlice(b.allocator, 0, &.{
-        .{ .bytes = "/bin/sh" },
-        .{ .lazy_path = .{
-            .prefix = "",
-            .suffix = "",
-            .lazy_path = b.path("tools/run_test.sh"),
-            .make_absolute = true,
-        } },
+        .{ .bytes = "timeout" },
+        .{ .bytes = "--signal=KILL" },
         .{ .bytes = limit },
     }) catch @panic("OOM");
     run.has_side_effects = true;
