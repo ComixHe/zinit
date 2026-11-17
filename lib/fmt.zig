@@ -76,32 +76,98 @@ fn parsePlaceholder(format: []const u8, start: usize) Parsed {
 }
 
 pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) []u8 {
-    const args_info = @typeInfo(@TypeOf(args));
-    if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
-        @compileError("fmt: expected argument tuple, found " ++ @typeName(@TypeOf(args)));
-    }
-    const pieces = comptime parse(format, args_info.@"struct".field_names.len);
+    const prepared = prepare(format, args);
+    return prepared.message().render(buf);
+}
 
-    var at: usize = 0;
+pub inline fn prepare(comptime format: []const u8, args: anytype) Prepared(format, @TypeOf(args)) {
+    const count = comptime argumentCount(@TypeOf(args));
+    const pieces = comptime parse(format, count);
+
+    var values: [count]Value = undefined;
     comptime var arg_i: usize = 0;
-
     inline for (pieces) |piece| {
-        switch (piece) {
-            .literal => |lit| at = appendBytes(buf, at, lit),
-            .arg => |kind| {
-                at = switch (kind) {
-                    .str => appendBytes(buf, at, args[arg_i]),
-                    .dec => appendInt(buf, at, args[arg_i], .dec),
-                    .hex => appendInt(buf, at, args[arg_i], .hex),
-                    .errno => appendErrno(buf, at, args[arg_i]),
-                };
-
-                arg_i += 1;
-            },
+        if (piece == .arg) {
+            values[arg_i] = switch (piece.arg) {
+                .str => .{ .text = args[arg_i] },
+                .dec, .hex => .{ .number = args[arg_i] },
+                .errno => .{ .number = @backingInt(@as(std.os.linux.E, args[arg_i])) },
+            };
+            arg_i += 1;
         }
     }
 
-    checks.check(at <= buf.len, "fmt: bufPrint position past the end of the buffer");
+    return .{ .values = values };
+}
+
+fn Prepared(comptime format: []const u8, comptime Args: type) type {
+    return struct {
+        values: [argumentCount(Args)]Value,
+
+        pub inline fn message(self: *const @This()) Message {
+            return .{ .text = format, .values = &self.values };
+        }
+    };
+}
+
+/// A synchronous borrowed view for the shared noinline renderer
+pub const Message = struct {
+    text: []const u8,
+    values: ?[]const Value,
+
+    pub inline fn literal(text: []const u8) Message {
+        return .{ .text = text, .values = null };
+    }
+
+    pub inline fn render(self: Message, buf: []u8) []u8 {
+        const values = self.values orelse return buf[0..appendBytes(buf, 0, self.text)];
+        return renderFormat(buf, self.text, values);
+    }
+};
+
+fn argumentCount(comptime Args: type) usize {
+    const args_info = @typeInfo(Args);
+    if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
+        @compileError("fmt: expected argument tuple, found " ++ @typeName(Args));
+    }
+
+    return args_info.@"struct".field_names.len;
+}
+
+const Value = union { text: []const u8, number: u64 };
+
+noinline fn renderFormat(buf: []u8, format: []const u8, values: []const Value) []u8 {
+    var at: usize = 0;
+    var cursor: usize = 0;
+    var argument: usize = 0;
+    while (cursor < format.len and at < buf.len) {
+        const start = cursor;
+        while (cursor < format.len and format[cursor] != '{') : (cursor += 1) {}
+        at = appendBytes(buf, at, format[start..cursor]);
+        if (cursor == format.len) break;
+
+        checks.check(format.len - cursor >= 3, "fmt: prepared placeholder is incomplete");
+        checks.check(format[cursor + 2] == '}', "fmt: prepared placeholder has no closing brace");
+        checks.check(argument < values.len, "fmt: prepared format has no argument for its placeholder");
+
+        at = switch (format[cursor + 1]) {
+            's' => appendBytes(buf, at, values[argument].text),
+            'd' => appendInt(buf, at, values[argument].number, .dec),
+            'x' => appendInt(buf, at, values[argument].number, .hex),
+            'e' => appendErrno(buf, at, @fromBackingInt(@intCast(values[argument].number))),
+            else => unreachable,
+        };
+
+        argument += 1;
+        cursor += 3;
+    }
+
+    checks.check(at <= buf.len, "fmt: render position past the end of the buffer");
+    if (cursor == format.len) {
+        @branchHint(.cold);
+        checks.check(argument == values.len, "fmt: complete rendering left unused arguments");
+    }
+
     return buf[0..at];
 }
 
@@ -156,7 +222,8 @@ const errno_lookup = blk: {
         names = names ++ e.text ++ "\x00";
     }
 
-    break :blk .{ .offsets = offsets, .names = names };
+    const Table = struct { offsets: [widest + 1]u8, names: []const u8 };
+    break :blk Table{ .offsets = offsets, .names = names };
 };
 
 pub fn appendErrno(buf: []u8, at: usize, errno: std.os.linux.E) usize {
@@ -312,6 +379,19 @@ test "append primitives never overrun, and truncate only at the buffer end" {
             var full_buf: [24]u8 = undefined;
             const full = full_buf[0..appendErrno(&full_buf, 0, errno)];
             try expectErrnoShape(full);
+
+            var reference_buf: [128]u8 = undefined;
+            const reference = try std.mem.print(&reference_buf, "{s}:{d}:{x}:{s}", .{
+                payload[0..payload_len], value, value, full,
+            });
+
+            const capacity = smith.index(buf.len + 1);
+            @memset(&buf, 0xAA);
+            const rendered = bufPrint(buf[0..capacity], "{s}:{d}:{x}:{e}", .{
+                payload[0..payload_len], value, value, errno,
+            });
+            try std.testing.expectEqualStrings(reference[0..@min(capacity, reference.len)], rendered);
+            try expectUntouched(&buf, 0, rendered.len);
 
             const errno_at = smith.index(buf.len + 1);
             @memset(&buf, 0xAA);
