@@ -14,8 +14,9 @@
 //! vector instead.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const fmt = @import("fmt.zig");
+const log = @import("log.zig");
+const checks = @import("checks.zig");
 
 /// A stack overflow faults on the exhausted stack, so the handler needs its own.
 /// It lives in `.bss` and costs no file size.
@@ -41,7 +42,7 @@ var bias_known: bool = false;
 
 /// Installs the handler for the terminating fault signals. The supervisor's
 /// forwarded signals stay blocked and keep their default disposition.
-pub fn install(comptime pie: bool) void {
+pub fn install(comptime pie: bool) ?std.os.linux.E {
     if (comptime pie) {
         if (detectLoadBias()) |range| {
             load_bias = range.base;
@@ -55,17 +56,22 @@ pub fn install(comptime pie: bool) void {
         .flags = 0,
         .size = alt_stack.len,
     };
-    _ = std.os.linux.sigaltstack(&stack, null);
+
+    const stack_errno = std.os.linux.errno(std.os.linux.sigaltstack(&stack, null));
+    if (stack_errno != .SUCCESS) return stack_errno;
 
     const action: std.os.linux.Sigaction = .{
         .handler = .{ .sigaction = Handler(pie).handle },
-        .mask = std.os.linux.sigemptyset(),
+        .mask = std.os.linux.sigfillset(),
         .flags = std.os.linux.SA.SIGINFO | std.os.linux.SA.ONSTACK | std.os.linux.SA.RESTART,
     };
 
     for ([_]std.os.linux.SIG{ .SEGV, .BUS, .ILL, .FPE }) |sig| {
-        _ = std.os.linux.sigaction(sig, &action, null);
+        const action_errno = std.os.linux.errno(std.os.linux.sigaction(sig, &action, null));
+        if (action_errno != .SUCCESS) return action_errno;
     }
+
+    return null;
 }
 
 /// The auxv `AT_ENTRY` value is relocated at load time; `e_entry` is the
@@ -166,39 +172,83 @@ fn appendCode(buf: []u8, at: usize, code: i32) usize {
     return fmt.appendInt(buf, at, @intCast(code), .dec);
 }
 
-fn report(comptime pie: bool, sig: std.os.linux.SIG, pc: usize, code: i32, addr: usize) noreturn {
-    var buf: [192]u8 = undefined;
-    var at: usize = 0;
-    at = fmt.appendBytes(&buf, at, "zinit: fatal signal ");
-    at = fmt.appendInt(&buf, at, @backingInt(sig), .dec);
-    at = fmt.appendBytes(&buf, at, " phase=");
-    at = fmt.appendBytes(&buf, at, @tagName(phase));
-    at = fmt.appendBytes(&buf, at, " code=");
-    at = appendCode(&buf, at, code);
-    at = fmt.appendBytes(&buf, at, " addr=0x");
-    at = fmt.appendInt(&buf, at, addr, .hex);
-
-    if (pie) {
-        at = fmt.appendBytes(&buf, at, " pc=0x");
-        at = fmt.appendInt(&buf, at, pc, .hex);
-        at = fmt.appendBytes(&buf, at, " load_bias=0x");
-        at = fmt.appendInt(&buf, at, load_bias, .hex);
-        at = fmt.appendBytes(&buf, at, " elf_pc=0x");
-        at = fmt.appendInt(&buf, at, pc -| load_bias, .hex);
-    } else {
-        at = fmt.appendBytes(&buf, at, " at 0x");
-        at = fmt.appendInt(&buf, at, pc, .hex);
-    }
-
-    buf[at] = '\n';
-    at += 1;
-    const iov = [_]std.posix.iovec_const{.{ .base = &buf, .len = at }};
-    writeAndExit(&iov);
+fn reportFormat(comptime pie: bool) []const u8 {
+    return if (pie)
+        "zinit: fatal signal {d} phase={s} code={s} addr=0x{x}" ++
+            " pc=0x{x} load_bias=0x{x} elf_pc=0x{x}\n"
+    else
+        "zinit: fatal signal {d} phase={s} code={s} addr=0x{x} at 0x{x}\n";
 }
 
-/// Writes an already-formatted fatal line to stderr and exits with 70. Shared
-/// with the message-only panic handler in `app/main.zig`.
-pub fn writeAndExit(iov: []const std.posix.iovec_const) noreturn {
-    _ = std.os.linux.writev(std.os.linux.STDERR_FILENO, iov.ptr, iov.len);
+const report_buffer_size = 192;
+const code_text_size = std.fmt.count("{d}", .{std.math.minInt(i32)});
+
+fn reportSizeMax(comptime pie: bool) usize {
+    const phase_longest = comptime blk: {
+        var longest: []const u8 = "";
+        for (@typeInfo(Phase).@"enum".field_names) |name| {
+            if (name.len > longest.len) longest = name;
+        }
+
+        break :blk longest;
+    };
+
+    const code_longest = std.fmt.comptimePrint("{d}", .{std.math.minInt(i32)});
+    const address_max = std.math.maxInt(usize);
+    return std.fmt.count(reportFormat(pie), if (pie)
+        .{
+            std.os.linux.NSIG - 1,
+            phase_longest,
+            code_longest,
+            address_max,
+            address_max,
+            address_max,
+            address_max,
+        }
+    else
+        .{ std.os.linux.NSIG - 1, phase_longest, code_longest, address_max, address_max });
+}
+
+fn report(
+    comptime pie: bool,
+    sig: std.os.linux.SIG,
+    pc: usize,
+    code: i32,
+    addr: usize,
+) noreturn {
+    checks.comptimeCheck(
+        reportSizeMax(pie) <= report_buffer_size,
+        "crash: the complete worst-case report must fit, including newline",
+    );
+
+    var code_buf: [code_text_size]u8 = undefined;
+    const code_text = code_buf[0..appendCode(&code_buf, 0, code)];
+    var buf: [report_buffer_size]u8 = undefined;
+
+    const text = fmt.bufPrint(&buf, reportFormat(pie), if (pie)
+        .{ @backingInt(sig), @tagName(phase), code_text, addr, pc, load_bias, pc -| load_bias }
+    else
+        .{ @backingInt(sig), @tagName(phase), code_text, addr, pc });
+
+    const iov = [_]std.posix.iovec_const{.{ .base = text.ptr, .len = text.len }};
+    writeAndExit(&iov, true);
+}
+
+/// Writes an already-formatted fatal line and exits with 70.
+///
+/// `signals_blocked` means the caller already made signal delivery harmless:
+/// the crash handler relies on its sigaction mask. Other callers get every
+/// signal blocked here. A failed block still attempts the write, because a
+/// sink that could raise SIGPIPE is the one that cannot show the line anyway.
+pub fn writeAndExit(iov: []const std.posix.iovec_const, signals_blocked: bool) noreturn {
+    if (!signals_blocked) {
+        // Panic may occur before the supervision mask is installed. A broken
+        // pipe must not replace EX_SOFTWARE with SIGPIPE's termination status.
+        const blocked = comptime std.os.linux.sigfillset();
+        _ = std.os.linux.sigprocmask(std.os.linux.SIG.BLOCK, &blocked, null);
+    }
+
+    log.writeFatal(iov);
+
     std.os.linux.exit(fatal_exit_code);
 }

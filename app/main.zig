@@ -46,7 +46,7 @@ fn minimalPanic(msg: []const u8, _: ?*std.lang.StackTrace, _: ?usize) noreturn {
         .{ .base = "\n", .len = 1 },
     };
 
-    lib.crash.writeAndExit(&iov);
+    lib.crash.writeAndExit(&iov, false);
 }
 
 const ParsedBehavior = union(enum) {
@@ -156,7 +156,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // Without std.debug's crash reporter, install the minimal one so a fault
     // still names the program counter; the address is symbolized offline.
-    if (comptime !stack_traces) lib.crash.install(config.pie);
+    if (comptime !stack_traces) {
+        if (lib.crash.install(config.pie)) |errno| {
+            log.err("unable to install crash reporter: {e}", .{errno});
+            return 1;
+        }
+    }
 
     return switch (dispatch(init, ctx)) {
         .run => |args| run(args, ctx),
