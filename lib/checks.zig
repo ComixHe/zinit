@@ -16,9 +16,14 @@ pub inline fn check(ok: bool, comptime reason: []const u8) void {
     if (!ok) @panic(reason);
 }
 
-/// Runtime invariant whose predicate has side effects.
-/// The predicate is not evaluated when checks are compiled out.
-pub inline fn checkLazy(comptime predicate: anytype, args: anytype, comptime reason: []const u8) void {
+/// Observes an invariant lazily, for example by querying kernel signal state.
+/// The query is skipped when checks are disabled. Neither the predicate nor
+/// its arguments may perform work required for the program's normal behavior.
+pub inline fn checkLazy(
+    comptime predicate: anytype,
+    args: anytype,
+    comptime reason: []const u8,
+) void {
     if (comptime !enabled) return;
     if (!@call(.auto, predicate, args)) @panic(reason);
 }

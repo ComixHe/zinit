@@ -123,7 +123,6 @@ fn execChild(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) u8 {
-    var path_buf: [std.os.linux.PATH_MAX]u8 = undefined;
     const file = std.mem.span(argv[0].?);
 
     if (str.indexOfByte(file, '/') != null) {
@@ -134,6 +133,7 @@ fn execChild(
         );
     }
 
+    var path_buf: [std.os.linux.PATH_MAX]u8 = undefined;
     const path = str.getEnv(std.mem.span(envp), "PATH") orelse default_path;
     var last_errno: std.os.linux.E = .NOENT;
     var denied_errno: ?std.os.linux.E = null;
@@ -150,10 +150,6 @@ fn execChild(
                 .ACCES => {
                     @branchHint(.unlikely);
                     denied_errno = e;
-                },
-                .NOEXEC => {
-                    @branchHint(.cold);
-                    return reportExec(exec_error_fd, file, e);
                 },
                 .NOENT, .NOTDIR, .NAMETOOLONG, .LOOP => {
                     @branchHint(.unlikely);
@@ -174,7 +170,7 @@ fn execChild(
     return reportExec(exec_error_fd, file, final_errno);
 }
 
-fn waitForTracer(signal_config: *const SignalConfig) ?u8 {
+fn waitForTracer(signal_config: *const SignalConfig) void {
     checks.check(std.os.linux.sigismember(&signal_config.current_set, Sig.USR1), "child: SIGUSR1 must be blocked while waiting for the tracer");
 
     const usr1 = comptime blk: {
@@ -193,7 +189,10 @@ fn waitForTracer(signal_config: *const SignalConfig) ?u8 {
         );
 
         switch (io.syscallErrno(rc)) {
-            .SUCCESS => return null,
+            .SUCCESS => {
+                checks.check(rc == @backingInt(Sig.USR1), "child: tracer wait returned a signal outside its set");
+                return;
+            },
             // STOP/CONT can interrupt the wait even though USR1 stays blocked.
             // Returning here would exec the workload before the tracer releases it.
             // see: https://man7.org/linux/man-pages/man2/rt_sigtimedwait.2.html#NOTES
@@ -223,7 +222,7 @@ fn parentIsForeground(tty_fd: std.os.linux.fd_t) bool {
     return foreground == parent_pgrp;
 }
 
-fn setupTerminal(spec: SpawnSpec) ?u8 {
+fn setupTerminal(spec: SpawnSpec) void {
     if (spec.new_session) {
         const sid = std.os.linux.setsid();
         const err = io.syscallErrno(sid);
@@ -240,7 +239,7 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
         }
     }
 
-    const tty_fd = spec.ctty orelse return null;
+    const tty_fd = spec.ctty orelse return;
 
     if (spec.new_session) {
         // TIOCSCTTY makes this new session's process group the foreground group,
@@ -254,21 +253,21 @@ fn setupTerminal(spec: SpawnSpec) ?u8 {
             ),
             else => |e| log.warn("{s}: {e}", .{ "unable to acquire controlling tty", e }),
         }
-    } else if (parentIsForeground(tty_fd)) {
-        // Only take the foreground when zinit owned it: a background zinit must
-        // not steal the shell's terminal just because stdio still names it.
-        // The child's group has to be foreground or a program reading the
-        // terminal is stopped by SIGTTIN, this must run while SIGTTOU is still
-        // ignored.
-        checks.checkLazy(signalIsIgnored, .{Sig.TTOU}, "child: SIGTTOU must stay ignored while taking the terminal");
-        const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
-        switch (io.syscallErrno(std.os.linux.tcsetpgrp(tty_fd, &pgrp))) {
-            .SUCCESS, .NOTTY, .NXIO => {},
-            else => |e| log.warn("{s}: {e}", .{ "unable to set foreground process group", e }),
-        }
+        return;
     }
 
-    return null;
+    // Only take the foreground when zinit owned it: a background zinit must
+    // not steal the shell's terminal just because stdio still names it.
+    if (!parentIsForeground(tty_fd)) return;
+
+    // The child's group has to be foreground or a program reading the
+    // terminal is stopped by SIGTTIN. SIGTTOU must still be ignored here.
+    checks.checkLazy(signalIsIgnored, .{Sig.TTOU}, "child: SIGTTOU must stay ignored while taking the terminal");
+    const pgrp: std.os.linux.pid_t = std.os.linux.getpid();
+    switch (io.syscallErrno(std.os.linux.tcsetpgrp(tty_fd, &pgrp))) {
+        .SUCCESS, .NOTTY, .NXIO => {},
+        else => |e| log.warn("{s}: {e}", .{ "unable to set foreground process group", e }),
+    }
 }
 
 pub fn run(
@@ -280,7 +279,7 @@ pub fn run(
     checks.check(spec.argv[0] != null, "child: spawn spec has no program name");
     checks.check(parent > 0, "child: parent pid must be positive in the child");
     if (spec.ctty) |fd| checks.check(fd >= 0, "child: controlling terminal descriptor is negative");
-    if (setupTerminal(spec)) |code| return code;
+    setupTerminal(spec);
 
     if (signal_config.restoreChild()) |failure| {
         @branchHint(.cold);
@@ -313,9 +312,7 @@ pub fn run(
         }
     }
 
-    if (spec.tracing_child) {
-        if (waitForTracer(signal_config)) |code| return code;
-    }
+    if (spec.tracing_child) waitForTracer(signal_config);
 
     return execChild(signal_config, exec_error_fd, spec.argv, spec.envs);
 }

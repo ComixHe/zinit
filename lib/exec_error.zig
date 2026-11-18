@@ -17,6 +17,12 @@ const checks = @import("checks.zig");
 /// small is atomic and cannot block on an empty pipe.
 pub const max_message = 512;
 
+comptime {
+    // Linux's PIPE_BUF is 4096 on the supported architectures.
+    // https://github.com/torvalds/linux/blob/20eef29b7c8465ac98d7dd6d6f2ac07a8d8056ca/include/uapi/linux/limits.h#L14
+    checks.comptimeCheck(max_message > 0 and max_message <= 4096, "exec_error: the report must fit one atomic pipe write");
+}
+
 pub fn write(fd: std.os.linux.fd_t, text: []const u8) void {
     checks.check(fd >= 0, "exec_error: the write end must be a valid descriptor");
     checks.check(text.len <= max_message, "exec_error: the message exceeds the pipe record");
