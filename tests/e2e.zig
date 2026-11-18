@@ -1950,7 +1950,7 @@ const Suite = struct {
     }
 
     fn groupFallback(self: *Suite, zinit: []const u8, self_exe: []const u8) !void {
-        const name = "-g falls back to the child when it has no own group";
+        const name = "-g reports a failed group send instead of signalling the child";
         var dir_buf: [128]u8 = undefined;
         const dir = try makeTempDir(self.io, &dir_buf, "group-fallback");
         defer removeTempDir(self.io, dir);
@@ -1973,10 +1973,27 @@ const Suite = struct {
         defer terminateAndReap(self.io, &child);
 
         if (!self.waitForPath(ready, 5_000)) return self.fail(name, "the workload did not join a group", .{});
+        const workload_pid = mainChildPid(self.io, child.id.?) orelse
+            return self.fail(name, "no workload pid", .{});
         _ = std.posix.kill(child.id.?, .TERM) catch return self.fail(name, "cannot signal zinit", .{});
-        if (waitForPid(self.io, child.id, 5_000) == null) return self.fail(name, "zinit did not exit", .{});
+        std.Io.sleep(self.io, .fromMilliseconds(500), .awake) catch {};
+
+        const state = processState(self.io, child.id.?) orelse
+            return self.fail(name, "zinit exited after a failed group send", .{});
+        if (state == 'Z' or state == 'X')
+            return self.fail(name, "zinit exited after a failed group send", .{});
+        if (fileExists(self.io, marker))
+            return self.fail(name, "the child received the signal through a fallback", .{});
+        var diag_buf: [4096]u8 = undefined;
+        const text = readSmallFile(self.io, self.diag_path, &diag_buf) orelse "";
+        if (std.mem.find(u8, text, "unable to signal the workload's process group") == null)
+            return self.fail(name, "the failed group send was not reported: {s}", .{text});
+
+        // Let the fixture leave through its own path so it reaps its helper.
+        _ = std.posix.kill(workload_pid, .TERM) catch {};
+        if (waitForPid(self.io, child.id, 5_000) == null)
+            return self.fail(name, "zinit did not exit after the workload returned", .{});
         child.id = null;
-        if (!fileExists(self.io, marker)) return self.fail(name, "the fallback signal did not reach the child", .{});
         self.pass(name);
     }
 
