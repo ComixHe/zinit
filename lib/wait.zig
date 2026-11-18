@@ -55,7 +55,7 @@ pub const WaitStatus = struct {
     }
 };
 
-// kcov-exclude-tests (everything below is test-only).
+// Everything below is test-only.
 
 /// What one non-blocking look at a child says. "Not reaped yet" and "cannot be
 /// reaped any more" are different facts and must not collapse into one `null`.
@@ -119,7 +119,7 @@ pub fn killAndReap(test_io: std.Io, pid: std.os.linux.pid_t) void {
     _ = waitForExit(test_io, pid) catch {};
 }
 
-/// Whether a tracer (kcov, a debugger) owns this process's stop/continue events.
+/// Whether a tracer (a debugger or profiler) owns this process's stop/continue events.
 /// Tests that need those events must skip rather than fail when one does.
 pub fn underTracer(test_io: std.Io) bool {
     const file = std.Io.Dir.openFileAbsolute(test_io, "/proc/self/status", .{}) catch return true;

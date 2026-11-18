@@ -266,7 +266,7 @@ pub fn appendInt(buf: []u8, at: usize, value: u64, base: Base) usize {
     return appendBytes(buf, at, tmp[index..]);
 }
 
-// kcov-exclude-tests (everything below is test-only).
+// Everything below is test-only.
 test "bufPrint renders strings, decimals and hex, and truncates rather than overruns" {
     // The expectation comes from std's formatter, so the two are cross-checked.
     var expected_buf: [16]u8 = undefined;
