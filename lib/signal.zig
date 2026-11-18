@@ -18,6 +18,10 @@ pub const SI = struct {
     pub const USER: i32 = 0;
     /// Sent by `rt_sigqueueinfo`/`sigqueue`: carries a value.
     pub const QUEUE: i32 = -1;
+    /// Sent by queued SIGIO: the record carries band/fd, not a sigval.
+    pub const SIGIO: i32 = -5;
+    /// Sent by tkill/tgkill: the kernel clears the sigval.
+    pub const TKILL: i32 = -6;
     /// Raised by the kernel itself (timer, terminal hangup): no sender.
     pub const KERNEL: i32 = 0x80;
 };

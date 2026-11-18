@@ -508,9 +508,12 @@ pub const State = struct {
             return;
         }
 
-        // Only a queued signal carries a value, anything else would hand the child
-        // a meaningless one.
-        const payload: ?Payload = if (event.code == signal.SI.QUEUE)
+        // Apart from SIGIO and TKILL, a negative code selects the RT or timer
+        // layout, where the signalfd record carries the sigval. SIGIO stores
+        // band/fd instead, and a kernel-raised TKILL clears the value, so
+        // those two have nothing to preserve.
+        const payload: ?Payload = if (event.code < 0 and
+            event.code != signal.SI.SIGIO and event.code != signal.SI.TKILL)
             .{ .value = event.value }
         else
             null;
