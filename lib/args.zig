@@ -176,7 +176,6 @@ pub const Args = struct {
     };
 
     const OptionSpec = struct { long: []const u8, short: u8, kind: Option };
-
     const option_specs = [_]OptionSpec{
         .{ .long = "--help", .short = 'h', .kind = .help },
         .{ .long = "--version", .short = 'V', .kind = .version },
@@ -190,10 +189,40 @@ pub const Args = struct {
         .{ .long = "--expect-exit", .short = 'e', .kind = .expect_exit },
     };
 
+    const option_names = blk: {
+        var names: []const u8 = "";
+        var offsets: [option_specs.len + 1]u8 = undefined;
+        var shorts: [option_specs.len]u8 = undefined;
+        offsets[0] = 0;
+
+        for (option_specs, 0..) |spec, i| {
+            checks.comptimeCheck(@backingInt(spec.kind) == i, "args: option names must follow enum order");
+            names = names ++ spec.long;
+            offsets[i + 1] = @intCast(names.len);
+            shorts[i] = spec.short;
+        }
+
+        const Names = struct {
+            text: []const u8,
+            offsets: [option_specs.len + 1]u8,
+            shorts: [option_specs.len]u8,
+        };
+
+        break :blk Names{ .text = names, .offsets = offsets, .shorts = shorts };
+    };
+
     fn lookup(arg: []const u8) ?Option {
-        for (option_specs) |spec| {
-            if (str.eql(arg, spec.long)) return spec.kind;
-            if (arg.len == 2 and arg[0] == '-' and arg[1] == spec.short) return spec.kind;
+        if (arg.len == 2 and arg[0] == '-') {
+            for (option_names.shorts, 0..) |short, i| {
+                if (arg[1] == short) return @fromBackingInt(@intCast(i));
+            }
+
+            return null;
+        }
+
+        for (0..option_specs.len) |i| {
+            const name = option_names.text[option_names.offsets[i]..option_names.offsets[i + 1]];
+            if (str.eql(arg, name)) return @fromBackingInt(@intCast(i));
         }
 
         return null;
