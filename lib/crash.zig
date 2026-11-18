@@ -174,10 +174,12 @@ fn appendCode(buf: []u8, at: usize, code: i32) usize {
 
 fn reportFormat(comptime pie: bool) []const u8 {
     return if (pie)
-        "zinit: fatal signal {d} phase={s} code={s} addr=0x{x}" ++
-            " pc=0x{x} load_bias=0x{x} elf_pc=0x{x}\n"
+        \\zinit: fatal signal {d} phase={s} code={s} addr=0x{x} pc=0x{x} load_bias=0x{x} elf_pc=0x{x}
+        \\
     else
-        "zinit: fatal signal {d} phase={s} code={s} addr=0x{x} at 0x{x}\n";
+        \\zinit: fatal signal {d} phase={s} code={s} addr=0x{x} at 0x{x}
+        \\
+    ;
 }
 
 const report_buffer_size = 192;
